@@ -64,6 +64,9 @@ type settings struct {
 	// CacheMB is how many megabytes the songs kept on disk may take; 0
 	// keeps none.
 	CacheMB int `json:"cacheMB"`
+	// Proxy is "", to follow the environment and OS system proxy, "direct"
+	// to connect directly, or an HTTP/SOCKS5 proxy URL.
+	Proxy string `json:"proxy,omitempty"`
 	// SearchHistory keeps submitted keywords, most recent first.
 	SearchHistory []string `json:"searchHistory,omitempty"`
 

@@ -3,12 +3,17 @@
   "identifier": "com.ytbmusic.app",
   "slug": "ytb-music",
   "version": "0.1.0",
+  "icon": "resources/icon.png",
   "out": "build",
   "macos": {
     "icon": "icon/AppIcon.icon",
     "minimumSystemVersion": "13.0",
     "signingIdentity": "Developer ID Application: X SOUL LTD (DM5Z8Y9C3V)",
     "entitlements": "entitlements.plist"
+  },
+  "windows": {
+    "displayName": "YTB Music",
+    "installDirName": "YTB Music"
   },
   "linux": {
     "comment": "YouTube Music 原生桌面客户端",

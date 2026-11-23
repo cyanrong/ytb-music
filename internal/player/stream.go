@@ -102,7 +102,7 @@ func (d *download) run(ctx context.Context, url string) {
 		return
 	}
 	req.Header.Set("User-Agent", ytm.UserAgent)
-	res, err := http.DefaultClient.Do(req)
+	res, err := ytm.StreamClient.Do(req)
 	if err != nil {
 		finish(err)
 		return

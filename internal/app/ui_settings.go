@@ -2,11 +2,45 @@ package app
 
 import (
 	"runtime"
+	"strings"
 	"time"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
+
+	"ytb-music/internal/ytm"
 )
+
+func (a *app) syncProxyState() {
+	a.proxyErr = ""
+	switch strings.ToLower(strings.TrimSpace(a.settings.Proxy)) {
+	case "":
+		a.proxyMode = 0
+	case "direct", "none":
+		a.proxyMode = 2
+	default:
+		a.proxyMode = 1
+		a.proxyInput = a.settings.Proxy
+	}
+}
+
+func (a *app) applyCustomProxy() {
+	raw := strings.TrimSpace(a.proxyInput)
+	if raw == "" || strings.EqualFold(raw, "direct") || strings.EqualFold(raw, "none") {
+		a.proxyErr = "请输入有效的代理地址，例如 127.0.0.1:7890 或 socks5://127.0.0.1:1080"
+		return
+	}
+	if err := ytm.SetProxy(raw); err != nil {
+		a.proxyErr = "代理地址格式不正确，请使用 http:// 或 socks5:// 地址"
+		return
+	}
+	a.proxyErr = ""
+	a.settings.Proxy = raw
+	a.changed()
+	if a.homeErr != "" {
+		a.loadHome()
+	}
+}
 
 // openSettings shows the settings window, opening it the first time.
 func (a *app) openSettings() {
@@ -16,6 +50,7 @@ func (a *app) openSettings() {
 		a.measureCache()
 		return
 	}
+	a.syncProxyState()
 	a.measureCache()
 	a.settingsWin = mygo.NewWindow(mygo.WindowOptions{
 		Title:           "设置",
@@ -42,7 +77,9 @@ func (a *app) openSettings() {
 // changed applies the settings everywhere and keeps them.
 func (a *app) changed() {
 	a.settings.save()
-	a.settings.applyAppearance()
+	if a.win != nil {
+		a.settings.applyAppearance()
+	}
 	if a.notch != nil {
 		a.notch.setEnabled(a.settings.Notch)
 	}
@@ -167,6 +204,61 @@ func (a *app) settingsView(c *ui.Context) {
 					a.changed()
 				}
 			})
+		})
+
+		group("网络", func() {
+			desc := "自动读取环境变量与系统代理"
+			if a.proxyMode == 0 {
+				if sys := ytm.SystemProxy(); sys != "" {
+					desc = "当前跟随系统代理：" + sys
+				}
+			} else if a.proxyMode == 2 {
+				desc = "不使用任何系统或环境变量代理，直接连接"
+			}
+			row("网络代理", desc, func() {
+				mode := a.proxyMode
+				if segmented(c.Key("proxy-mode"), &mode, "跟随系统", "自定义", "直连") {
+					a.proxyMode = mode
+					a.proxyErr = ""
+					switch mode {
+					case 0:
+						s.Proxy = ""
+						_ = ytm.SetProxy("")
+						a.changed()
+						if a.homeErr != "" {
+							a.loadHome()
+						}
+					case 1:
+						if a.proxyInput == "" && s.Proxy != "" && s.Proxy != "direct" {
+							a.proxyInput = s.Proxy
+						}
+					case 2:
+						s.Proxy = "direct"
+						_ = ytm.SetProxy("direct")
+						a.changed()
+					}
+				}
+			})
+			if a.proxyMode == 1 {
+				ui.Column(c.Key("proxy-custom")).Padding(12, 16).Gap(8).Children(func() {
+					ui.Row(c).Gap(8).AlignItems(ui.Center).Children(func() {
+						in := ui.TextInput(c.Key("proxy-url"), &a.proxyInput).
+							Placeholder("127.0.0.1:7890 或 socks5://127.0.0.1:1080").
+							Label("代理地址").FontSize(12.5).Grow(1)
+						if in.Submitted() {
+							a.applyCustomProxy()
+						}
+						if ui.Button(c.Key("proxy-apply"), "应用").Clicked() {
+							a.applyCustomProxy()
+						}
+					})
+					if a.proxyErr != "" {
+						ui.Text(c, a.proxyErr).FontSize(11.5).TextColor(p.accent)
+					} else if s.Proxy != "" && s.Proxy != "direct" {
+						ui.Text(c, "已启用代理："+s.Proxy).FontSize(11.5).TextColor(p.muted)
+					}
+				})
+			}
 		})
 
 		if a.captionsShown() {

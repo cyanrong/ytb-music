@@ -1,6 +1,7 @@
-// Package jsc runs JavaScript in the system's JavaScriptCore, on macOS,
-// through its C API: a bare context, with the language's own objects and
-// nothing of a browser's or a file system's, for scripts that only compute.
+// Package jsc runs JavaScript in a bare context, with the language's own
+// objects and nothing of a browser's or a file system's, for scripts that
+// only compute: in the system's JavaScriptCore on macOS, and in goja
+// elsewhere.
 package jsc
 
 import (

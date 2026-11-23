@@ -185,7 +185,7 @@ func (d *download) fetchRange(ctx context.Context, url string, from, to int64) (
 	}
 	start := time.Now()
 	req.Header.Set("User-Agent", ytm.UserAgent)
-	res, err := http.DefaultClient.Do(req)
+	res, err := ytm.StreamClient.Do(req)
 	if err != nil {
 		return 0, err
 	}

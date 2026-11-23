@@ -29,8 +29,9 @@
 - 歌单、专辑与歌手页
 - 歌曲电台：从任意一首歌开启，无尽播放相似歌曲
 - 视频：正在播放页左侧在封面与 MV 之间切换（原生 AVPlayer 硬件解码），与歌曲同步，可进影院模式；画质按网速自动选择（最高 1080p），也可手动指定；仅 macOS
-- 边下边播：AAC 128k；Premium 账号可选 AAC 256k（仅 macOS），听过的歌曲缓存在本机
-- 登录：从 Chrome、Safari、Edge、Arc、Brave、Firefox 等浏览器导入 YouTube 登录（仅 macOS），或 Google 账号登录、粘贴 Cookie；登录后同步歌单、喜欢、播放记录与关注
+- 边下边播：AAC 128k；Premium 账号可选 AAC 256k（全平台支持），听过的歌曲缓存在本机
+- 网络代理：Windows 自动识别注册表系统代理，设置页支持跟随系统、自定义 HTTP/SOCKS5 代理或直连
+- 登录：从 Chrome、Safari、Edge、Arc、Brave、Firefox 等浏览器导入 YouTube 登录（仅 macOS），或独立窗口登录 Google 账号、粘贴 Cookie；登录后同步歌单、喜欢、播放记录与关注
 - 同步歌词（LRCLib），律动歌词，没有同步歌词时显示纯文本歌词
 - 音量均衡（按 YouTube 测得的响度），暂停与继续时淡出淡入
 - 控制中心「正在播放」与媒体键、刘海播放器、菜单栏
@@ -63,10 +64,10 @@ go test ./...        # 运行测试；LIVE=1 时运行访问 YouTube 的测试
 
 - 目录与搜索走 InnerTube（music.youtube.com 的 `WEB_REMIX` 客户端）
 - 音频与视频流走 `VISIONOS` 客户端：音频取 itag 140（AAC-LC），按区间分段下载；视频取 HLS 清单里合适的 H.264 档位
-- Premium 的 256k（itag 141）来自登录后的 `WEB_REMIX` 客户端，其地址经 YouTube 播放器脚本加扰：用 [yt-dlp/ejs](https://github.com/yt-dlp/ejs) 在系统 JavaScriptCore 里解出，解不出时退回 128k
+- Premium 的 256k（itag 141）来自登录后的 `WEB_REMIX` 客户端，其地址经 YouTube 播放器脚本加扰：用 [yt-dlp/ejs](https://github.com/yt-dlp/ejs) 解出（macOS 使用系统 JavaScriptCore，Windows/Linux 使用纯 Go [goja](https://github.com/dop251/goja) 引擎），解不出时退回 128k
 - 音频由 MyGo 的 `audio/aac` 解码；视频是 MyGo 的原生 `VideoView`（AVPlayerLayer），静音播放并跟随原生音频的进度，不使用 WebView
 - 浏览器登录读取各浏览器的 Cookie 数据库（Chromium 系用钥匙串里的密钥解密）
-- Windows、Linux 版可以编译，但视频、浏览器导入登录与 256k 暂只支持 macOS
+- Windows、Linux 版支持编译及 256k 高音质解签；原生视频与浏览器自动导入登录暂只支持 macOS
 
 ## 致谢
 

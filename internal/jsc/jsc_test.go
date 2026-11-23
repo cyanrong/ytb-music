@@ -1,7 +1,6 @@
 package jsc
 
 import (
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -9,9 +8,6 @@ import (
 // A script's value comes back as a string, and what it throws as an
 // error, with text beyond ASCII intact both ways.
 func TestEval(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("JavaScriptCore is macOS's")
-	}
 	got, err := Eval(`JSON.stringify({s: "歌" + [1, 2].map(x => x * 2).join("")})`)
 	if err != nil || got != `{"s":"歌24"}` {
 		t.Fatalf("%q, %v", got, err)
@@ -21,11 +17,9 @@ func TestEval(t *testing.T) {
 	}
 }
 
-// A context kept sees what the scripts before left in it.
+// A context kept sees what the scripts before left in it, and rejects use
+// after it is closed.
 func TestContextKeeps(t *testing.T) {
-	if runtime.GOOS != "darwin" {
-		t.Skip("JavaScriptCore is macOS's")
-	}
 	c, err := New()
 	if err != nil {
 		t.Fatal(err)
@@ -36,5 +30,9 @@ func TestContextKeeps(t *testing.T) {
 	}
 	if got, err := c.Eval(`twice("ab")`); err != nil || got != "abab" {
 		t.Fatalf("%q, %v", got, err)
+	}
+	c.Close()
+	if _, err := c.Eval(`twice("ab")`); err == nil {
+		t.Fatal("expected error from closed context")
 	}
 }

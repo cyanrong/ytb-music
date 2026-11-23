@@ -74,6 +74,9 @@ func TestSafariCookies(t *testing.T) {
 // Firefox's default profile signed in to YouTube lists, and gives the
 // cookies of its own container, not another container's sign-in.
 func TestFirefoxCookies(t *testing.T) {
+	if _, err := os.Stat(sqlite); err != nil {
+		t.Skip("sqlite3 is not at " + sqlite)
+	}
 	home = t.TempDir()
 	defer func() { home = os.Getenv("HOME") }()
 	root := appSupport("Firefox")

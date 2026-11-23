@@ -31,7 +31,7 @@ const (
 	visionVer  = "0.1"
 )
 
-var httpClient = &http.Client{Timeout: 20 * time.Second}
+var httpClient = &http.Client{Timeout: 20 * time.Second, Transport: proxyTransport}
 
 // visitor is the visitorData that anonymous requests carry, as a browser
 // that has been to YouTube before: fetched once, shared, and fetched again

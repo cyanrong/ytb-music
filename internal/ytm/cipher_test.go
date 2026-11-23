@@ -2,8 +2,30 @@ package ytm
 
 import (
 	"net/url"
+	"os"
 	"testing"
 )
+
+// The embedded yt-dlp solver loads into jsc and unscrambles YouTube's live
+// player script when LIVE is set.
+func TestLiveSolver(t *testing.T) {
+	if os.Getenv("LIVE") == "" {
+		t.Skip("set LIVE to call YouTube")
+	}
+	PlayerCacheDir = t.TempDir()
+	sv, err := currentSolver()
+	if err != nil {
+		t.Fatalf("currentSolver: %v", err)
+	}
+	sig, n, err := sv.solve("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef", "abc123XYZ_def456")
+	if err != nil {
+		t.Fatalf("solve: %v", err)
+	}
+	if sig == "" || n == "" {
+		t.Fatalf("empty output: sig=%q n=%q", sig, n)
+	}
+	t.Logf("player %s (sts %d) → sig=%q n=%q", sv.id, sv.sts, sig, n)
+}
 
 // A web client's format plays from its URL with the signature its cipher
 // scrambled put back under the name the cipher says, and its n replaced by

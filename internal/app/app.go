@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -160,6 +161,9 @@ type app struct {
 
 	settings    settings
 	settingsWin *mygo.Window
+	proxyMode   int    // 0: system, 1: custom, 2: direct
+	proxyInput  string // custom proxy address edited in settings
+	proxyErr    string
 	cacheUsed   int64 // the bytes the song cache takes, -1 until measured
 	updates     bool  // the update plugin is used (useUpdater)
 
@@ -183,6 +187,9 @@ func (a *app) post(fn func()) {
 func (a *app) redraw() {
 	if a.win != nil {
 		a.win.Invalidate()
+	}
+	if a.settingsWin != nil {
+		a.settingsWin.Invalidate()
 	}
 	if a.notch != nil && a.notch.win != nil {
 		a.notch.win.Invalidate()
@@ -228,6 +235,9 @@ func Run() error {
 	}
 	mygo.App.WhenReady(func() {
 		a.settings = loadSettings()
+		_ = ytm.SetProxy(a.settings.Proxy)
+		http.DefaultTransport = ytm.Transport()
+		a.syncProxyState()
 		a.settings.applyAppearance()
 		a.npPane = a.lyricsPaneChosen()
 		// Before the window: on Windows it lays out its content as it is

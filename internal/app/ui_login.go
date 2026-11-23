@@ -3,6 +3,7 @@ package app
 import (
 	"errors"
 	"os/exec"
+	"runtime"
 	"strings"
 	"time"
 
@@ -262,21 +263,31 @@ func (a *app) loginDialog(c *ui.Context) {
 			}
 		})
 
-		ui.Text(c, "使用浏览器的登录（推荐）").FontSize(12).FontWeight(600).TextColor(p.muted).Margin(20, 0, 8, 2)
-		a.browserList(c)
-		a.loginHints(c)
+		if runtime.GOOS == "darwin" || len(l.profiles) > 0 {
+			ui.Text(c, "使用浏览器的登录（推荐）").FontSize(12).FontWeight(600).TextColor(p.muted).Margin(20, 0, 8, 2)
+			a.browserList(c)
+			a.loginHints(c)
 
-		// Or Google's own page.
-		ui.Row(c).Gap(12).AlignItems(ui.Center).Margin(18, 0, 14, 0).Children(func() {
-			ui.Box(c).Height(0.5).Grow(1).Background(p.hairline)
-			ui.Text(c, "或").FontSize(11.5).TextColor(p.faint)
-			ui.Box(c).Height(0.5).Grow(1).Background(p.hairline)
-		})
+			// Or Google's own page.
+			ui.Row(c).Gap(12).AlignItems(ui.Center).Margin(18, 0, 14, 0).Children(func() {
+				ui.Box(c).Height(0.5).Grow(1).Background(p.hairline)
+				ui.Text(c, "或").FontSize(11.5).TextColor(p.faint)
+				ui.Box(c).Height(0.5).Grow(1).Background(p.hairline)
+			})
+		} else {
+			ui.Box(c).Height(18)
+		}
 		window := pillButton(c.Key("google"), nil, "使用 Google 账号密码登录", p.hover.Over(p.bg), p.text).Justify(ui.Center)
 		if window.Clicked() {
 			a.openLoginWindow()
 		}
-		ui.Text(c, "在窗口里打开 Google 官方登录页（系统 Safari 内核），支持两步验证").
+		webviewHint := "在窗口里打开 Google 官方登录页（系统 Safari 内核），支持两步验证"
+		if runtime.GOOS == "windows" {
+			webviewHint = "在独立窗口打开 Google 官方登录页（系统 WebView2 内核），支持两步验证"
+		} else if runtime.GOOS != "darwin" {
+			webviewHint = "在独立窗口打开 Google 官方登录页（系统 WebView 内核），支持两步验证"
+		}
+		ui.Text(c, webviewHint).
 			FontSize(11).TextColor(p.faint).TextAlign(ui.Center).Margin(6, 0, 0, 0)
 
 		a.pasteSection(c)
