@@ -412,7 +412,9 @@ func (a *app) playerBar(c *ui.Context) {
 			a.likeButton(c.Key("like"), tr, 16, p.muted).Margin(0, 0, 0, 4).Shrink(0)
 		})
 
-		// Controls over the progress.
+		// Controls over the progress, and the active audio signal pill.
+		w, _ := c.Size()
+		sigText, sigGold, sigTip := a.signalBarText(w < 960)
 		ui.Column(c).Width(440).Shrink(1).MinWidth(300).Gap(0).AlignItems(ui.Stretch).Children(func() {
 			a.transport(c, p.text, p.muted, p.accent, 18)
 			ui.Row(c).Gap(10).AlignItems(ui.Center).Margin(-4, 0, 0, 0).Children(func() {
@@ -420,6 +422,11 @@ func (a *app) playerBar(c *ui.Context) {
 				a.scrubber(c.Key("bar-scrub"), &a.barScrub, p.press, p.text.Alpha(0.75), 14, p.accent).Grow(1)
 				ui.Text(c, clock(pl.Duration())).FontSize(10.5).FontFeatures("tnum").TextColor(p.faint).Width(34)
 			})
+			if sigText != "" {
+				ui.Row(c).Justify(ui.Center).Margin(1, 0, 0, 0).Children(func() {
+					a.signalBarPill(c, sigText, sigGold, sigTip)
+				})
+			}
 		})
 
 		// Lyrics and volume.
@@ -442,4 +449,54 @@ func (a *app) playerBar(c *ui.Context) {
 			a.volumeButton(c, p.text.Alpha(0.75))
 		})
 	})
+}
+
+func (a *app) signalBarPill(c *ui.Context, text string, gold bool, tooltip string) {
+	p := a.pal
+	if tooltip == "" {
+		tooltip = "点击查看信号路径"
+	}
+	pill := ui.ButtonBase(c.Key("bar-signal-pill")).Height(17).Padding(0, 7).Gap(5).Radius(999).
+		AlignItems(ui.Center).Shrink(1).MinWidth(0).FocusRing(false).Label("音频信号路径").Tooltip(tooltip)
+
+	var fg, bg, border, dot ui.Color
+	if gold {
+		dot = signalGoldColor(p.dark)
+		fg = dot
+		bg = dot.Alpha(0.09)
+		border = dot.Alpha(0.38)
+		if pill.Hovered() || a.audio.open {
+			bg = dot.Alpha(0.17)
+		}
+	} else {
+		fg = p.muted
+		bg = p.hover
+		border = p.hairline
+		if pill.Hovered() || a.audio.open {
+			bg = p.press
+		}
+	}
+	pill.Background(bg).Border(0.5, border)
+	pill.Children(func() {
+		if gold {
+			ui.Box(c).Size(4.5, 4.5).Radius(999).Background(dot).Shrink(0)
+		}
+		ui.Text(c, text).FontSize(10).FontWeight(600).FontFeatures("tnum").LetterSpacing(0.15).TextColor(fg).SingleLine()
+	})
+	if pill.PressedInside() && a.audio.open && !pill.Clicked() {
+		a.audio.pillClosing = true
+	}
+	if pill.Clicked() {
+		if a.audio.pillClosing {
+			a.audio.pillClosing = false
+			a.audio.open = false
+		} else {
+			a.audio.open = !a.audio.open
+			if a.audio.open {
+				a.syncAudioInputs()
+			}
+		}
+	} else if !pill.Pressed() {
+		a.audio.pillClosing = false
+	}
 }

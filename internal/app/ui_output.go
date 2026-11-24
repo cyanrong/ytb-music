@@ -2,8 +2,10 @@ package app
 
 import (
 	"context"
+	"fmt"
 	"maps"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -11,6 +13,7 @@ import (
 	"github.com/egoist/mygo/ui"
 
 	"ytb-music/internal/bridge"
+	"ytb-music/internal/ytm"
 )
 
 const (
@@ -48,6 +51,8 @@ type audioChainState struct {
 	hqpStatus    string
 	hqpTesting   bool
 	hqpGen       int
+	hqpSignal    bridge.HQPSignalInfo
+	pillClosing  bool
 
 	roonStatus bridge.RoonStatus
 	bridgeErr  string
@@ -102,10 +107,13 @@ func (a *app) closeAudioChain() {
 }
 
 func (a *app) stopUnusedServices(keepMode string) {
-	if keepMode != outputHQPlayer && a.audio.hqp != nil {
-		hqp := a.audio.hqp
-		a.audio.hqp = nil
-		hqp.Shutdown(true)
+	if keepMode != outputHQPlayer {
+		a.audio.hqpSignal = bridge.HQPSignalInfo{}
+		if a.audio.hqp != nil {
+			hqp := a.audio.hqp
+			a.audio.hqp = nil
+			hqp.Shutdown(true)
+		}
 	}
 	if keepMode != outputRoon && a.audio.roonMgr != nil {
 		mgr := a.audio.roonMgr
@@ -164,12 +172,23 @@ func (a *app) ensureHQPlayerBackend() (*bridge.HQPlayerBackend, error) {
 		return nil, err
 	}
 	if a.audio.hqp == nil {
-		a.audio.hqp = bridge.NewHQPlayerBackend(srv, a.settings.HQPlayerAddr, func(ok bool, detail string) {
+		var hqp *bridge.HQPlayerBackend
+		hqp = bridge.NewHQPlayerBackend(srv, a.settings.HQPlayerAddr, func(ok bool, detail string) {
 			a.postSettingsOrMain(func() {
-				a.audio.hqpConnected = ok
-				a.audio.hqpStatus = detail
+				if a.audio.hqp == hqp {
+					a.audio.hqpConnected = ok
+					a.audio.hqpStatus = detail
+				}
 			})
 		})
+		hqp.SetOnSignal(func(sig bridge.HQPSignalInfo) {
+			a.postSettingsOrMain(func() {
+				if a.audio.hqp == hqp {
+					a.audio.hqpSignal = sig
+				}
+			})
+		})
+		a.audio.hqp = hqp
 	} else {
 		a.audio.hqp.SetAddr(a.settings.HQPlayerAddr)
 	}
@@ -307,6 +326,7 @@ func (a *app) applyHQPlayerAddr() {
 	if addr != prev && a.audio.hqp != nil {
 		oldHQP := a.audio.hqp
 		a.audio.hqp = nil
+		a.audio.hqpSignal = bridge.HQPSignalInfo{}
 		if a.settings.OutputMode == outputHQPlayer {
 			if newHQP, err := a.ensureHQPlayerBackend(); err == nil {
 				a.pl.SetBackend(newHQP)
@@ -406,6 +426,170 @@ func (a *app) currentRoonStreamURL() string {
 	return "http://" + a.settings.BridgeListen + suffix
 }
 
+// signalBarLabel returns the full player-bar signal text, whether to style it
+// with the audiophile warm-gold accent, and an optional DSP chain tooltip.
+func (a *app) signalBarLabel() (text string, gold bool, tooltip string) {
+	return a.signalBarText(false)
+}
+
+func (a *app) signalBarText(compact bool) (text string, gold bool, tooltip string) {
+	st := a.pl.Stream()
+	if st == nil {
+		return "", false, ""
+	}
+	dur := a.pl.Duration()
+	src := st.SpecDetail(dur)
+	if compact {
+		src = st.SpecBadge()
+	}
+	switch normalizeOutputMode(a.settings.OutputMode) {
+	case outputHQPlayer:
+		if out := a.audio.hqpSignal.OutputBadge(); out != "" {
+			return fmt.Sprintf("%s → %s", src, out), true, a.audio.hqpSignal.SummaryChain()
+		}
+		return src, st.IsLosslessStream(), ""
+	case outputRoon:
+		if a.audio.roonStatus.Listeners > 0 {
+			if a.settings.RoonStreamFormat == "aac" {
+				return src + " → Roon AAC", false, ""
+			}
+			return src + " → Roon 24/44.1", st.IsLosslessStream(), ""
+		}
+		return src, st.IsLosslessStream(), ""
+	default:
+		return src, st.IsLosslessStream(), ""
+	}
+}
+
+func signalGoldColor(dark bool) ui.Color {
+	if dark {
+		return ui.Hex("#f5d58a")
+	}
+	return ui.Hex("#b87d14")
+}
+
+func signalCyanColor(dark bool) ui.Color {
+	if dark {
+		return ui.Hex("#56cfe1")
+	}
+	return ui.Hex("#0284c7")
+}
+
+func (a *app) signalPathCard(c *ui.Context, st *ytm.Stream, mode string, pop popover) {
+	p := a.pal
+	gold := signalGoldColor(p.dark)
+	cyan := signalCyanColor(p.dark)
+	sig := a.audio.hqpSignal
+	hqpActive := mode == outputHQPlayer && sig.Active
+	lossless := st.IsLosslessStream()
+
+	headerDot := cyan
+	stageTag := "标准链路"
+	switch {
+	case hqpActive:
+		headerDot = gold
+		stageTag = "HQP 升频"
+	case st.IsHiResStream():
+		headerDot = gold
+		stageTag = "Hi-Res 无损"
+	case lossless:
+		headerDot = gold
+		stageTag = "无损音源"
+	case mode == outputRoon && a.audio.roonStatus.Listeners > 0:
+		stageTag = "Roon 桥接"
+	}
+
+	cardBg := ui.RGBA(0, 0, 0, 0.035)
+	cardEdge := pop.edge
+	if p.dark {
+		cardBg = ui.RGBA(255, 255, 255, 0.045)
+	}
+	if hqpActive || lossless {
+		cardEdge = gold.Alpha(0.28)
+	}
+
+	ui.Column(c.Key("signal-path-card")).Margin(2, 4, 4, 4).Padding(9, 10).Gap(7).Radius(9).
+		Background(cardBg).Border(0.5, cardEdge).Children(func() {
+		ui.Row(c).Gap(6).AlignItems(ui.Center).Children(func() {
+			ui.Box(c).Size(6, 6).Radius(999).Background(headerDot).Shrink(0)
+			ui.Text(c, "信号路径").FontSize(11.5).FontWeight(700).TextColor(p.text)
+			ui.Text(c, "Signal Path").FontSize(10).TextColor(p.faint)
+			ui.Spacer(c)
+			ui.Text(c, stageTag).FontSize(9.5).FontWeight(700).TextColor(headerDot).
+				Padding(1, 5).Radius(4).Background(headerDot.Alpha(0.12))
+		})
+
+		nodeRow := func(key, title, detail string, dotCol, detailCol ui.Color) {
+			ui.Row(c.Key(key)).Gap(8).AlignItems(ui.Start).Children(func() {
+				ui.Box(c).Size(5, 5).Radius(999).Margin(5, 0, 0, 0).Background(dotCol).Shrink(0)
+				ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Gap(1).Children(func() {
+					ui.Text(c, title).FontSize(10.5).FontWeight(600).TextColor(p.faint)
+					ui.Text(c, detail).FontSize(11.5).FontWeight(600).FontFeatures("tnum").TextColor(detailCol).SingleLine()
+				})
+			})
+		}
+
+		srcDot := cyan
+		if lossless {
+			srcDot = gold
+		}
+		nodeRow("node-source", "音源", st.SpecDetail(a.pl.Duration()), srcDot, p.text)
+
+		var transport string
+		transportDot := cyan
+		switch mode {
+		case outputHQPlayer:
+			switch {
+			case sig.SourceSDM || st.IsDSD || (lossless && st.SampleRate > 0 && sig.SourceRate == st.SampleRate):
+				transport = "原生文件直通 (file:///)"
+				transportDot = gold
+			case sig.SourceBitrate > 0:
+				transport = fmt.Sprintf("24-bit WAV (%d kbps)", sig.SourceBitrate/1000)
+			default:
+				transport = "24-bit PCM WAV"
+			}
+		case outputRoon:
+			if a.settings.RoonStreamFormat == "aac" {
+				transport = "Roon Live Radio · ADTS AAC"
+			} else {
+				transport = "Roon Live Radio · 24-bit WAV"
+				if lossless {
+					transportDot = gold
+				}
+			}
+		default:
+			transport = "MyGo 32-bit Float 混音引擎"
+		}
+		nodeRow("node-transport", "传输 / 解码", transport, transportDot, p.text)
+
+		if hqpActive {
+			ui.Row(c.Key("node-hqp")).Gap(8).AlignItems(ui.Start).Children(func() {
+				ui.Box(c).Size(5, 5).Radius(999).Margin(5, 0, 0, 0).Background(gold).Shrink(0)
+				ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Gap(2).Children(func() {
+					ui.Text(c, "HQPlayer 升频与调制").FontSize(10.5).FontWeight(600).TextColor(p.faint)
+					if sig.Filter != "" {
+						ui.Text(c, "滤波器："+sig.Filter).FontSize(11).FontFeatures("tnum").TextColor(p.muted).SingleLine()
+					}
+					if sig.Shaper != "" {
+						ui.Text(c, "调制器："+sig.Shaper).FontSize(11).FontFeatures("tnum").TextColor(p.muted).SingleLine()
+					}
+					if out := sig.OutputDetail(); out != "" {
+						ui.Text(c, "输出："+out).FontSize(11.5).FontWeight(700).FontFeatures("tnum").TextColor(gold).SingleLine()
+					}
+					if sig.Clips > 0 {
+						ui.Row(c).Gap(5).AlignItems(ui.Center).Margin(2, 0, 0, 0).Children(func() {
+							ui.Text(c, "!").FontSize(9.5).FontWeight(800).TextColor(ui.Hex("#ffffff")).
+								Padding(0, 4.5).Radius(999).Background(p.accent)
+							warn := "检测到限幅削波 (" + strconv.Itoa(sig.Clips) + ")，建议调低音量 3dB"
+							ui.Text(c, warn).FontSize(10.5).FontWeight(600).FontFeatures("tnum").TextColor(p.accent).SingleLine()
+						})
+					}
+				})
+			})
+		}
+	})
+}
+
 // outputButton sits in the bottom player bar and opens the audio chain switcher popover.
 func (a *app) outputButton(c *ui.Context) {
 	p := a.pal
@@ -424,12 +608,23 @@ func (a *app) outputButton(c *ui.Context) {
 		}
 	}
 
+	st := a.pl.Stream()
+	popWidth := float32(276)
+	if st != nil {
+		popWidth = 308
+	}
+
 	pop := popoverColors(p.dark)
 	ui.PopoverBase(c.Key("output-popover"), b, &a.audio.open, func(panel ui.Element) {
-		panel.AttachTo(b, ui.AnchorTopEnd, ui.AnchorBottomEnd).Margin(0, 0, 10, 0).Width(276).Padding(8).Gap(4).
+		panel.AttachTo(b, ui.AnchorTopEnd, ui.AnchorBottomEnd).Margin(0, 0, 10, 0).Width(popWidth).Padding(8).Gap(4).
 			Radius(13).Background(pop.fill).Border(0.5, pop.edge).Shadow(0, 10, 28, -4, ui.RGBA(0, 0, 0, 0.25)).
 			Role(ui.RoleMenu).Label("输出设备").TransformOrigin(0.9, 1).
 			Transition(ui.ElementTransition{Animation: &ui.Snappy, Enter: &ui.Motion{Scale: 0.96, Y: 4}, Exit: &ui.Motion{Scale: 0.98}})
+
+		if st != nil {
+			a.signalPathCard(c, st, mode, pop)
+			ui.Box(c).Height(0.5).Margin(2, 6).Background(pop.edge)
+		}
 
 		ui.Text(c, "音频输出链路").FontSize(11.5).FontWeight(600).TextColor(p.faint).Padding(4, 8, 2, 8)
 
@@ -475,8 +670,12 @@ func (a *app) outputButton(c *ui.Context) {
 		}
 
 		hqpSub := "44.1kHz 24-bit WAV · " + a.settings.HQPlayerAddr
-		if a.audio.hqpStatus != "" && mode == outputHQPlayer {
-			hqpSub = a.audio.hqpStatus
+		if mode == outputHQPlayer {
+			if chain := a.audio.hqpSignal.SummaryChain(); chain != "" {
+				hqpSub = chain
+			} else if a.audio.hqpStatus != "" {
+				hqpSub = a.audio.hqpStatus
+			}
 		}
 		a.outputOptionRow(c, outputHQPlayer, "HQPlayer 直推", hqpSub, mode == outputHQPlayer)
 

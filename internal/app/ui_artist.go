@@ -7,6 +7,7 @@ import (
 
 	"github.com/egoist/mygo/ui"
 
+	"ytb-music/internal/localmusic"
 	"ytb-music/internal/ytm"
 )
 
@@ -123,6 +124,25 @@ func (a *app) artist(id string) *artistData {
 // loadArtist loads an artist's page, and what it lists.
 func (a *app) loadArtist(id string) {
 	d := a.artist(id)
+	if localmusic.IsLocalArtist(id) {
+		if a.local.lib != nil {
+			if ar, ok := a.local.lib.ArtistByID(id); ok {
+				prof := ar.ToArtistProfile()
+				d.profile = &prof
+				albums := make([]ytm.AlbumProfile, len(ar.Albums))
+				for i := range ar.Albums {
+					albums[i] = ar.Albums[i].ToAlbumProfile()
+				}
+				d.albums = albums
+				d.albumsPage = paged{loaded: true, more: false}
+				d.latest = prof.Songs
+				d.loading, d.err = false, ""
+				return
+			}
+		}
+		d.loading, d.err = false, "本地歌手不存在"
+		return
+	}
 	switch a.artistTab {
 	case artistLatest:
 		a.loadLatest(id)
@@ -271,6 +291,20 @@ func (a *app) artistPage(c *ui.Context) {
 		return
 	}
 	header := func(c *ui.Context) { a.artistHeader(c, d) }
+	if localmusic.IsLocalArtist(id) {
+		if a.artistTab == artistAlbums {
+			a.scrollPage(c, func() {
+				header(c)
+				a.albumGrid(c, d.albums)
+				if len(d.albums) == 0 {
+					a.empty(c, "暂无专辑")
+				}
+			})
+			return
+		}
+		a.trackRows(c, d.profile.Songs, true, header)
+		return
+	}
 	switch a.artistTab {
 	case artistAlbums:
 		a.scrollPage(c, func() {
@@ -335,9 +369,10 @@ const artistPhotoSize = 212
 func (a *app) artistHeader(c *ui.Context, d *artistData) {
 	p := a.pal
 	ar := d.profile
+	isLocal := localmusic.IsLocalArtist(ar.ID)
 	// What the buttons play: the songs listed, or else the most popular.
 	songs := ar.Songs
-	if a.artistTab == artistLatest && d.latest != nil {
+	if !isLocal && a.artistTab == artistLatest && d.latest != nil {
 		songs = d.latest
 	}
 	ui.Row(c).Gap(28).AlignItems(ui.End).Padding(0, 0, 8, 0).Children(func() {
@@ -346,10 +381,18 @@ func (a *app) artistHeader(c *ui.Context, d *artistData) {
 			photo = ar.PicURL
 		}
 		ui.Box(c).Size(artistPhotoSize, artistPhotoSize).Radius(artistPhotoSize/2).Shadow(0, 18, 40, -10, p.cardShade).Children(func() {
-			a.coverFill(c, photo, 600, artistPhotoSize/2)
+			if isLocal && photo == "" {
+				a.localDiscPlaceholder(c, artistPhotoSize/2)
+			} else {
+				a.coverFill(c, photo, 600, artistPhotoSize/2)
+			}
 		})
 		ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Gap(8).Children(func() {
-			ui.Text(c, "歌手").FontSize(12).FontWeight(600).TextColor(p.accent)
+			eyebrow := "歌手"
+			if isLocal {
+				eyebrow = "本地艺人"
+			}
+			ui.Text(c, eyebrow).FontSize(12).FontWeight(600).TextColor(p.accent)
 			ui.Text(c, ar.Name).FontSize(30).FontWeight(800).LetterSpacing(-0.6).MaxLines(2).LineHeight(1.2)
 			var meta []string
 			if aka := distinct(append([]string{ar.Trans}, ar.Alias...)); len(aka) > 0 {
@@ -381,22 +424,46 @@ func (a *app) artistHeader(c *ui.Context, d *artistData) {
 					}
 					a.pl.PlayQueue(songs, firstPlayable(songs))
 				}
-				// The radio of their best-known song, YouTube Music's.
-				if len(ar.Songs) > 0 && pillButton(c.Key("radio"), iconRadio, "电台", p.hover.Over(p.bg), p.text).Clicked() {
-					a.startSongRadio(&ar.Songs[firstPlayable(ar.Songs)])
-				}
-				if a.profile != nil {
-					icon, label := iconPlus, "关注"
-					if ar.Followed {
-						icon, label = iconCheck, "已关注"
+				if !isLocal {
+					// The radio of their best-known song, YouTube Music's.
+					if len(ar.Songs) > 0 && pillButton(c.Key("radio"), iconRadio, "电台", p.hover.Over(p.bg), p.text).Clicked() {
+						a.startSongRadio(&ar.Songs[firstPlayable(ar.Songs)])
 					}
-					if pillButton(c.Key("follow"), icon, label, p.hover.Over(p.bg), p.text).Clicked() {
-						a.toggleFollow(ar.ID)
+					if a.profile != nil {
+						icon, label := iconPlus, "关注"
+						if ar.Followed {
+							icon, label = iconCheck, "已关注"
+						}
+						if pillButton(c.Key("follow"), icon, label, p.hover.Over(p.bg), p.text).Clicked() {
+							a.toggleFollow(ar.ID)
+						}
 					}
 				}
 			})
 		})
 	})
+	if isLocal {
+		localTab := 0
+		if a.artistTab == artistAlbums {
+			localTab = 1
+		}
+		secTitle := "全部歌曲"
+		if localTab == 1 {
+			secTitle = "专辑"
+		}
+		ui.Row(c).AlignItems(ui.Center).Margin(34, 0, 14, 0).Children(func() {
+			ui.Text(c, secTitle).FontSize(19).FontWeight(700).LetterSpacing(-0.3)
+			ui.Spacer(c)
+			if segmented(c.Key("local-tab"), &localTab, "全部歌曲", "专辑") {
+				if localTab == 1 {
+					a.artistTab = artistAlbums
+				} else {
+					a.artistTab = artistHot
+				}
+			}
+		})
+		return
+	}
 	ui.Row(c).AlignItems(ui.Center).Margin(34, 0, 14, 0).Children(func() {
 		ui.Text(c, artistTabTitles[a.artistTab]).FontSize(19).FontWeight(700).LetterSpacing(-0.3)
 		ui.Spacer(c)

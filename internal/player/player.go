@@ -36,6 +36,8 @@ type Player struct {
 	Normalize func() bool
 	// Cache keeps the songs played, if set.
 	Cache *Cache
+	// Local opens tracks and lyrics from the listener's local music library, if set.
+	Local LocalProvider
 	// Changed, if set, hears that what plays, where it is or whether it
 	// plays changed.
 	Changed func()
@@ -383,6 +385,9 @@ func (p *Player) Downloaded() (float64, bool) {
 		return 0, false
 	}
 	dl, _ := p.stream.source()
+	if dl == nil {
+		return 1, true
+	}
 	return dl.Progress(), true
 }
 
@@ -406,7 +411,20 @@ func (p *Player) OpenAudio() (Audio, error) {
 	if p.stream == nil || p.track == nil {
 		return nil, errors.New("player: nothing loaded")
 	}
+	if p.Local != nil && p.Local.IsLocalTrack(p.track.ID) {
+		opened, err := p.Local.OpenLocalTrack(p.track.ID)
+		if err != nil {
+			return nil, err
+		}
+		if opened == nil || opened.Decoder == nil {
+			return nil, errors.New("player: empty local audio")
+		}
+		return newLocalPCMStream(opened.Decoder, nil), nil
+	}
 	dl, _ := p.stream.source()
+	if dl == nil {
+		return nil, errors.New("player: nothing loaded")
+	}
 	return openShared(dl, p.track.Duration)
 }
 
@@ -636,6 +654,9 @@ func (p *Player) Levels() ([Bands]float32, bool) {
 		return [Bands]float32{}, false
 	}
 	_, spec := p.stream.source()
+	if spec == nil {
+		return [Bands]float32{}, false
+	}
 	frame := int64(p.Position().Seconds() * float64(p.stream.SampleRate()))
 	return spec.at(frame)
 }
@@ -700,25 +721,41 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 	p.announce(&t, nil)
 	p.refill()
 
-	go func() {
-		cover, err := ytm.Fetch(ytm.Sized(t.Album.PicURL, 600))
-		if err == nil {
-			p.post(func() {
-				if gen == p.gen {
-					p.announce(&t, cover)
-				}
-			})
-		}
-	}()
+	localProv := p.Local
+	isLocal := localProv != nil && localProv.IsLocalTrack(t.ID)
+
+	if !isLocal && t.Album.PicURL != "" {
+		go func() {
+			cover, err := ytm.Fetch(ytm.Sized(t.Album.PicURL, 600))
+			if err == nil {
+				p.post(func() {
+					if gen == p.gen {
+						p.announce(&t, cover)
+					}
+				})
+			}
+		}()
+	}
 
 	go func() {
-		lrc, trans, yrc, err := ytm.Lyrics(&t)
 		var lines []lyrics.Line
 		var plain []string
-		if err == nil {
-			lines = lyrics.Build(lrc, trans, yrc)
-			if len(lines) == 0 {
-				plain = lyrics.Plain(lrc)
+		if isLocal {
+			lrc, trans, rawPlain := localProv.LocalLyrics(t.ID)
+			plain = rawPlain
+			if lrc != "" {
+				lines = lyrics.Build(lrc, trans, "")
+				if len(lines) == 0 && len(plain) == 0 {
+					plain = lyrics.Plain(lrc)
+				}
+			}
+		} else {
+			lrc, trans, yrc, err := ytm.Lyrics(&t)
+			if err == nil {
+				lines = lyrics.Build(lrc, trans, yrc)
+				if len(lines) == 0 {
+					plain = lyrics.Plain(lrc)
+				}
 			}
 		}
 		p.post(func() {
@@ -730,43 +767,116 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 	}()
 	initGain := p.effectiveGain(1)
 	go func() {
-		level := "standard"
-		if p.Quality != nil {
-			level = p.Quality()
-		}
-		info, s, err := p.open(t, level)
-		var extOut OutputSink
-		var backendErr error
-		openBackend := func() {
-			if ctx.Err() != nil {
-				s.Close()
-				return
+		var (
+			info       *ytm.Stream
+			s          stream
+			err        error
+			extOut     OutputSink
+			backendErr error
+		)
+		if isLocal {
+			var opened *LocalOpenedTrack
+			opened, err = localProv.OpenLocalTrack(t.ID)
+			if err == nil && (opened == nil || opened.Decoder == nil) {
+				err = errors.New("player: empty local audio")
 			}
-			dl, spec := s.source()
-			dur := t.Length()
-			if frames := s.Len(); frames > 0 && s.SampleRate() > 0 {
-				dur = time.Duration(float64(frames) / float64(s.SampleRate()) * float64(time.Second))
+			if err == nil {
+				if len(opened.Cover) > 0 {
+					cover := opened.Cover
+					p.post(func() {
+						if gen == p.gen {
+							p.announce(&t, cover)
+						}
+					})
+				}
+				sr := opened.Decoder.SampleRate()
+				if sr <= 0 {
+					sr = 44100
+				}
+				frames := max(opened.Decoder.Len(), int64(0))
+				if frames == 0 && t.Duration > 0 {
+					frames = t.Duration * int64(sr) / 1000
+				}
+				spec := newSpectrum(sr, frames)
+				s = newLocalPCMStream(opened.Decoder, spec)
+				if opened.Stream != nil {
+					cp := *opened.Stream
+					info = &cp
+				} else {
+					info = &ytm.Stream{}
+				}
+				if info.SampleRate <= 0 {
+					info.SampleRate = sr
+				}
+				if backend != nil {
+					if ctx.Err() != nil {
+						_ = s.Close()
+					} else {
+						dur := t.Length()
+						if f := s.Len(); f > 0 && s.SampleRate() > 0 {
+							dur = time.Duration(float64(f) / float64(s.SampleRate()) * float64(time.Second))
+						}
+						src := TrackSource{
+							Track:     t,
+							Stream:    info,
+							Duration:  dur,
+							Gain:      initGain * normGain(info),
+							LocalPath: opened.LocalPath,
+							NativeHQP: opened.NativeHQP,
+							OpenPCM: func() (PCMDecoder, error) {
+								op, oerr := localProv.OpenLocalTrack(t.ID)
+								if oerr != nil {
+									return nil, oerr
+								}
+								if op == nil || op.Decoder == nil {
+									return nil, errors.New("player: empty local audio")
+								}
+								return newLocalPCMStream(op.Decoder, spec), nil
+							},
+						}
+						stopLoad := context.AfterFunc(ctx, func() { _ = s.Close() })
+						extOut, backendErr = backend.Open(ctx, src)
+						stopLoad()
+					}
+				}
 			}
-			src := TrackSource{
-				Track:    t,
-				Stream:   info,
-				Duration: dur,
-				Gain:     initGain * normGain(info),
-				OpenPCM:  func() (PCMDecoder, error) { return openSharedWithSpec(dl, spec) },
-				OpenRaw:  func() (RawStream, error) { return openSharedRaw(dl) },
+		} else {
+			level := "standard"
+			if p.Quality != nil {
+				level = p.Quality()
 			}
-			stopLoad := context.AfterFunc(ctx, func() { _ = s.Close() })
-			extOut, backendErr = backend.Open(ctx, src)
-			stopLoad()
-		}
-		if err == nil && backend != nil {
-			openBackend()
-			if backendErr != nil && ctx.Err() == nil && info != nil && info.Level == "exhigh" && isForbiddenStreamErr(backendErr) {
-				ytm.MarkExhighForbidden()
-				_ = s.Close()
-				extOut, backendErr = nil, nil
-				if info, s, err = p.open(t, "standard"); err == nil {
-					openBackend()
+			info, s, err = p.open(t, level)
+			openBackend := func() {
+				if ctx.Err() != nil {
+					s.Close()
+					return
+				}
+				dl, spec := s.source()
+				dur := t.Length()
+				if frames := s.Len(); frames > 0 && s.SampleRate() > 0 {
+					dur = time.Duration(float64(frames) / float64(s.SampleRate()) * float64(time.Second))
+				}
+				src := TrackSource{
+					Track:    t,
+					Stream:   info,
+					Duration: dur,
+					Gain:     initGain * normGain(info),
+					OpenPCM:  func() (PCMDecoder, error) { return openSharedWithSpec(dl, spec) },
+					OpenRaw:  func() (RawStream, error) { return openSharedRaw(dl) },
+				}
+				stopLoad := context.AfterFunc(ctx, func() { _ = s.Close() })
+				extOut, backendErr = backend.Open(ctx, src)
+				stopLoad()
+			}
+			if err == nil && backend != nil {
+				openBackend()
+				if backendErr != nil && ctx.Err() == nil && info != nil && info.Level == "exhigh" && isForbiddenStreamErr(backendErr) {
+					ytm.MarkExhighForbidden()
+					_ = s.Close()
+					extOut, backendErr = nil, nil
+					if info, s, err = p.open(t, "standard"); err == nil {
+						openBackend()
+					}
 				}
 			}
 		}
@@ -821,6 +931,9 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 				return
 			}
 			p.stream, p.info = s, info
+			if p.track != nil && p.track.Duration <= 0 && s != nil && s.Len() > 0 && s.SampleRate() > 0 {
+				p.track.Duration = s.Len() * 1000 / int64(s.SampleRate())
+			}
 			p.gain = normGain(info)
 			if extOut != nil {
 				extOut.Activate()

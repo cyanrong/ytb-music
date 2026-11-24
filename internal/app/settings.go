@@ -84,6 +84,8 @@ type settings struct {
 	RoonStreamFormat string `json:"roonStreamFormat,omitempty"`
 	// SearchHistory keeps submitted keywords, most recent first.
 	SearchHistory []string `json:"searchHistory,omitempty"`
+	// LocalLiked keeps liked local track IDs ("localfile:..."), even signed out.
+	LocalLiked []string `json:"localLiked,omitempty"`
 
 	path string // where they were loaded from, and are saved to
 }

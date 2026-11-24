@@ -14,6 +14,9 @@ import (
 const sidebarWidth = 232
 
 func (a *app) view(c *ui.Context) {
+	if len(a.settings.LocalLiked) > 0 && !a.liked[a.settings.LocalLiked[0]] {
+		a.syncLocalLikes()
+	}
 	t := *c.Theme()
 	a.pal = paletteFor(&t)
 	p := a.pal
@@ -69,6 +72,7 @@ func (a *app) view(c *ui.Context) {
 	a.playlistNameDialog(c)
 	a.deletePlaylistDialog(c)
 	a.importDialog(c)
+	a.localPlaylistNameDialog(c)
 	// The video view goes once nothing shows it.
 	if a.video.view != nil && !a.videoOnScreen() {
 		a.closeVideo()
@@ -198,6 +202,7 @@ func (a *app) sidebar(c *ui.Context) {
 			a.navItem(c, iconHome, "为你推荐", route{page: pageHome})
 			a.navItem(c, iconDaily, "快速精选", route{page: pageDaily})
 			a.navItem(c, iconCharts, "排行榜", route{page: pageCharts})
+			a.navItem(c, iconFolder, "本地音乐", route{page: pageLocal})
 			if a.searched.query != "" {
 				a.navItem(c, iconSearch, "搜索结果", a.searched)
 			}
@@ -361,6 +366,8 @@ func (a *app) content(c *ui.Context) {
 		a.podcastPage(c)
 	case pagePodcasts:
 		a.podcastsPage(c)
+	case pageLocal:
+		a.localPage(c)
 	}
 }
 

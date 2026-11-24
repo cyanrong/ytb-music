@@ -2,10 +2,12 @@ package app
 
 import (
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/egoist/mygo/ui"
 
+	"ytb-music/internal/localmusic"
 	"ytb-music/internal/ytm"
 )
 
@@ -37,8 +39,11 @@ var searchKinds = []struct {
 
 // searchData is what a search found, as far as its pages have loaded.
 type searchData struct {
-	res  ytm.SearchResult
-	page paged
+	res          ytm.SearchResult
+	localSongs   []ytm.Track
+	localAlbums  []ytm.AlbumProfile
+	localArtists []ytm.ArtistProfile
+	page         paged
 }
 
 // search searches for q, of the kind last searched for.
@@ -70,9 +75,16 @@ func (a *app) searchFor(r route) {
 // loadSearch loads the first page of a search, unless it has, or again.
 func (a *app) loadSearch(r route, again bool) {
 	if a.searches[r] != nil && !again {
+		if a.local.lib != nil {
+			d := a.searches[r]
+			d.localSongs, d.localAlbums, d.localArtists = a.local.lib.Search(r.query, 24)
+		}
 		return
 	}
 	d := &searchData{}
+	if a.local.lib != nil {
+		d.localSongs, d.localAlbums, d.localArtists = a.local.lib.Search(r.query, 24)
+	}
 	a.searches[r] = d
 	a.moreResults(r, d)
 }
@@ -126,19 +138,28 @@ func (a *app) clearSearchHistory() {
 func (a *app) searchPage(c *ui.Context) {
 	r := a.route
 	d := a.searches[r]
+	if d == nil {
+		a.loadSearch(r, false)
+		d = a.searches[r]
+	}
 	header := func(c *ui.Context) { a.searchHeader(c, d) }
 	more := func() { a.moreResults(r, d) }
 	if r.kind == ytm.SearchSongs || r.kind == ytm.SearchVideos {
-		if !d.page.loaded && d.page.loading {
+		hasLocalSongs := r.kind == ytm.SearchSongs && len(d.localSongs) > 0
+		if !d.page.loaded && d.page.loading && !hasLocalSongs {
 			a.trackSkeleton(c, a.pageShimmer(c), true, header)
 			return
 		}
 		tracks := d.res.Songs
 		if r.kind == ytm.SearchVideos {
 			tracks = d.res.Videos
+		} else if hasLocalSongs {
+			tracks = append(slices.Clone(d.localSongs), tracks...)
 		}
 		a.trackRows(c, tracks, true, header, func(c *ui.Context) {
-			a.pageFoot(c, &d.page, more)
+			if !hasLocalSongs || d.page.err == "" {
+				a.pageFoot(c, &d.page, more)
+			}
 			a.searchEmpty(c, d)
 		})
 		return
@@ -146,15 +167,40 @@ func (a *app) searchPage(c *ui.Context) {
 	a.scrollPage(c, func() {
 		header(c)
 		res := &d.res
+		hasLocal := false
 		switch r.kind {
 		case ytm.SearchArtists:
-			ui.Grid(c).Columns(a.columns(c, 132)).GapX(20).GapY(28).Children(func() {
-				for i := range res.Artists {
-					a.artistCard(c.Key(res.Artists[i].ID), &res.Artists[i])
+			if len(d.localArtists) > 0 {
+				hasLocal = true
+				ui.Text(c, "本地曲库匹配").FontSize(15).FontWeight(700).Margin(0, 0, 12, 0)
+				ui.Grid(c.Key("local-artists")).Columns(a.columns(c, 132)).GapX(20).GapY(28).Children(func() {
+					for i := range d.localArtists {
+						a.artistCard(c.Key(d.localArtists[i].ID), &d.localArtists[i])
+					}
+				})
+				if len(res.Artists) > 0 {
+					a.section(c, "在线结果")
 				}
-			})
+			}
+			if len(res.Artists) > 0 {
+				ui.Grid(c.Key("ytm-artists")).Columns(a.columns(c, 132)).GapX(20).GapY(28).Children(func() {
+					for i := range res.Artists {
+						a.artistCard(c.Key(res.Artists[i].ID), &res.Artists[i])
+					}
+				})
+			}
 		case ytm.SearchAlbums:
-			a.albumGrid(c, res.Albums)
+			if len(d.localAlbums) > 0 {
+				hasLocal = true
+				ui.Text(c, "本地曲库匹配").FontSize(15).FontWeight(700).Margin(0, 0, 12, 0)
+				a.albumGrid(c.Key("local-albums"), d.localAlbums)
+				if len(res.Albums) > 0 {
+					a.section(c, "在线结果")
+				}
+			}
+			if len(res.Albums) > 0 {
+				a.albumGrid(c.Key("ytm-albums"), res.Albums)
+			}
 		case ytm.SearchPlaylists:
 			ui.Grid(c).Columns(a.columns(c, 156)).GapX(20).GapY(28).Children(func() {
 				for i := range res.Playlists {
@@ -170,16 +216,37 @@ func (a *app) searchPage(c *ui.Context) {
 				a.podcastRow(c.Key(res.Podcasts[i].ID), &res.Podcasts[i])
 			}
 		}
-		if !d.page.loaded && d.page.loading {
+		if !d.page.loaded && d.page.loading && !hasLocal {
 			a.playlistCardsSkeleton(c, a.pageShimmer(c), a.columns(c, 156), 156, false)
 			return
 		}
-		a.pageFoot(c, &d.page, more)
+		if !hasLocal || d.page.err == "" {
+			a.pageFoot(c, &d.page, more)
+		}
 		a.searchEmpty(c, d)
 	})
 }
 
+func (a *app) searchLocalCount(kind ytm.SearchType, d *searchData) int {
+	if d == nil {
+		return 0
+	}
+	switch kind {
+	case ytm.SearchSongs:
+		return len(d.localSongs)
+	case ytm.SearchAlbums:
+		return len(d.localAlbums)
+	case ytm.SearchArtists:
+		return len(d.localArtists)
+	default:
+		return 0
+	}
+}
+
 func (a *app) searchEmpty(c *ui.Context, d *searchData) {
+	if a.searchLocalCount(a.route.kind, d) > 0 {
+		return
+	}
 	if d.page.loaded && d.res.Len() == 0 {
 		a.empty(c, "没有找到相关结果")
 	}
@@ -191,10 +258,16 @@ func (a *app) searchHeader(c *ui.Context, d *searchData) {
 	r := a.route
 	sub := "搜索"
 	at := 0
+	localCnt := a.searchLocalCount(r.kind, d)
 	for i, k := range searchKinds {
 		if k.kind == r.kind {
 			at = i
-			if d.page.loaded {
+			switch {
+			case d.page.loaded && localCnt > 0:
+				sub = fmt.Sprintf("搜索 · 本地 %d · 在线 %d %s", localCnt, d.res.Len(), k.unit)
+			case localCnt > 0:
+				sub = fmt.Sprintf("搜索 · 本地曲库 %d %s", localCnt, k.unit)
+			case d.page.loaded:
 				sub = fmt.Sprintf("搜索 · %d %s", d.res.Len(), k.unit)
 			}
 		}
@@ -210,6 +283,45 @@ func (a *app) searchHeader(c *ui.Context, d *searchData) {
 			a.show(r)
 		}
 	})
+	if r.kind == ytm.SearchSongs && (len(d.localSongs) > 0 || len(d.localAlbums) > 0 || len(d.localArtists) > 0) {
+		p := a.pal
+		ui.Row(c.Key("local-search-banner")).Gap(8).AlignItems(ui.Center).Margin(0, 0, 12, 0).PaddingX(12).Wrap().Children(func() {
+			ui.Row(c).Gap(5).AlignItems(ui.Center).Children(func() {
+				ui.Icon(c, iconFolder).Size(13.5, 13.5).TextColor(p.accent)
+				ui.Text(c, "本地曲库匹配").FontSize(12.5).FontWeight(700).TextColor(p.text)
+			})
+			for i := range min(len(d.localAlbums), 3) {
+				al := d.localAlbums[i]
+				chip := ui.ButtonBase(c.Key("s-al:" + al.ID)).Height(24).PaddingX(10).Gap(5).Radius(999).AlignItems(ui.Center).
+					Background(p.hover).Border(1, p.hairline).TextColor(p.muted).Label("本地专辑：" + al.Name).FocusRing(false)
+				if chip.Hovered() {
+					chip.Background(p.press).TextColor(p.text)
+				}
+				chip.Children(func() {
+					ui.Icon(c, iconDisc).Size(12, 12)
+					ui.Text(c, al.Name).FontSize(11.5).FontWeight(600).SingleLine()
+				})
+				if chip.Clicked() {
+					a.open(route{page: pageAlbum, id: al.ID})
+				}
+			}
+			for i := range min(len(d.localArtists), 2) {
+				ar := d.localArtists[i]
+				chip := ui.ButtonBase(c.Key("s-ar:" + ar.ID)).Height(24).PaddingX(10).Gap(5).Radius(999).AlignItems(ui.Center).
+					Background(p.hover).Border(1, p.hairline).TextColor(p.muted).Label("本地艺人：" + ar.Name).FocusRing(false)
+				if chip.Hovered() {
+					chip.Background(p.press).TextColor(p.text)
+				}
+				chip.Children(func() {
+					ui.Icon(c, iconUser).Size(12, 12)
+					ui.Text(c, ar.Name).FontSize(11.5).FontWeight(600).SingleLine()
+				})
+				if chip.Clicked() {
+					a.open(route{page: pageArtist, id: ar.ID})
+				}
+			}
+		})
+	}
 }
 
 // artistCard is an artist's round photo over their name, opening their page.
@@ -228,7 +340,13 @@ func (a *app) artistCard(c *ui.Context, ar *ytm.ArtistProfile) {
 		} else {
 			art.Shadow(0, 2, 8, -2, p.cardShade)
 		}
-		art.Children(func() { a.coverFill(c, photo, 400, 999) })
+		art.Children(func() {
+			if photo == "" && localmusic.IsLocalArtist(ar.ID) {
+				a.localDiscPlaceholder(c, 999)
+			} else {
+				a.coverFill(c, photo, 400, 999)
+			}
+		})
 		ui.Text(c, ar.Name).FontSize(13).FontWeight(500).SingleLine().AlignSelf(ui.Center)
 	})
 	if card.Clicked() {

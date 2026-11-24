@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -94,6 +95,125 @@ type hqpConn struct {
 	product  string
 }
 
+// HQPSignalInfo reports live DSP upsampling and modulator telemetry parsed from
+// HQPlayer's subscribed <Status> XML frames.
+type HQPSignalInfo struct {
+	Active        bool
+	State         int
+	Mode          string // e.g. "SDM (DSD)", "PCM"
+	Rate          int    // e.g. 11289600, 22579200, 705600
+	Bits          int    // e.g. 1, 20, 24, 32
+	Channels      int
+	Filter        string // e.g. "poly-sinc-gauss-long"
+	Shaper        string // e.g. "ASDM7EC-super 512+fs"
+	Clips         int    // limiter/clip counter
+	Apod          int    // apodizing counter
+	SourceRate    int
+	SourceBits    int
+	SourceBitrate int // bps from <metadata bitrate="..."/>
+	SourceSDM     bool
+}
+
+func formatHQPKHz(hz int) string {
+	v := strconv.FormatFloat(float64(hz)/1000.0, 'f', 1, 64)
+	return strings.TrimSuffix(v, ".0")
+}
+
+func hqpDSDName(rate int) string {
+	switch rate {
+	case 2822400:
+		return "DSD64"
+	case 5644800:
+		return "DSD128"
+	case 11289600:
+		return "DSD256"
+	case 22579200:
+		return "DSD512"
+	case 45158400:
+		return "DSD1024"
+	case 90316800:
+		return "DSD2048"
+	case 3072000:
+		return "DSD64x48"
+	case 6144000:
+		return "DSD128x48"
+	case 12288000:
+		return "DSD256x48"
+	case 24576000:
+		return "DSD512x48"
+	case 49152000:
+		return "DSD1024x48"
+	case 98304000:
+		return "DSD2048x48"
+	}
+	if rate >= 2822400 && rate%44100 == 0 {
+		return fmt.Sprintf("DSD%d", rate/44100)
+	}
+	if rate >= 3072000 && rate%48000 == 0 {
+		return fmt.Sprintf("DSD%dx48", rate/48000)
+	}
+	return ""
+}
+
+func (s HQPSignalInfo) isSDM() bool {
+	m := strings.ToUpper(s.Mode)
+	return strings.Contains(m, "SDM") || strings.Contains(m, "DSD") || s.Bits == 1 || s.Rate >= 2822400
+}
+
+// OutputBadge returns a concise output format label such as "DSD256", "DSD256x48", or "PCM 705.6k/24b".
+func (s HQPSignalInfo) OutputBadge() string {
+	if !s.Active || s.Rate <= 0 {
+		return ""
+	}
+	if s.isSDM() {
+		if name := hqpDSDName(s.Rate); name != "" {
+			return name
+		}
+		return fmt.Sprintf("SDM %.2fMHz", float64(s.Rate)/1e6)
+	}
+	if s.Bits > 0 {
+		return fmt.Sprintf("PCM %sk/%db", formatHQPKHz(s.Rate), s.Bits)
+	}
+	return fmt.Sprintf("PCM %sk", formatHQPKHz(s.Rate))
+}
+
+// OutputDetail returns a detailed output signal description such as "SDM · DSD256 (11.29 MHz / 1-bit)".
+func (s HQPSignalInfo) OutputDetail() string {
+	if !s.Active || s.Rate <= 0 {
+		return ""
+	}
+	if s.isSDM() {
+		bits := s.Bits
+		if bits <= 0 {
+			bits = 1
+		}
+		if name := hqpDSDName(s.Rate); name != "" {
+			return fmt.Sprintf("SDM · %s (%.2f MHz / %d-bit)", name, float64(s.Rate)/1e6, bits)
+		}
+		return fmt.Sprintf("SDM · %.2f MHz / %d-bit", float64(s.Rate)/1e6, bits)
+	}
+	if s.Bits > 0 {
+		return fmt.Sprintf("PCM · %s kHz / %d-bit", formatHQPKHz(s.Rate), s.Bits)
+	}
+	return fmt.Sprintf("PCM · %s kHz", formatHQPKHz(s.Rate))
+}
+
+// SummaryChain summarizes the active HQPlayer output rate, digital filter, and modulator/shaper.
+func (s HQPSignalInfo) SummaryChain() string {
+	badge := s.OutputBadge()
+	if badge == "" {
+		return ""
+	}
+	parts := []string{badge}
+	if f := strings.TrimSpace(s.Filter); f != "" {
+		parts = append(parts, f)
+	}
+	if sh := strings.TrimSpace(s.Shaper); sh != "" {
+		parts = append(parts, sh)
+	}
+	return strings.Join(parts, " · ")
+}
+
 // HQPlayerBackend delivers native-rate 24-bit WAV (via local file:/// URI on
 // the same host, or HTTP 206 byte-range WAV across LAN) to Signalyst HQPlayer
 // Desktop / Embedded via its TCP 4321 XML control protocol.
@@ -105,6 +225,10 @@ type HQPlayerBackend struct {
 	cfgMu   sync.RWMutex
 	addr    string
 	onState func(connected bool, detail string)
+
+	sigMu    sync.RWMutex
+	signal   HQPSignalInfo
+	onSignal func(HQPSignalInfo)
 
 	retired atomic.Bool
 	cmdMu   sync.Mutex
@@ -166,6 +290,7 @@ func (b *HQPlayerBackend) Disconnect() {
 		hc.closed.Store(true)
 		_ = hc.conn.Close()
 	}
+	b.updateSignal(HQPSignalInfo{})
 	b.emitState(false, "未连接")
 }
 
@@ -193,8 +318,37 @@ func (b *HQPlayerBackend) DisconnectAsync(sendStop bool) {
 			_ = hc.conn.Close()
 		}
 		b.cmdMu.Unlock()
+		b.updateSignal(HQPSignalInfo{})
 		b.emitState(false, "未连接")
 	}()
+}
+
+// SetOnSignal registers a callback notified whenever HQPlayer's live DSP signal telemetry changes.
+func (b *HQPlayerBackend) SetOnSignal(fn func(HQPSignalInfo)) {
+	b.sigMu.Lock()
+	b.onSignal = fn
+	b.sigMu.Unlock()
+}
+
+// Signal returns the latest HQPlayer DSP signal telemetry snapshot.
+func (b *HQPlayerBackend) Signal() HQPSignalInfo {
+	b.sigMu.RLock()
+	defer b.sigMu.RUnlock()
+	return b.signal
+}
+
+func (b *HQPlayerBackend) updateSignal(next HQPSignalInfo) {
+	b.sigMu.Lock()
+	if b.signal == next {
+		b.sigMu.Unlock()
+		return
+	}
+	b.signal = next
+	fn := b.onSignal
+	b.sigMu.Unlock()
+	if fn != nil {
+		fn(next)
+	}
 }
 
 func (b *HQPlayerBackend) emitState(ok bool, detail string) {
@@ -271,7 +425,7 @@ func (b *HQPlayerBackend) readLoop(hc *hqpConn) {
 		if err != nil {
 			hc.closed.Store(true)
 			_ = hc.conn.Close()
-			b.connPtr.CompareAndSwap(hc, nil)
+			swapped := b.connPtr.CompareAndSwap(hc, nil)
 			hc.waitMu.Lock()
 			ch := hc.waitCh
 			hc.waitCh = nil
@@ -280,7 +434,10 @@ func (b *HQPlayerBackend) readLoop(hc *hqpConn) {
 			if ch != nil {
 				ch <- xmlReply{err: err}
 			}
-			b.emitState(false, "连接已断开")
+			if swapped || b.connPtr.Load() == nil {
+				b.updateSignal(HQPSignalInfo{})
+				b.emitState(false, "连接已断开")
+			}
 			return
 		}
 		parsedTag, attrs, perr := parseXMLAttrs(doc)
@@ -482,9 +639,49 @@ func buildHQPPlaylistAdd(uri string, src player.TrackSource, coverURL string, du
 	)
 }
 
+func (b *HQPlayerBackend) newActiveSink(epoch, seq uint64, src player.TrackSource, targetURI, wavURL, coverURL string, actualDur time.Duration) *hqpSink {
+	sinkCtx, sinkCancel := context.WithCancel(context.Background())
+	sink := &hqpSink{
+		backend:  b,
+		epoch:    epoch,
+		seq:      seq,
+		src:      src,
+		uri:      targetURI,
+		wavURL:   wavURL,
+		coverURL: coverURL,
+		duration: actualDur,
+		posAt:    b.nowTime(),
+		ctx:      sinkCtx,
+		cancel:   sinkCancel,
+		wakeCh:   make(chan struct{}, 1),
+		stopCh:   make(chan struct{}),
+	}
+	go sink.transportWorker()
+	sink.SetSinkVolume(src.Gain)
+	return sink
+}
+
 func (b *HQPlayerBackend) Open(ctx context.Context, src player.TrackSource) (player.OutputSink, error) {
 	epoch := b.epoch.Add(1)
 	addr := b.Addr()
+
+	// Bit-perfect native file pass-through for same-host HQPlayer on supported local files.
+	if !b.ForceHTTP && isLocalHQPPeer(addr) && src.NativeHQP && src.LocalPath != "" {
+		if st, serr := os.Stat(src.LocalPath); serr == nil && !st.IsDir() {
+			if _, err := b.execForEpoch(ctx, epoch, "PlaylistClear", `<PlaylistClear/>`, 5*time.Second); err != nil {
+				return nil, err
+			}
+			targetURI := LocalFileURI(src.LocalPath)
+			actualDur := src.Duration
+			addCmd := buildHQPPlaylistAdd(targetURI, src, "", actualDur)
+			if _, err := b.execForEpoch(ctx, epoch, "PlaylistAdd", addCmd, 25*time.Second); err != nil {
+				return nil, fmt.Errorf("HQPlayer 加载音轨失败: %w", err)
+			}
+			return b.newActiveSink(epoch, 0, src, targetURI, "", "", actualDur), nil
+		} else if src.OpenPCM == nil {
+			return nil, serr
+		}
+	}
 
 	// Verify HQPlayer TCP 4321 control connection upfront before decoding PCM.
 	if _, err := b.execForEpoch(ctx, epoch, "PlaylistClear", `<PlaylistClear/>`, 5*time.Second); err != nil {
@@ -509,25 +706,120 @@ func (b *HQPlayerBackend) Open(ctx context.Context, src player.TrackSource) (pla
 		return nil, fmt.Errorf("HQPlayer 加载音轨失败: %w", err)
 	}
 
-	sinkCtx, sinkCancel := context.WithCancel(context.Background())
-	sink := &hqpSink{
-		backend:  b,
-		epoch:    epoch,
-		seq:      seq,
-		src:      src,
-		uri:      targetURI,
-		wavURL:   wavURL,
-		coverURL: coverURL,
-		duration: actualDur,
-		posAt:    b.nowTime(),
-		ctx:      sinkCtx,
-		cancel:   sinkCancel,
-		wakeCh:   make(chan struct{}, 1),
-		stopCh:   make(chan struct{}),
+	return b.newActiveSink(epoch, seq, src, targetURI, wavURL, coverURL, actualDur), nil
+}
+
+func firstNonEmptyAttr(attrs map[string]string, keys ...string) string {
+	for _, k := range keys {
+		if v := strings.TrimSpace(attrs[k]); v != "" {
+			return v
+		}
 	}
-	go sink.transportWorker()
-	sink.SetSinkVolume(src.Gain)
-	return sink, nil
+	return ""
+}
+
+func parseHQPBoolAttr(v string) bool {
+	v = strings.TrimSpace(v)
+	return v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+}
+
+func parseHQPSignal(attrs map[string]string, state int, prev HQPSignalInfo) HQPSignalInfo {
+	active := state == 1 || state == 2
+	if !active {
+		return HQPSignalInfo{Active: false, State: state}
+	}
+
+	_, hasRate := attrs["rate"]
+	if !hasRate && prev.Active {
+		sig := prev
+		sig.Active = true
+		sig.State = state
+		if v := firstNonEmptyAttr(attrs, "clips", "clip"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				sig.Clips = n
+			}
+		}
+		if v := firstNonEmptyAttr(attrs, "apod", "apodizing"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				sig.Apod = n
+			}
+		}
+		if v := firstNonEmptyAttr(attrs, "filter", "active_filter"); v != "" {
+			sig.Filter = v
+		}
+		if v := firstNonEmptyAttr(attrs, "shaper", "modulator", "dither"); v != "" {
+			sig.Shaper = v
+		}
+		if v := firstNonEmptyAttr(attrs, "meta_bitrate", "bitrate", "src_bitrate"); v != "" {
+			if n, err := strconv.Atoi(v); err == nil {
+				sig.SourceBitrate = n
+			}
+		}
+		return sig
+	}
+
+	rate, _ := strconv.Atoi(strings.TrimSpace(attrs["rate"]))
+	bits, _ := strconv.Atoi(strings.TrimSpace(attrs["bits"]))
+	channels, _ := strconv.Atoi(strings.TrimSpace(attrs["channels"]))
+	clips, _ := strconv.Atoi(firstNonEmptyAttr(attrs, "clips", "clip"))
+	apod, _ := strconv.Atoi(firstNonEmptyAttr(attrs, "apod", "apodizing"))
+	filter := firstNonEmptyAttr(attrs, "filter", "active_filter")
+	shaper := firstNonEmptyAttr(attrs, "shaper", "modulator", "dither")
+
+	srcRate, _ := strconv.Atoi(firstNonEmptyAttr(attrs, "src_rate", "source_rate", "orig_rate", "meta_samplerate", "meta_sample_rate", "meta_rate"))
+	srcBits, _ := strconv.Atoi(firstNonEmptyAttr(attrs, "src_bits", "source_bits", "orig_bits", "meta_bits", "meta_bitdepth", "meta_bit_depth"))
+	srcBitrate, _ := strconv.Atoi(firstNonEmptyAttr(attrs, "meta_bitrate", "bitrate", "src_bitrate"))
+	srcSDM := parseHQPBoolAttr(firstNonEmptyAttr(attrs, "src_sdm", "source_sdm", "orig_sdm", "meta_sdm")) || srcBits == 1 || srcRate >= 2822400
+
+	if prev.Active && prev.Rate == rate {
+		if srcBitrate == 0 {
+			srcBitrate = prev.SourceBitrate
+		}
+		if srcRate == 0 {
+			srcRate = prev.SourceRate
+		}
+		if srcBits == 0 {
+			srcBits = prev.SourceBits
+		}
+		if !srcSDM && prev.SourceSDM && firstNonEmptyAttr(attrs, "src_sdm", "source_sdm", "orig_sdm", "meta_sdm") == "" {
+			srcSDM = prev.SourceSDM
+		}
+	}
+
+	isSDM := parseHQPBoolAttr(attrs["sdm"]) || bits == 1 || rate >= 2822400
+	mode := strings.TrimSpace(attrs["mode"])
+	switch {
+	case strings.EqualFold(mode, "sdm") || strings.EqualFold(mode, "dsd") || strings.EqualFold(mode, "sdm (dsd)"):
+		mode = "SDM (DSD)"
+	case strings.EqualFold(mode, "pcm"):
+		mode = "PCM"
+	case mode == "":
+		if isSDM {
+			mode = "SDM (DSD)"
+		} else if rate > 0 {
+			mode = "PCM"
+		}
+	}
+	if isSDM && bits == 0 {
+		bits = 1
+	}
+
+	return HQPSignalInfo{
+		Active:        true,
+		State:         state,
+		Mode:          mode,
+		Rate:          rate,
+		Bits:          bits,
+		Channels:      channels,
+		Filter:        filter,
+		Shaper:        shaper,
+		Clips:         clips,
+		Apod:          apod,
+		SourceRate:    srcRate,
+		SourceBits:    srcBits,
+		SourceBitrate: srcBitrate,
+		SourceSDM:     srcSDM,
+	}
 }
 
 func (b *HQPlayerBackend) onStatusFrame(attrs map[string]string) {
@@ -536,6 +828,11 @@ func (b *HQPlayerBackend) onStatusFrame(attrs map[string]string) {
 		return
 	}
 	posSec, _ := strconv.ParseFloat(attrs["position"], 64)
+
+	b.sigMu.RLock()
+	prevSig := b.signal
+	b.sigMu.RUnlock()
+	b.updateSignal(parseHQPSignal(attrs, state, prevSig))
 
 	b.sinkMu.Lock()
 	sink := b.active

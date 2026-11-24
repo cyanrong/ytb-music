@@ -10,6 +10,9 @@ package ytm
 
 import (
 	"errors"
+	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -171,6 +174,204 @@ type Stream struct {
 	// unknown.
 	Gain float64 `json:"gain"`
 	Peak float64 `json:"peak"`
+
+	Codec      string `json:"codec,omitempty"`      // e.g. "AAC", "FLAC", "WAV", "AIFF", "DSD64", "DSD128", "ALAC", "MP3"
+	SampleRate int    `json:"sampleRate,omitempty"` // Hz, e.g. 44100, 96000, 2822400
+	BitDepth   int    `json:"bitDepth,omitempty"`   // 1, 16, 24, 32 (0 for lossy)
+	Bitrate    int    `json:"bitrate,omitempty"`    // kbps, e.g. 128, 256, 1411, 2845
+	IsDSD      bool   `json:"isDsd,omitempty"`
+	IsCUE      bool   `json:"isCue,omitempty"`
+}
+
+func formatStreamKHz(hz int) string {
+	v := strconv.FormatFloat(float64(hz)/1000.0, 'f', 1, 64)
+	return strings.TrimSuffix(v, ".0")
+}
+
+func dsdStreamName(upperCodec string, hz int) string {
+	if upperCodec != "" {
+		return upperCodec
+	}
+	switch hz {
+	case 2822400:
+		return "DSD64"
+	case 5644800:
+		return "DSD128"
+	case 11289600:
+		return "DSD256"
+	case 22579200:
+		return "DSD512"
+	case 45158400:
+		return "DSD1024"
+	default:
+		return "DSD"
+	}
+}
+
+func dsdSampleRateForCodec(upperCodec string) int {
+	switch upperCodec {
+	case "DSD64":
+		return 2822400
+	case "DSD128":
+		return 5644800
+	case "DSD256":
+		return 11289600
+	case "DSD512":
+		return 22579200
+	case "DSD1024":
+		return 45158400
+	default:
+		return 0
+	}
+}
+
+// IsLosslessStream reports whether s is a lossless PCM or DSD stream.
+func (s *Stream) IsLosslessStream() bool {
+	if s == nil {
+		return false
+	}
+	if s.IsDSD {
+		return true
+	}
+	switch c := strings.ToUpper(strings.TrimSpace(s.Codec)); c {
+	case "FLAC", "WAV", "AIFF", "ALAC", "WV":
+		return true
+	default:
+		return strings.HasPrefix(c, "DSD")
+	}
+}
+
+// IsHiResStream reports whether s is DSD or lossless PCM above 48kHz / 16-bit.
+func (s *Stream) IsHiResStream() bool {
+	if s == nil {
+		return false
+	}
+	c := strings.ToUpper(strings.TrimSpace(s.Codec))
+	if s.IsDSD || strings.HasPrefix(c, "DSD") {
+		return true
+	}
+	return s.IsLosslessStream() && (s.SampleRate > 48000 || s.BitDepth > 16)
+}
+
+// EffectiveKbps returns the stream's bitrate in kbps, estimating from byte size
+// and duration or stream level when unknown.
+func (s *Stream) EffectiveKbps(dur time.Duration) int {
+	if s == nil {
+		return 0
+	}
+	if s.Bitrate > 0 {
+		return s.Bitrate
+	}
+	if s.Size > 0 && dur > 0 {
+		if kbps := int(math.Round(float64(s.Size) * 8 / dur.Seconds() / 1000)); kbps > 0 {
+			return kbps
+		}
+	}
+	if s.Level == "exhigh" {
+		return 256
+	}
+	return 128
+}
+
+// SpecBadge returns a compact format badge such as "FLAC 24/96", "DSD128", or "AAC 256k".
+func (s *Stream) SpecBadge() string {
+	if s == nil {
+		return ""
+	}
+	c := strings.ToUpper(strings.TrimSpace(s.Codec))
+	if s.IsDSD || strings.HasPrefix(c, "DSD") {
+		if raw := strings.TrimSpace(s.Codec); raw != "" {
+			return raw
+		}
+		return dsdStreamName(c, s.SampleRate)
+	}
+	if s.IsLosslessStream() {
+		if s.BitDepth > 0 && s.SampleRate > 0 {
+			return fmt.Sprintf("%s %d/%s", c, s.BitDepth, formatStreamKHz(s.SampleRate))
+		}
+		if s.SampleRate > 0 {
+			return fmt.Sprintf("%s %skHz", c, formatStreamKHz(s.SampleRate))
+		}
+		if s.BitDepth > 0 {
+			return fmt.Sprintf("%s %db", c, s.BitDepth)
+		}
+		return c
+	}
+	if c == "" || c == "AAC" {
+		if s.Level == "exhigh" || s.Bitrate >= 192 {
+			return "AAC 256k"
+		}
+		return "AAC 128k"
+	}
+	if s.Bitrate > 0 {
+		return fmt.Sprintf("%s %dk", c, s.Bitrate)
+	}
+	return c
+}
+
+// SpecDetail returns a single-line technical readout with bitrate and sample rate for the player bar.
+func (s *Stream) SpecDetail(dur time.Duration) string {
+	if s == nil {
+		return ""
+	}
+	c := strings.ToUpper(strings.TrimSpace(s.Codec))
+	if s.IsDSD || strings.HasPrefix(c, "DSD") {
+		label := strings.TrimSpace(s.Codec)
+		if label == "" {
+			label = dsdStreamName(c, s.SampleRate)
+		}
+		sr := s.SampleRate
+		if sr <= 0 {
+			sr = dsdSampleRateForCodec(c)
+		}
+		bits := s.BitDepth
+		if bits <= 0 {
+			bits = 1
+		}
+		if sr > 0 {
+			return fmt.Sprintf("%s · %.2fMHz / %db", label, float64(sr)/1e6, bits)
+		}
+		return label
+	}
+	if s.IsLosslessStream() {
+		var head string
+		switch {
+		case s.SampleRate > 0 && s.BitDepth > 0:
+			head = fmt.Sprintf("%s %skHz/%db", c, formatStreamKHz(s.SampleRate), s.BitDepth)
+		case s.SampleRate > 0:
+			head = fmt.Sprintf("%s %skHz", c, formatStreamKHz(s.SampleRate))
+		case s.BitDepth > 0:
+			head = fmt.Sprintf("%s %db", c, s.BitDepth)
+		default:
+			head = c
+		}
+		kbps := s.Bitrate
+		if kbps <= 0 && s.Size > 0 && dur > 0 {
+			kbps = int(math.Round(float64(s.Size) * 8 / dur.Seconds() / 1000))
+		}
+		if kbps > 0 {
+			return fmt.Sprintf("%s · %dkbps", head, kbps)
+		}
+		return head
+	}
+	if c == "" {
+		c = "AAC"
+	}
+	kbps := s.EffectiveKbps(dur)
+	sr := s.SampleRate
+	if sr <= 0 && c == "AAC" {
+		sr = 44100
+	}
+	if kbps > 0 && sr > 0 {
+		return fmt.Sprintf("%s %dkbps · %skHz", c, kbps, formatStreamKHz(sr))
+	}
+	if kbps > 0 {
+		return fmt.Sprintf("%s %dkbps", c, kbps)
+	}
+	if sr > 0 {
+		return fmt.Sprintf("%s · %skHz", c, formatStreamKHz(sr))
+	}
+	return c
 }
 
 // Levels are the stream levels, from the lowest. YouTube Music serves

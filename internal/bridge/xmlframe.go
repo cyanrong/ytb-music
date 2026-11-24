@@ -214,6 +214,11 @@ func parseXMLAttrs(doc []byte) (name string, attrs map[string]string, err error)
 				}
 				switch v := inner.(type) {
 				case xml.StartElement:
+					if depth == 1 && v.Name.Local == "metadata" {
+						for _, a := range v.Attr {
+							attrs["meta_"+a.Name.Local] = a.Value
+						}
+					}
 					depth++
 				case xml.EndElement:
 					depth--

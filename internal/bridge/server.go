@@ -365,8 +365,18 @@ func (s *Server) ensureHQPDir() (string, error) {
 }
 
 func localFileURI(absPath string) string {
+	if absPath != "" {
+		if abs, err := filepath.Abs(absPath); err == nil {
+			absPath = abs
+		}
+	}
 	slash := filepath.ToSlash(absPath)
 	return "file:///" + strings.TrimPrefix(slash, "/")
+}
+
+// LocalFileURI formats an absolute local filesystem path as a file:/// URI for HQPlayer.
+func LocalFileURI(absPath string) string {
+	return localFileURI(absPath)
 }
 
 // PrepareHQPTrack decodes src once into a materialized 24-bit stereo WAV file
@@ -384,7 +394,7 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 	}
 
 	var coverCh chan []byte
-	if picURL := strings.TrimSpace(src.Track.Album.PicURL); picURL != "" {
+	if picURL := strings.TrimSpace(src.Track.Album.PicURL); strings.HasPrefix(picURL, "http://") || strings.HasPrefix(picURL, "https://") {
 		coverCh = make(chan []byte, 1)
 		go func() {
 			data, ferr := ytm.Fetch(ytm.Sized(picURL, 600))

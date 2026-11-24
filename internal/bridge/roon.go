@@ -61,6 +61,13 @@ type RoonStatus struct {
 	Detail     string
 }
 
+// RoonAlbumGenre pairs a Roon library album and artist with its assigned genres.
+type RoonAlbumGenre struct {
+	Album  string
+	Artist string
+	Genres []string
+}
+
 type RoonCallbacks struct {
 	GetToken  func(coreID string) string
 	SaveToken func(coreID, token string)
@@ -90,6 +97,7 @@ type RoonManager struct {
 	startCancel   context.CancelFunc
 
 	browseMu sync.Mutex
+	genreMu  sync.Mutex
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -717,6 +725,262 @@ func (m *RoonManager) ensureStationPlayingSerialized(ctx context.Context, gen ui
 		cancel()
 	}
 	return nil
+}
+
+const roonGenreSessionKey = "ytb-genre-sync"
+
+type roonBrowseItem struct {
+	Title    string `json:"title"`
+	Subtitle string `json:"subtitle"`
+	ItemKey  string `json:"item_key"`
+	Hint     string `json:"hint"`
+}
+
+type roonBrowseResult struct {
+	Action string `json:"action"`
+	List   *struct {
+		Title string `json:"title"`
+		Count int    `json:"count"`
+		Level int    `json:"level"`
+	} `json:"list"`
+}
+
+type roonLoadResult struct {
+	Items  []roonBrowseItem `json:"items"`
+	Offset int              `json:"offset"`
+	List   *struct {
+		Title string `json:"title"`
+		Count int    `json:"count"`
+		Level int    `json:"level"`
+	} `json:"list"`
+}
+
+func findRoonAlbumsBucket(items []roonBrowseItem) string {
+	for _, it := range items {
+		if it.ItemKey == "" || it.Hint == "action" || it.Hint == "header" {
+			continue
+		}
+		t := strings.TrimSpace(it.Title)
+		tl := strings.ToLower(t)
+		if tl == "albums" || tl == "all albums" || tl == "view all albums" ||
+			strings.HasPrefix(tl, "albums (") || strings.HasPrefix(tl, "albums(") ||
+			t == "专辑" || t == "全部专辑" || t == "查看全部专辑" ||
+			strings.HasPrefix(t, "专辑 (") || strings.HasPrefix(t, "专辑(") || strings.HasPrefix(t, "专辑（") {
+			return it.ItemKey
+		}
+	}
+	return ""
+}
+
+func isRoonNonAlbumRow(it roonBrowseItem, atRoot bool) bool {
+	if it.Hint == "action" || it.Hint == "header" {
+		return true
+	}
+	t := strings.TrimSpace(it.Title)
+	if t == "" {
+		return true
+	}
+	if strings.TrimSpace(it.Subtitle) != "" {
+		return false
+	}
+	tl := strings.ToLower(t)
+	switch tl {
+	case "play genre", "play now", "play all", "shuffle", "start radio", "roon radio",
+		"播放流派", "立即播放", "播放全部", "随机播放":
+		return true
+	}
+	if !atRoot {
+		switch tl {
+		case "artists", "all artists", "composers", "subgenres",
+			"艺术家", "全部艺术家", "作曲家", "子流派":
+			return true
+		}
+	}
+	return false
+}
+
+// FetchLibraryGenres traverses Roon's "genres" browse hierarchy using an isolated
+// multi_session_key ("ytb-genre-sync") so Live Radio browsing is never disturbed,
+// returning deduplicated (Album, Artist) -> Genres mappings.
+func (m *RoonManager) FetchLibraryGenres(ctx context.Context) ([]RoonAlbumGenre, error) {
+	m.genreMu.Lock()
+	defer m.genreMu.Unlock()
+
+	m.mu.RLock()
+	sess := m.moo
+	paired := m.status.Paired
+	m.mu.RUnlock()
+	if sess == nil || !paired {
+		return nil, errors.New("尚未连接或授权 Roon Core")
+	}
+
+	browseGenres := func(opts map[string]any) (roonBrowseResult, error) {
+		req := map[string]any{
+			"hierarchy":         "genres",
+			"multi_session_key": roonGenreSessionKey,
+		}
+		for k, v := range opts {
+			req[k] = v
+		}
+		msg, err := sess.Request(ctx, "com.roonlabs.browse:1/browse", req)
+		if err != nil {
+			return roonBrowseResult{}, err
+		}
+		if !isMOOSuccess(msg) {
+			return roonBrowseResult{}, fmt.Errorf("roon browse genres failed: %s", msg.Name)
+		}
+		var res roonBrowseResult
+		_ = json.Unmarshal(msg.Body, &res)
+		return res, nil
+	}
+
+	loadAll := func() ([]roonBrowseItem, error) {
+		const pageSize = 100
+		var all []roonBrowseItem
+		offset := 0
+		for {
+			if err := ctx.Err(); err != nil {
+				return nil, err
+			}
+			msg, err := sess.Request(ctx, "com.roonlabs.browse:1/load", map[string]any{
+				"hierarchy":         "genres",
+				"multi_session_key": roonGenreSessionKey,
+				"offset":            offset,
+				"count":             pageSize,
+			})
+			if err != nil {
+				return nil, err
+			}
+			if !isMOOSuccess(msg) {
+				return nil, fmt.Errorf("roon load genres failed: %s", msg.Name)
+			}
+			var page roonLoadResult
+			if err := json.Unmarshal(msg.Body, &page); err != nil {
+				return nil, err
+			}
+			if len(page.Items) == 0 {
+				break
+			}
+			if offset > 0 && len(all) > 0 && page.Items[0].ItemKey != "" && page.Items[0].ItemKey == all[0].ItemKey {
+				break
+			}
+			all = append(all, page.Items...)
+			offset += len(page.Items)
+			if page.List != nil && page.List.Count > 0 {
+				if offset >= page.List.Count {
+					break
+				}
+				continue
+			}
+			if len(page.Items) < pageSize {
+				break
+			}
+		}
+		return all, nil
+	}
+
+	if _, err := browseGenres(map[string]any{"pop_all": true}); err != nil {
+		return nil, err
+	}
+	genreItems, err := loadAll()
+	if err != nil {
+		return nil, err
+	}
+
+	type albumKey struct {
+		album  string
+		artist string
+	}
+	var out []RoonAlbumGenre
+	idxByKey := make(map[albumKey]int)
+	addAlbumGenre := func(album, artist, genre string) {
+		album = strings.TrimSpace(album)
+		artist = strings.TrimSpace(artist)
+		genre = strings.TrimSpace(genre)
+		if album == "" || genre == "" {
+			return
+		}
+		k := albumKey{
+			album:  strings.ToLower(album),
+			artist: strings.ToLower(artist),
+		}
+		idx, ok := idxByKey[k]
+		if !ok {
+			idx = len(out)
+			idxByKey[k] = idx
+			out = append(out, RoonAlbumGenre{
+				Album:  album,
+				Artist: artist,
+				Genres: []string{genre},
+			})
+			return
+		}
+		for _, existing := range out[idx].Genres {
+			if strings.EqualFold(existing, genre) {
+				return
+			}
+		}
+		out[idx].Genres = append(out[idx].Genres, genre)
+	}
+
+	for _, g := range genreItems {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		genreName := strings.TrimSpace(g.Title)
+		if genreName == "" || g.ItemKey == "" || isRoonNonAlbumRow(g, true) {
+			continue
+		}
+		brRes, err := browseGenres(map[string]any{"item_key": g.ItemKey})
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+		if brRes.Action != "" && brRes.Action != "list" {
+			continue
+		}
+
+		children, err := loadAll()
+		if err != nil {
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			_, _ = browseGenres(map[string]any{"pop_levels": 1})
+			continue
+		}
+
+		if albumsKey := findRoonAlbumsBucket(children); albumsKey != "" {
+			subRes, serr := browseGenres(map[string]any{"item_key": albumsKey})
+			if serr == nil && (subRes.Action == "" || subRes.Action == "list") {
+				if albumItems, lerr := loadAll(); lerr == nil {
+					for _, it := range albumItems {
+						if !isRoonNonAlbumRow(it, false) {
+							addAlbumGenre(it.Title, it.Subtitle, genreName)
+						}
+					}
+				} else if ctx.Err() != nil {
+					return nil, ctx.Err()
+				}
+				_, _ = browseGenres(map[string]any{"pop_levels": 1})
+			} else if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+		} else {
+			for _, it := range children {
+				if !isRoonNonAlbumRow(it, false) {
+					addAlbumGenre(it.Title, it.Subtitle, genreName)
+				}
+			}
+		}
+
+		if _, perr := browseGenres(map[string]any{"pop_levels": 1}); perr != nil && ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+	}
+
+	return out, nil
 }
 
 // --- SOOD v2 Discovery ---

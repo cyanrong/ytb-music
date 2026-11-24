@@ -30,6 +30,7 @@ const (
 	pageUser
 	pagePodcast
 	pagePodcasts
+	pageLocal
 )
 
 type route struct {
@@ -165,6 +166,7 @@ type app struct {
 	settings        settings
 	settingsWin     *mygo.Window
 	audio           audioChainState
+	local           localUIState
 	proxyMode       int    // 0: system, 1: custom, 2: direct
 	proxyInput      string // custom proxy address edited in settings
 	proxyMasked     bool   // true while proxyInput holds an unedited RedactedProxy mask
@@ -245,6 +247,7 @@ func Run() error {
 	mygo.App.WhenReady(func() {
 		ytm.Language = "zh-CN"
 		a.settings = loadSettings()
+		a.syncLocalLikes()
 		a.initLocalPlaylists()
 		_ = ytm.SetProxy(a.settings.Proxy)
 		ytm.InitWebViewProxy(a.settings.Proxy)
@@ -268,6 +271,7 @@ func Run() error {
 		}
 		a.volume = a.settings.Volume
 		a.pl.SetVolume(a.volume)
+		a.initLocalLibrary()
 		a.initAudioChain()
 		a.win = mygo.NewWindow(mygo.WindowOptions{
 			Title:         mygo.App.Name(),
@@ -363,6 +367,7 @@ func Run() error {
 		a.settings.Volume = a.volume
 		a.settings.save()
 		a.saveSession()
+		a.closeLocalLibrary()
 		a.closeAudioChain()
 		if write := a.transcriptWrite(); write != nil {
 			write()

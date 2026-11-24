@@ -2,7 +2,9 @@ package app
 
 import (
 	"math"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
@@ -206,7 +208,7 @@ func (a *app) nowPlayingBody(c *ui.Context, tr *ytm.Track, art *artwork, accent 
 				ui.Row(c).Height(16).AlignItems(ui.Center).Children(func() {
 					ui.Text(c, clock(pl.Position())).FontSize(11).FontFeatures("tnum").TextColor(white.Alpha(0.5))
 					ui.Spacer(c)
-					qualityBadge(c, pl.Stream())
+					a.qualityBadge(c)
 					ui.Spacer(c)
 					status := "-" + clock(pl.Duration()-pl.Position())
 					if pl.Loading() {
@@ -453,17 +455,51 @@ func (a *app) radioChip(c *ui.Context, name string) {
 	}
 }
 
-// qualityBadge marks a lossless stream, as it plays.
-func qualityBadge(c *ui.Context, st *ytm.Stream) {
-	if st == nil || !ytm.Lossless(st.Level) {
+// qualityBadge shows the live stream format and any active HQPlayer upsampling chain.
+func (a *app) qualityBadge(c *ui.Context) {
+	st := a.pl.Stream()
+	if st == nil {
 		return
 	}
-	label := "无损"
-	if st.Level == "hires" {
-		label = "Hi-Res"
+	dur := a.pl.Duration()
+	gold := false
+	label := st.SpecDetail(dur)
+	tip := ""
+
+	if normalizeOutputMode(a.settings.OutputMode) == outputHQPlayer {
+		if out := a.audio.hqpSignal.OutputBadge(); out != "" {
+			gold = true
+			tip = a.audio.hqpSignal.SummaryChain()
+			parts := []string{st.SpecBadge() + " → " + out}
+			if sf := strings.TrimPrefix(strings.TrimSpace(a.audio.hqpSignal.Filter), "poly-sinc-"); sf != "" {
+				parts = append(parts, sf)
+			}
+			if sh, _, _ := strings.Cut(strings.TrimSpace(a.audio.hqpSignal.Shaper), " "); sh != "" {
+				cand := strings.Join(append(parts, sh), " · ")
+				if utf8.RuneCountInString(cand) <= 56 {
+					parts = append(parts, sh)
+				}
+			}
+			label = strings.Join(parts, " · ")
+		}
 	}
-	ui.Text(c, label).FontSize(9.5).FontWeight(800).LetterSpacing(0.6).TextColor(ui.Hex("#f5d58a")).
-		Padding(1, 6).Radius(4).Border(1, ui.Hex("#f5d58a").Alpha(0.55))
+	if !gold && st.IsLosslessStream() {
+		gold = true
+	}
+
+	fg := white.Alpha(0.72)
+	border := white.Alpha(0.22)
+	bg := white.Alpha(0.05)
+	if gold {
+		fg = ui.Hex("#f5d58a")
+		border = ui.Hex("#f5d58a").Alpha(0.55)
+		bg = ui.Hex("#f5d58a").Alpha(0.08)
+	}
+	el := ui.Text(c, label).FontSize(9.5).FontWeight(700).FontFeatures("tnum").LetterSpacing(0.25).
+		TextColor(fg).Padding(1, 6).Radius(4).Background(bg).Border(1, border).SingleLine().Shrink(1)
+	if tip != "" {
+		el.Tooltip(tip)
+	}
 }
 
 // stageBar is the slim bar along the foot of the stage: what plays, where
@@ -487,8 +523,9 @@ func (a *app) stageBar(c *ui.Context, tr *ytm.Track, art *artwork, accent ui.Col
 				a.songMenu(c.Key("more"), tr, 17, white.Alpha(0.6)).Margin(0, 0, 0, -10)
 			})
 			a.transport(c, white, white.Alpha(0.45), white, 22)
-			ui.Row(c).Grow(1).Basis(0).MinWidth(0).Justify(ui.End).Children(func() {
-				ui.Text(c, clock(pl.Position())+" / "+clock(pl.Duration())).FontSize(11.5).FontFeatures("tnum").TextColor(white.Alpha(0.5))
+			ui.Row(c).Grow(1).Basis(0).MinWidth(0).Gap(8).AlignItems(ui.Center).Justify(ui.End).Children(func() {
+				a.qualityBadge(c)
+				ui.Text(c, clock(pl.Position())+" / "+clock(pl.Duration())).FontSize(11.5).FontFeatures("tnum").TextColor(white.Alpha(0.5)).Shrink(0)
 			})
 		})
 	})

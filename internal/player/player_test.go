@@ -1,11 +1,14 @@
 package player
 
 import (
+	"context"
 	"fmt"
+	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -314,3 +317,186 @@ func TestSkipGuardAndErrorText(t *testing.T) {
 		t.Fatalf("bot check err = %q, want localized bot-check prompt", p.err)
 	}
 }
+
+type fakeLocalDecoder struct {
+	rate   int
+	ch     int
+	frames int64
+	pos    int64
+	closed *atomic.Int32
+}
+
+func (d *fakeLocalDecoder) SampleRate() int { return d.rate }
+func (d *fakeLocalDecoder) Channels() int   { return d.ch }
+func (d *fakeLocalDecoder) Len() int64      { return d.frames }
+func (d *fakeLocalDecoder) SetPosition(frame int64) error {
+	d.pos = frame
+	return nil
+}
+func (d *fakeLocalDecoder) Read(dst []float32) (int, error) {
+	if d.pos >= d.frames {
+		return 0, io.EOF
+	}
+	wantFrames := min(int64(len(dst)/d.ch), d.frames-d.pos)
+	for i := range int(wantFrames) {
+		frameIdx := d.pos + int64(i)
+		sig := float32(0.5 * math.Sin(2*math.Pi*440*float64(frameIdx)/float64(d.rate)))
+		for c := range d.ch {
+			dst[i*d.ch+c] = sig * float32(c+1)
+		}
+	}
+	d.pos += wantFrames
+	return int(wantFrames) * d.ch, nil
+}
+func (d *fakeLocalDecoder) Close() error {
+	if d.closed != nil {
+		d.closed.Add(1)
+	}
+	return nil
+}
+
+type stubLocalProvider struct {
+	closed atomic.Int32
+}
+
+func (s *stubLocalProvider) IsLocalTrack(id string) bool {
+	return strings.HasPrefix(id, "localfile:")
+}
+
+func (s *stubLocalProvider) OpenLocalTrack(id string) (*LocalOpenedTrack, error) {
+	return &LocalOpenedTrack{
+		Decoder:   &fakeLocalDecoder{rate: 96000, ch: 1, frames: 96000 * 2, closed: &s.closed},
+		Stream:    &ytm.Stream{Codec: "FLAC", BitDepth: 24, Bitrate: 2845},
+		LocalPath: "/music/test.flac",
+		NativeHQP: true,
+		Cover:     []byte{0xFF, 0xD8, 0xFF, 0xD9},
+	}, nil
+}
+
+func (s *stubLocalProvider) LocalLyrics(id string) (lrc, trans string, plain []string) {
+	return "[00:01.00]First line\n[00:03.00]Second line", "[00:01.00]第一行", nil
+}
+
+type stubSink struct {
+	playing bool
+	pos     time.Duration
+	dur     time.Duration
+}
+
+func (s *stubSink) Activate()                {}
+func (s *stubSink) Play()                    { s.playing = true }
+func (s *stubSink) Pause()                   { s.playing = false }
+func (s *stubSink) Playing() bool            { return s.playing }
+func (s *stubSink) Seek(t time.Duration)     { s.pos = t }
+func (s *stubSink) Position() time.Duration  { return s.pos }
+func (s *stubSink) Duration() time.Duration  { return s.dur }
+func (s *stubSink) SetSinkVolume(v float64)  {}
+func (s *stubSink) OnSinkEnd(fn func())      {}
+func (s *stubSink) DirectTransport() bool    { return true }
+func (s *stubSink) Close()                   { s.playing = false }
+
+type stubBackend struct {
+	gotSrc TrackSource
+}
+
+func (b *stubBackend) Name() string { return "stub" }
+func (b *stubBackend) Open(_ context.Context, src TrackSource) (OutputSink, error) {
+	b.gotSrc = src
+	dec, err := src.OpenPCM()
+	if err != nil {
+		return nil, err
+	}
+	buf := make([]float32, fftSize*2*2)
+	_, _ = dec.Read(buf)
+	_ = dec.Close()
+	return &stubSink{dur: src.Duration}, nil
+}
+
+// Playing a local track through LocalProvider loads timed lyrics, reports 100% downloaded, normalizes mono/multichannel PCM to stereo with FFT spectrum analysis, and opens independent stereo audio via OpenAudio.
+func TestLocalProviderPlaybackLyricsAndSpectrum(t *testing.T) {
+	// Verify multichannel (>2ch) down-selection to front L/R as well.
+	var multiClosed atomic.Int32
+	multi := newLocalPCMStream(&fakeLocalDecoder{rate: 48000, ch: 6, frames: 64, closed: &multiClosed}, nil)
+	if multi.Channels() != 2 {
+		t.Fatalf("Channels() = %d, want 2", multi.Channels())
+	}
+	outBuf := make([]float32, 16)
+	n, err := multi.Read(outBuf)
+	if err != nil || n != 16 || math.Abs(float64(outBuf[3]-2*outBuf[2])) > 1e-6 {
+		t.Fatalf("6ch -> 2ch Read got n=%d err=%v samples=%v", n, err, outBuf[:4])
+	}
+	_ = multi.Close()
+	if multiClosed.Load() != 1 {
+		t.Fatalf("multi Close count = %d, want 1", multiClosed.Load())
+	}
+
+	ch := make(chan func(), 32)
+	p := New(func(fn func()) { ch <- fn })
+	prov := &stubLocalProvider{}
+	be := &stubBackend{}
+	p.Local = prov
+	p.SetBackend(be)
+
+	p.PlayQueue([]ytm.Track{{
+		ID:       "localfile:1",
+		Name:     " Waltz ",
+		Duration: 2000,
+	}}, 0)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for (!p.Ready() || !valueTrue(func() bool { _, ok := p.Lyrics(); return ok })) && time.Now().Before(deadline) {
+		select {
+		case fn := <-ch:
+			fn()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	for len(ch) > 0 {
+		(<-ch)()
+	}
+
+	if !p.Ready() || !p.Playing() {
+		t.Fatalf("local track not ready/playing: ready=%v playing=%v err=%q", p.Ready(), p.Playing(), p.Err())
+	}
+	if prog, ok := p.Downloaded(); !ok || prog != 1 {
+		t.Fatalf("Downloaded() = (%v, %v), want (1, true)", prog, ok)
+	}
+	if st := p.Stream(); st == nil || st.SampleRate != 96000 || st.SpecBadge() != "FLAC 24/96" {
+		t.Fatalf("Stream() = %+v", st)
+	}
+	if be.gotSrc.LocalPath != "/music/test.flac" || !be.gotSrc.NativeHQP {
+		t.Fatalf("TrackSource = %+v", be.gotSrc)
+	}
+	lines, loaded := p.Lyrics()
+	if !loaded || len(lines) != 2 || lines[0].Translation != "第一行" {
+		t.Fatalf("Lyrics() = (%+v, %v)", lines, loaded)
+	}
+	bands, ok := p.Levels()
+	var energy float32
+	for _, b := range bands {
+		energy += b
+	}
+	if !ok || energy <= 0 {
+		t.Fatalf("Levels() = (%v, %v), want active spectrum energy", bands, ok)
+	}
+
+	aud, err := p.OpenAudio()
+	if err != nil {
+		t.Fatalf("OpenAudio: %v", err)
+	}
+	if aud.Channels() != 2 || aud.SampleRate() != 96000 {
+		t.Fatalf("OpenAudio format = %dHz/%dch, want 96000Hz/2ch", aud.SampleRate(), aud.Channels())
+	}
+	monoCheck := make([]float32, 8)
+	an, aerr := aud.Read(monoCheck)
+	if aerr != nil || an != 8 || monoCheck[2] != monoCheck[3] {
+		t.Fatalf("mono -> stereo OpenAudio Read got n=%d err=%v samples=%v", an, aerr, monoCheck)
+	}
+	_ = aud.Close()
+	p.Stop()
+	if prov.closed.Load() < 3 {
+		t.Fatalf("decoder Close count = %d, want >= 3 (backend + OpenAudio + player stream)", prov.closed.Load())
+	}
+}
+
+func valueTrue(fn func() bool) bool { return fn() }

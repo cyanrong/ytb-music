@@ -5,6 +5,7 @@ import (
 	"github.com/egoist/mygo/transfer"
 	"github.com/egoist/mygo/ui"
 
+	"ytb-music/internal/localmusic"
 	"ytb-music/internal/ytm"
 )
 
@@ -27,6 +28,42 @@ func (a *app) songItems(tr *ytm.Track, pid string) func(m *ui.Menu) {
 	return func(m *ui.Menu) {
 		if tr.ProgramID != "" {
 			a.programItems(m, tr)
+			return
+		}
+		if localmusic.IsLocalTrack(tr.ID) {
+			if m.Item("复制歌名").Chosen() {
+				copyText(tr.Name)
+			}
+			if m.Item("复制歌名和歌手").Chosen() {
+				copyText(tr.Name + " - " + tr.ArtistNames())
+			}
+			var localPath string
+			if lt, ok := a.localTrackByID(tr.ID); ok && lt != nil {
+				localPath = lt.Path
+			}
+			m.Separator()
+			if m.Item("在文件夹中显示").Chosen() && localPath != "" {
+				showInFolder(localPath)
+			}
+			if m.Item("复制文件路径").Chosen() && localPath != "" {
+				copyText(localPath)
+			}
+			linked := tr.Album.ID != ""
+			for _, ar := range tr.Artists {
+				linked = linked || ar.ID != ""
+			}
+			if linked {
+				m.Separator()
+			}
+			for _, ar := range tr.Artists {
+				if ar.ID != "" && m.Item("查看歌手："+ar.Name).Chosen() {
+					a.openArtist(ar.ID)
+				}
+			}
+			if tr.Album.ID != "" && m.Item("查看专辑："+tr.Album.Name).Chosen() {
+				a.openPage(route{page: pageAlbum, id: tr.Album.ID})
+			}
+			a.localSongPlaylistItems(m, tr, pid)
 			return
 		}
 		if tr.Playable() && m.Item("开启电台").Chosen() {

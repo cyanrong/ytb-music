@@ -2,10 +2,12 @@ package app
 
 import (
 	"math"
+	"slices"
 	"time"
 
 	"github.com/egoist/mygo/ui"
 
+	"ytb-music/internal/localmusic"
 	"ytb-music/internal/ytm"
 )
 
@@ -20,6 +22,21 @@ var (
 	programsLiked = ytm.ProgramsLiked
 )
 
+// syncLocalLikes merges persisted local liked track IDs into a.liked.
+func (a *app) syncLocalLikes() {
+	if len(a.settings.LocalLiked) == 0 {
+		return
+	}
+	if a.liked == nil {
+		a.liked = make(map[string]bool, len(a.settings.LocalLiked))
+	}
+	for _, id := range a.settings.LocalLiked {
+		if id != "" {
+			a.liked[id] = true
+		}
+	}
+}
+
 // loadLiked loads the listener's liked songs.
 func (a *app) loadLiked(uid string) {
 	go func() {
@@ -28,18 +45,36 @@ func (a *app) loadLiked(uid string) {
 			if err != nil || a.profile == nil || a.profile.UserID != uid {
 				return
 			}
-			a.liked = make(map[string]bool, len(ids))
+			a.liked = make(map[string]bool, len(ids)+len(a.settings.LocalLiked))
 			for _, id := range ids {
 				a.liked[id] = true
 			}
+			a.syncLocalLikes()
 		})
 	}()
 }
 
 // toggleLike likes a song or an episode, or unlikes it, at once in the app
 // and then with NetEase, which may refuse: the heart goes back then. Signed
-// out, it asks the listener to sign in.
+// out, it asks the listener to sign in (except for local library tracks).
 func (a *app) toggleLike(tr *ytm.Track) {
+	if localmusic.IsLocalTrack(tr.ID) {
+		if a.liked == nil {
+			a.liked = map[string]bool{}
+		}
+		id := tr.ID
+		like := !a.isLiked(tr)
+		a.setLiked(id, like)
+		if like {
+			if !slices.Contains(a.settings.LocalLiked, id) {
+				a.settings.LocalLiked = append(a.settings.LocalLiked, id)
+			}
+		} else {
+			a.settings.LocalLiked = slices.DeleteFunc(slices.Clone(a.settings.LocalLiked), func(s string) bool { return s == id })
+		}
+		_ = a.settings.save()
+		return
+	}
 	if a.profile == nil {
 		a.showMain()
 		a.openLogin()
@@ -94,6 +129,12 @@ func (a *app) isLiked(tr *ytm.Track) bool {
 	if tr.ProgramID != "" {
 		return a.likedPrograms[tr.ProgramID]
 	}
+	if localmusic.IsLocalTrack(tr.ID) {
+		if a.liked[tr.ID] {
+			return true
+		}
+		return slices.Contains(a.settings.LocalLiked, tr.ID)
+	}
 	return a.liked[tr.ID]
 }
 
@@ -106,7 +147,7 @@ func (a *app) likeCurrent() {
 	}
 	a.toggleLike(tr)
 	switch {
-	case a.profile == nil:
+	case a.profile == nil && !localmusic.IsLocalTrack(tr.ID):
 		return // asked to sign in
 	case !a.isLiked(tr):
 		a.toast = "已取消喜欢"
@@ -199,7 +240,7 @@ func (a *app) likeButton(c *ui.Context, tr *ytm.Track, size float32, color ui.Co
 	burst := ui.Local(wrap, "burst", func() time.Time { return time.Time{} })
 	if b.Clicked() {
 		switch {
-		case a.profile == nil:
+		case a.profile == nil && !localmusic.IsLocalTrack(tr.ID):
 		case liked:
 			b.Jump("pop", 0.8)
 		default:

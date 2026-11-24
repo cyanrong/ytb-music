@@ -29,15 +29,34 @@ type RawStream interface {
 	Close() error
 }
 
+// LocalOpenedTrack carries a decoded local audio stream and its metadata from a
+// LocalProvider without coupling package player to the local library package.
+type LocalOpenedTrack struct {
+	Decoder   audio.Decoder // may also implement io.Closer
+	Stream    *ytm.Stream
+	LocalPath string
+	NativeHQP bool
+	Cover     []byte
+}
+
+// LocalProvider supplies local library tracks, stream openers, and lyrics to Player.
+type LocalProvider interface {
+	IsLocalTrack(id string) bool
+	OpenLocalTrack(id string) (*LocalOpenedTrack, error)
+	LocalLyrics(id string) (lrc, trans string, plain []string)
+}
+
 // TrackSource bundles the current track's metadata and stream openers for an
 // external OutputBackend (such as HQPlayer or Roon).
 type TrackSource struct {
-	Track    ytm.Track
-	Stream   *ytm.Stream
-	Duration time.Duration
-	Gain     float64
-	OpenPCM  func() (PCMDecoder, error)
-	OpenRaw  func() (RawStream, error)
+	Track     ytm.Track
+	Stream    *ytm.Stream
+	Duration  time.Duration
+	Gain      float64
+	LocalPath string
+	NativeHQP bool
+	OpenPCM   func() (PCMDecoder, error)
+	OpenRaw   func() (RawStream, error)
 }
 
 // OutputSink controls playback of a single loaded track on either the built-in

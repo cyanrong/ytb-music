@@ -3,6 +3,7 @@ package ytm
 import (
 	"errors"
 	"fmt"
+	"math"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -151,16 +152,32 @@ func parsePlayerResp(id string, resp any, ua string, solve func(sig, n string) (
 		}
 		size, _ := strconv.ParseInt(str(f, "contentLength"), 10, 64)
 		level := "standard"
+		bitrate := 128
 		if itag == 141 {
 			level = "exhigh"
+			bitrate = 256
+		}
+		if avgBr, ok := num(f, "averageBitrate"); ok && avgBr > 0 {
+			bitrate = int(math.Round(avgBr / 1000))
+		}
+		sampleRate := 44100
+		if srStr := str(f, "audioSampleRate"); srStr != "" {
+			if sr, perr := strconv.Atoi(srStr); perr == nil && sr > 0 {
+				sampleRate = sr
+			}
+		} else if srNum, ok := num(f, "audioSampleRate"); ok && srNum > 0 {
+			sampleRate = int(srNum)
 		}
 		st := &Stream{
-			URL:       u,
-			UserAgent: ua,
-			Size:      size,
-			Type:      "m4a",
-			Level:     level,
-			Gain:      gainOf(f, resp),
+			URL:        u,
+			UserAgent:  ua,
+			Size:       size,
+			Type:       "m4a",
+			Level:      level,
+			Gain:       gainOf(f, resp),
+			Codec:      "AAC",
+			SampleRate: sampleRate,
+			Bitrate:    bitrate,
 		}
 		if itag == 141 && p.exhigh == nil {
 			p.exhigh = st

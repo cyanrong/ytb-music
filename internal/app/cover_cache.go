@@ -3,16 +3,32 @@ package app
 import (
 	"crypto/sha1"
 	"encoding/hex"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/egoist/mygo"
 
+	"ytb-music/internal/localmusic"
 	"ytb-music/internal/ytm"
 )
+
+// localCoverLoader loads localcover:// artwork bytes (set by setLocalLibrary
+// and replaceable in tests).
+var (
+	localCoverMu     sync.RWMutex
+	localCoverLoader func(url string) ([]byte, error)
+)
+
+func setLocalCoverLoader(fn func(url string) ([]byte, error)) {
+	localCoverMu.Lock()
+	localCoverLoader = fn
+	localCoverMu.Unlock()
+}
 
 // Covers come from the disk once they came from the network: the home page
 // opens with its pictures, without asking YouTube's image servers for them
@@ -35,6 +51,25 @@ var coverDir = sync.OnceValue(func() string {
 
 // fetchCover returns the picture at url: kept on disk, or fetched and kept.
 func fetchCover(url string) ([]byte, error) {
+	if localmusic.IsLocalCover(url) {
+		localCoverMu.RLock()
+		loader := localCoverLoader
+		localCoverMu.RUnlock()
+		if loader != nil {
+			if b, err := loader(url); err == nil && len(b) > 0 {
+				return b, nil
+			}
+		}
+		if cacheDir, err := mygo.App.Path(mygo.PathCache); err == nil && cacheDir != "" {
+			id := filepath.Base(strings.TrimSpace(strings.TrimPrefix(url, localmusic.CoverScheme)))
+			if id != "" && id != "." && id != ".." {
+				if b, err := os.ReadFile(filepath.Join(cacheDir, "local_covers", id)); err == nil && len(b) > 0 {
+					return b, nil
+				}
+			}
+		}
+		return nil, errors.New("local cover not found")
+	}
 	dir := coverDir()
 	if dir == "" {
 		return ytm.Fetch(url)
