@@ -1,6 +1,7 @@
 package app
 
 import (
+	"net/url"
 	"runtime"
 	"strings"
 	"time"
@@ -11,6 +12,9 @@ import (
 	"ytb-music/internal/ytm"
 )
 
+// setProxy applies the proxy route; tests wrap or inspect it.
+var setProxy = ytm.SetProxy
+
 func (a *app) syncProxyState() {
 	a.proxyErr = ""
 	switch strings.ToLower(strings.TrimSpace(a.settings.Proxy)) {
@@ -20,7 +24,35 @@ func (a *app) syncProxyState() {
 		a.proxyMode = 2
 	default:
 		a.proxyMode = 1
-		a.proxyInput = a.settings.Proxy
+		a.proxyInput = ytm.RedactedProxy(a.settings.Proxy)
+	}
+}
+
+// restoreRedactedPassword preserves the stored proxy password when the editor
+// submits the masked "xxxxx" placeholder unchanged for the same user.
+func restoreRedactedPassword(input, saved string) string {
+	inU, err1 := ytm.ParseProxy(input)
+	svU, err2 := ytm.ParseProxy(saved)
+	if err1 != nil || err2 != nil || inU == nil || svU == nil || inU.User == nil || svU.User == nil {
+		return input
+	}
+	inPass, inHas := inU.User.Password()
+	svPass, svHas := svU.User.Password()
+	if inHas && svHas && inPass == "xxxxx" && svPass != "xxxxx" && inU.User.Username() == svU.User.Username() {
+		cp := *inU
+		cp.User = url.UserPassword(svU.User.Username(), svPass)
+		return cp.String()
+	}
+	return input
+}
+
+func (a *app) onProxyRouteChanged() {
+	a.changeVideoHeight()
+	if a.art != nil {
+		a.art.clearFailed()
+	}
+	if a.homeErr != "" {
+		a.loadHome()
 	}
 }
 
@@ -30,14 +62,19 @@ func (a *app) applyCustomProxy() {
 		a.proxyErr = "请输入有效的代理地址，例如 127.0.0.1:7890 或 socks5://127.0.0.1:1080"
 		return
 	}
-	if err := ytm.SetProxy(raw); err != nil {
-		a.proxyErr = "代理地址格式不正确，请使用 http:// 或 socks5:// 地址"
+	raw = restoreRedactedPassword(raw, a.settings.Proxy)
+	prev := a.settings.Proxy
+	if err := setProxy(raw); err != nil {
+		a.proxyErr = "代理地址格式不正确，请填写有效的 http:// 或 socks5:// 主机与端口"
 		return
 	}
 	a.proxyErr = ""
 	a.settings.Proxy = raw
+	a.proxyInput = ytm.RedactedProxy(raw)
 	a.changed()
-	if a.homeErr != "" {
+	if prev != raw {
+		a.onProxyRouteChanged()
+	} else if a.homeErr != "" {
 		a.loadHome()
 	}
 }
@@ -82,6 +119,9 @@ func (a *app) changed() {
 	}
 	if a.notch != nil {
 		a.notch.setEnabled(a.settings.Notch)
+	}
+	if a.settingsWin != nil {
+		a.settingsWin.Invalidate()
 	}
 	a.redraw()
 }
@@ -207,35 +247,54 @@ func (a *app) settingsView(c *ui.Context) {
 		})
 
 		group("网络", func() {
-			desc := "自动读取环境变量与系统代理"
-			if a.proxyMode == 0 {
-				if sys := ytm.SystemProxy(); sys != "" {
-					desc = "当前跟随系统代理：" + sys
+			desc := "作用于目录、音频流、封面与歌词请求；独立登录窗口默认使用系统网络设置"
+			switch a.proxyMode {
+			case 0:
+				activeURL, src := ytm.EffectiveProxy()
+				switch {
+				case activeURL != "" && src == ytm.ProxySourceEnv:
+					desc = "当前使用环境变量代理：" + activeURL
+				case activeURL != "" && src == ytm.ProxySourcePAC:
+					desc = "当前使用系统自动代理脚本：" + activeURL
+				case activeURL != "":
+					desc = "当前使用系统代理：" + activeURL
+				case runtime.GOOS == "windows":
+					desc = "自动跟随环境变量或 Windows 系统代理（当前直连）"
+				default:
+					desc = "自动跟随 HTTP_PROXY / HTTPS_PROXY 环境变量（当前直连）"
 				}
-			} else if a.proxyMode == 2 {
-				desc = "不使用任何系统或环境变量代理，直接连接"
+			case 2:
+				desc = "目录、音频流、封面与歌词请求直接连接（独立登录窗口与系统视频组件使用系统网络设置）"
 			}
 			row("网络代理", desc, func() {
 				mode := a.proxyMode
 				if segmented(c.Key("proxy-mode"), &mode, "跟随系统", "自定义", "直连") {
 					a.proxyMode = mode
 					a.proxyErr = ""
+					prev := s.Proxy
 					switch mode {
 					case 0:
 						s.Proxy = ""
-						_ = ytm.SetProxy("")
+						_ = setProxy("")
 						a.changed()
-						if a.homeErr != "" {
+						if prev != "" {
+							a.onProxyRouteChanged()
+						} else if a.homeErr != "" {
 							a.loadHome()
 						}
 					case 1:
 						if a.proxyInput == "" && s.Proxy != "" && s.Proxy != "direct" {
-							a.proxyInput = s.Proxy
+							a.proxyInput = ytm.RedactedProxy(s.Proxy)
 						}
 					case 2:
 						s.Proxy = "direct"
-						_ = ytm.SetProxy("direct")
+						_ = setProxy("direct")
 						a.changed()
+						if prev != "direct" {
+							a.onProxyRouteChanged()
+						} else if a.homeErr != "" {
+							a.loadHome()
+						}
 					}
 				}
 			})
@@ -255,7 +314,7 @@ func (a *app) settingsView(c *ui.Context) {
 					if a.proxyErr != "" {
 						ui.Text(c, a.proxyErr).FontSize(11.5).TextColor(p.accent)
 					} else if s.Proxy != "" && s.Proxy != "direct" {
-						ui.Text(c, "已启用代理："+s.Proxy).FontSize(11.5).TextColor(p.muted)
+						ui.Text(c, "已启用代理："+ytm.RedactedProxy(s.Proxy)).FontSize(11.5).TextColor(p.muted)
 					}
 				})
 			}

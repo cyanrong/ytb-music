@@ -17,12 +17,14 @@ func TestLiveSolver(t *testing.T) {
 	if err != nil {
 		t.Fatalf("currentSolver: %v", err)
 	}
-	sig, n, err := sv.solve("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef", "abc123XYZ_def456")
+	inSig := "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789abcdef"
+	inN := "abc123XYZ_def456"
+	sig, n, err := sv.solve(inSig, inN)
 	if err != nil {
 		t.Fatalf("solve: %v", err)
 	}
-	if sig == "" || n == "" {
-		t.Fatalf("empty output: sig=%q n=%q", sig, n)
+	if sig == "" || n == "" || sig == inSig || n == inN {
+		t.Fatalf("solver did not transform inputs: sig=%q n=%q", sig, n)
 	}
 	t.Logf("player %s (sts %d) → sig=%q n=%q", sv.id, sv.sts, sig, n)
 }

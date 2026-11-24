@@ -1,6 +1,9 @@
 package jsc
 
 import (
+	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 )
@@ -14,6 +17,31 @@ func TestEval(t *testing.T) {
 	}
 	if _, err := Eval(`throw new Error("没有")`); err == nil || !strings.Contains(err.Error(), "没有") {
 		t.Fatalf("%v", err)
+	}
+}
+
+// Hostile values whose string conversion throws or cannot coerce return
+// errors instead of panicking, and sourceMappingURL comments do not read
+// files on disk.
+func TestEvalHostileValuesAndSourceMaps(t *testing.T) {
+	if _, err := Eval(`throw { toString() { throw new Error("nested"); } }`); err == nil {
+		t.Fatal("expected error when thrown object's toString throws")
+	}
+	if _, err := Eval(`({ toString() { throw new Error("bad result"); } })`); runtime.GOOS != "darwin" && err == nil {
+		t.Fatal("expected error when returned object's toString throws")
+	}
+	if _, err := Eval(`Object.create(null)`); runtime.GOOS != "darwin" && err == nil {
+		t.Fatal("expected error when converting null-prototype object")
+	}
+	_, _ = Eval(`Symbol("x")`)
+
+	dir := t.TempDir()
+	mapPath := filepath.Join(dir, "secret.map")
+	os.WriteFile(mapPath, []byte(`{"version":3,"sources":["secret.js"],"names":[],"mappings":"AAAA"}`), 0o600)
+	script := "function f() { throw new Error('boom'); }\nf();\n//# sourceMappingURL=" + filepath.ToSlash(mapPath)
+	_, err := Eval(script)
+	if err == nil || strings.Contains(err.Error(), "secret.js") {
+		t.Fatalf("source map should be ignored in compute-only context, got: %v", err)
 	}
 }
 

@@ -61,6 +61,19 @@ func newArtCache(post func(func())) *artCache {
 	return &artCache{art: map[string]*artwork{}, gone: map[string]weak.Pointer[artwork]{}, busy: map[string]bool{}, sem: make(chan struct{}, artAtOnce), post: post, now: time.Now, limit: artLimit}
 }
 
+// clearFailed forgets covers whose download failed, so the next paint
+// tries them again after network settings change.
+func (c *artCache) clearFailed() {
+	if c == nil {
+		return
+	}
+	for key, a := range c.art {
+		if a != nil && a.failed {
+			delete(c.art, key)
+		}
+	}
+}
+
 // add keeps a cover, and drops those asked for least recently once the
 // covers take more than the limit, down to three quarters of it, so that
 // it sorts them seldom. Those showing were asked for last, and stay.

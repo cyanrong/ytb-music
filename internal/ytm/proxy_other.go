@@ -4,6 +4,6 @@ package ytm
 
 import "net/url"
 
-func systemProxy(*url.URL) (*url.URL, error) {
-	return nil, nil
+func systemProxy(*url.URL) (*url.URL, ProxySource, error) {
+	return nil, ProxySourceNone, nil
 }

@@ -188,9 +188,6 @@ func (a *app) redraw() {
 	if a.win != nil {
 		a.win.Invalidate()
 	}
-	if a.settingsWin != nil {
-		a.settingsWin.Invalidate()
-	}
 	if a.notch != nil && a.notch.win != nil {
 		a.notch.win.Invalidate()
 	}
