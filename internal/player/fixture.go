@@ -37,7 +37,11 @@ func (p *Player) Hold(pos time.Duration) {
 
 // Attach makes out the current track's audio, playing.
 func (p *Player) Attach(out *audio.Player) {
-	p.out = out
+	if out == nil {
+		p.out = nil
+	} else {
+		p.out = localSink{Player: out}
+	}
 	p.playing = true
 }
 

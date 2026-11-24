@@ -293,7 +293,9 @@ func (a *app) playlistHeader(c *ui.Context, pl *ytm.Playlist) {
 		})
 		ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Gap(8).Children(func() {
 			kind := "歌单"
-			if pl.UpdateFreq != "" {
+			if isLocalPlaylist(pl.ID) {
+				kind = "本地歌单"
+			} else if pl.UpdateFreq != "" {
 				kind = "榜单 · " + pl.UpdateFreq
 			}
 			ui.Text(c, kind).FontSize(12).FontWeight(600).TextColor(p.accent)

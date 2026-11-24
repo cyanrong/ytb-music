@@ -59,6 +59,9 @@ func (a *app) isSaved(pl *ytm.Playlist) bool {
 // savable reports whether the listener may save playlist pl: anyone's but
 // their own. Signed out, saving asks them to sign in.
 func (a *app) savable(pl *ytm.Playlist) bool {
+	if isLocalPlaylist(pl.ID) {
+		return false
+	}
 	// Without an account there is nowhere to save it to yet.
 	return a.profile != nil && pl.Creator.UserID != a.profile.UserID
 }
@@ -130,7 +133,7 @@ func (a *app) loadMine(uid string) {
 		made, saved, err := ytm.UserPlaylists(uid)
 		a.post(func() {
 			if err == nil && a.profile != nil && a.profile.UserID == uid {
-				a.mine, a.saved = made, saved
+				a.mine, a.saved = a.withLocalPlaylists(made), saved
 			}
 		})
 	}()
@@ -149,13 +152,8 @@ func (a *app) playlistChanged(id string) {
 }
 
 // newPlaylist asks for the name of a playlist to make, then adds tr to it
-// if set. Signed out, it asks the listener to sign in.
+// if set. Signed out, it makes a persistent local playlist.
 func (a *app) newPlaylist(tr *ytm.Track) {
-	if a.profile == nil {
-		a.showMain()
-		a.openLogin()
-		return
-	}
 	a.naming = nameDialog{open: true, add: tr}
 }
 
@@ -179,6 +177,10 @@ func (a *app) submitName() {
 		if pl == nil || pl.Name == name {
 			return
 		}
+		if isLocalPlaylist(id) {
+			a.renameLocalPlaylist(id, name)
+			return
+		}
 		old := pl.Name
 		a.setPlaylistName(id, name)
 		go func() {
@@ -190,6 +192,17 @@ func (a *app) submitName() {
 				}
 			})
 		}()
+		return
+	}
+	if a.profile == nil {
+		d.open = false
+		var tracks []ytm.Track
+		if d.add != nil {
+			tracks = []ytm.Track{*d.add}
+		}
+		pl := a.createLocalPlaylist(name, "", "", tracks)
+		a.open(route{page: pagePlaylist, id: pl.ID})
+		a.toast = "已创建本地歌单"
 		return
 	}
 	d.busy = true
@@ -247,6 +260,11 @@ func (a *app) deleteChosen() {
 		}
 		a.show(r)
 	}
+	if isLocalPlaylist(id) {
+		a.deleteLocalPlaylist(id)
+		a.toast = "已删除歌单"
+		return
+	}
 	go func() {
 		err := deletePlaylist(id)
 		a.post(func() {
@@ -272,6 +290,18 @@ func (a *app) setPlaylistName(id string, name string) {
 
 // addTo adds tr to the listener's playlist pid; a toast says how it went.
 func (a *app) addTo(pid string, tr *ytm.Track) {
+	if isLocalPlaylist(pid) {
+		added, dup := a.addTracksToLocalPlaylist(pid, *tr)
+		switch {
+		case added == 0 && dup:
+			a.toast = "歌曲已在歌单中"
+		case added > 0:
+			a.toast = "已添加到歌单"
+		default:
+			a.toast = "添加失败，请稍后再试"
+		}
+		return
+	}
 	id := tr.ID
 	go func() {
 		err := addToPlaylist(pid, id)
@@ -292,6 +322,10 @@ func (a *app) addTo(pid string, tr *ytm.Track) {
 // removeFrom takes tr out of the listener's playlist pid, at once in the
 // app and then with NetEase, which may refuse: the song comes back then.
 func (a *app) removeFrom(pid string, tr *ytm.Track) {
+	if isLocalPlaylist(pid) {
+		a.removeTrackFromLocalPlaylist(pid, tr.ID)
+		return
+	}
 	id := tr.ID
 	pl := a.playlists[pid]
 	var before []ytm.Track
@@ -323,7 +357,7 @@ func (a *app) removeFrom(pid string, tr *ytm.Track) {
 // listener's playlists, or take it out of pid, the one it is listed in, if
 // set.
 func (a *app) playlistItems(m *ui.Menu, tr *ytm.Track, pid string) {
-	if a.profile == nil {
+	if a.profile == nil && len(a.localPlaylists) == 0 {
 		return
 	}
 	m.Separator()

@@ -345,6 +345,8 @@ func (a *app) settingsView(c *ui.Context) {
 			})
 		})
 
+		a.audioChainSettings(c, group, row)
+
 		group("网络", func() {
 			customDesc := "作用于目录、音频流、封面与歌词请求（Google 登录窗口使用系统网络设置）"
 			directDesc := "目录、音频流、封面与歌词直接连接（Google 登录窗口使用系统网络设置）"

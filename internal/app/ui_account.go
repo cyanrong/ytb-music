@@ -61,6 +61,7 @@ func (a *app) signedIn(prof *ytm.Profile) {
 	// again.
 	a.playlists = map[string]*ytm.Playlist{}
 	a.plErr = map[string]string{}
+	a.syncLocalPlaylists()
 	a.artists, a.albums, a.users, a.podcasts = map[string]*artistData{}, map[string]*albumData{}, map[string]*userData{}, map[string]*podcastData{}
 	a.podcastTab = &podcastTab{}
 	a.searches = map[route]*searchData{}
@@ -293,7 +294,7 @@ func (a *app) menuItem(c *ui.Context, icon *ui.SVG, label, shortcut string) ui.E
 // and closes them: those they made, if mine, with a button to make one
 // and a menu to rename them, or else with a menu to unsave them.
 func (a *app) myPlaylists(c *ui.Context, title string, lists []ytm.Playlist, mine bool, collapsed *bool) {
-	if len(lists) == 0 {
+	if len(lists) == 0 && !mine {
 		return
 	}
 	p := a.pal
@@ -315,6 +316,9 @@ func (a *app) myPlaylists(c *ui.Context, title string, lists []ytm.Playlist, min
 			}
 			ui.Icon(c, arrow).Size(12, 12).TextColor(p.faint)
 		})
+		if mine && iconButton(c.Key("import"), iconImport, 13, p.faint, "导入网易云歌单").Size(26, 26).Radius(6).Clicked() {
+			a.openImport()
+		}
 		if mine && iconButton(c.Key("new"), iconPlus, 13, p.faint, "新建歌单").Size(26, 26).Radius(6).Clicked() {
 			a.newPlaylist(nil)
 		}

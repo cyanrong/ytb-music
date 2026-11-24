@@ -68,6 +68,7 @@ func (a *app) view(c *ui.Context) {
 	a.loginDialog(c)
 	a.playlistNameDialog(c)
 	a.deletePlaylistDialog(c)
+	a.importDialog(c)
 	// The video view goes once nothing shows it.
 	if a.video.view != nil && !a.videoOnScreen() {
 		a.closeVideo()
@@ -90,6 +91,7 @@ func (a *app) shortcuts(c *ui.Context) {
 		a.nowPlaying = false
 		a.searchBox.Focus(c)
 	})
+	c.OnShortcut(ui.Cmd|ui.Shift, ui.KeyI, a.openImport)
 	if a.nowPlaying {
 		// Esc puts the theater's video back in the cover's place, and
 		// closes Now Playing.
@@ -488,6 +490,10 @@ func (a *app) loadPlaylist(id string, thenPlay bool) {
 		if thenPlay {
 			a.pl.PlayQueue(pl.Tracks, firstPlayable(pl.Tracks))
 		}
+		return
+	}
+	if isLocalPlaylist(id) {
+		a.plErr[id] = "本地歌单不存在"
 		return
 	}
 	if a.loadingPl[id] {

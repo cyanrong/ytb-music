@@ -1,6 +1,7 @@
 package player
 
 import (
+	"context"
 	"errors"
 	"math"
 	"math/rand/v2"
@@ -52,16 +53,18 @@ type Player struct {
 	feeding  bool // the feed is asked
 	awaiting bool // at the queue's end, for what the feed gives
 
-	track   *ytm.Track
-	out     *audio.Player
-	stream  stream
-	info    *ytm.Stream // what the current track streams
-	fade    fader
-	gain    float64 // the current track's normalizing gain
-	loading bool
-	playing bool // what the listener wants: false while paused
-	err     string
-	gen     int // counts loads, to drop the results of stale ones
+	track      *ytm.Track
+	backend    OutputBackend
+	out        OutputSink
+	stream     stream
+	info       *ytm.Stream // what the current track streams
+	fade       fader
+	gain       float64 // the current track's normalizing gain
+	loading    bool
+	playing    bool // what the listener wants: false while paused
+	err        string
+	gen        int // counts loads, to drop the results of stale ones
+	loadCancel context.CancelFunc
 
 	lyrics       []lyrics.Line
 	plainLyrics  []string // lyrics without times, when no timed ones are found
@@ -449,6 +452,26 @@ func (p *Player) Jump(i int) {
 	}
 }
 
+// Backend returns the active external audio backend, or nil for built-in output.
+func (p *Player) Backend() OutputBackend { return p.backend }
+
+// SetBackend switches audio output between the built-in OS mixer (nil) and an
+// external audiophile chain, seamlessly reopening the current track at its
+// playback position when one is loaded.
+func (p *Player) SetBackend(b OutputBackend) {
+	if p.backend == b {
+		return
+	}
+	hasTrack := p.track != nil && p.at >= 0 && p.at < len(p.order)
+	wasPlaying := p.playing
+	pos := p.Position()
+	at := p.at
+	p.backend = b
+	if hasTrack {
+		p.loadSkipping(at, 0, wasPlaying, pos)
+	}
+}
+
 // TogglePlay pauses, fading out, or plays, fading in.
 func (p *Player) TogglePlay() {
 	if p.out == nil {
@@ -463,6 +486,20 @@ func (p *Player) TogglePlay() {
 		return
 	}
 	out := p.out
+	if out.DirectTransport() {
+		if p.playing {
+			p.playing = false
+			out.Pause()
+		} else {
+			p.playing = true
+			if out.Duration() > 0 && out.Position() >= out.Duration()-time.Second {
+				out.Seek(0)
+			}
+			out.Play()
+		}
+		p.sync()
+		return
+	}
 	if p.playing {
 		p.playing = false
 		p.fade.fade(0, fadeOut, func() {
@@ -501,6 +538,11 @@ func (p *Player) Seek(t time.Duration) {
 		return
 	}
 	out := p.out
+	if out.DirectTransport() {
+		out.Seek(t)
+		p.sync()
+		return
+	}
 	// Paused, it jumps at once; but a seek on its way paused it only for
 	// the jump, and this one takes its place, playing on from there.
 	if !out.Playing() && !p.seeking {
@@ -533,12 +575,21 @@ func (p *Player) SetVolume(v float64) {
 	p.applyGain()
 }
 
+func (p *Player) effectiveGain(infoGain float64) float64 {
+	g := p.volume * p.volume
+	if p.Normalize != nil && p.Normalize() {
+		g *= infoGain
+	}
+	return g
+}
+
 // applyGain sets the volume of what plays: the listener's, which the ear
 // hears in powers, and the track's gain, if normalizing.
 func (p *Player) applyGain() {
-	g := p.volume * p.volume
-	if p.Normalize != nil && p.Normalize() {
-		g *= p.gain
+	g := p.effectiveGain(p.gain)
+	if p.out != nil && p.out.DirectTransport() {
+		p.out.SetSinkVolume(g)
+		return
 	}
 	p.fade.setGain(g)
 }
@@ -588,15 +639,39 @@ func (p *Player) Levels() ([Bands]float32, bool) {
 }
 
 func (p *Player) stop() {
-	if out := p.out; out != nil {
-		// Paused first, it fades out over a few milliseconds, rather than
-		// stopping with a click.
-		out.Pause()
-		time.AfterFunc(100*time.Millisecond, out.Close)
+	if p.loadCancel != nil {
+		p.loadCancel()
+		p.loadCancel = nil
+	}
+	out, st := p.out, p.stream
+	if out != nil {
+		if out.DirectTransport() {
+			out.Close()
+			if st != nil {
+				_ = st.Close()
+			}
+		} else {
+			// Paused first, it fades out over a few milliseconds, rather than
+			// stopping with a click.
+			out.Pause()
+			time.AfterFunc(100*time.Millisecond, func() {
+				out.Close()
+				if st != nil {
+					_ = st.Close()
+				}
+			})
+		}
+	} else if st != nil {
+		_ = st.Close()
 	}
 	p.out, p.stream, p.info = nil, nil, nil
 	p.seeking = false
-	p.fade.attach(nil, 1)
+	p.fade.attachSink(nil, 1)
+}
+
+// Stop releases any active audio sink and download when the app exits.
+func (p *Player) Stop() {
+	p.stop()
 }
 
 // load plays the track at order[at], skipping those that cannot play.
@@ -610,6 +685,9 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 	p.stop()
 	p.gen++
 	gen := p.gen
+	ctx, cancel := context.WithCancel(context.Background())
+	p.loadCancel = cancel
+	backend := p.backend
 	p.at = at
 	t := p.queue[p.order[at]]
 	p.track = &t
@@ -648,20 +726,57 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 			}
 		})
 	}()
+	initGain := p.effectiveGain(1)
 	go func() {
 		level := "standard"
 		if p.Quality != nil {
 			level = p.Quality()
 		}
 		info, s, err := p.open(t, level)
+		var extOut OutputSink
+		var backendErr error
+		if err == nil && backend != nil {
+			if ctx.Err() != nil {
+				s.Close()
+				return
+			}
+			dl, spec := s.source()
+			dur := t.Length()
+			if frames := s.Len(); frames > 0 && s.SampleRate() > 0 {
+				dur = time.Duration(float64(frames) / float64(s.SampleRate()) * float64(time.Second))
+			}
+			src := TrackSource{
+				Track:    t,
+				Stream:   info,
+				Duration: dur,
+				Gain:     initGain * normGain(info),
+				OpenPCM:  func() (PCMDecoder, error) { return openSharedWithSpec(dl, spec) },
+				OpenRaw:  func() (RawStream, error) { return openSharedRaw(dl) },
+			}
+			extOut, backendErr = backend.Open(ctx, src)
+		}
 		p.post(func() {
 			if gen != p.gen {
+				if extOut != nil {
+					extOut.Close()
+				}
 				if s != nil {
 					s.Close()
 				}
 				return
 			}
 			p.loading = false
+			if backendErr != nil {
+				if s != nil {
+					s.Close()
+				}
+				if !errors.Is(backendErr, context.Canceled) {
+					p.err = backendErr.Error()
+				}
+				p.playing = false
+				p.sync()
+				return
+			}
 			if err != nil {
 				p.err = err.Error()
 				switch {
@@ -684,15 +799,21 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 			}
 			p.stream, p.info = s, info
 			p.gain = normGain(info)
-			p.out = audio.NewPlayer(s)
-			// From its middle, as a session picked up again, it fades in.
-			level := 1.0
-			if p.pending > 0 {
-				level = 0
+			if extOut != nil {
+				p.out = extOut
+			} else {
+				p.out = localSink{Player: audio.NewPlayer(s)}
 			}
-			p.fade.attach(p.out, level)
+			if !p.out.DirectTransport() {
+				// From its middle, as a session picked up again, it fades in.
+				lvl := 1.0
+				if p.pending > 0 {
+					lvl = 0
+				}
+				p.fade.attachSink(p.out, lvl)
+			}
 			p.applyGain()
-			p.out.OnEnd(func() {
+			p.out.OnSinkEnd(func() {
 				p.post(func() {
 					if gen == p.gen {
 						p.ended()
@@ -705,7 +826,9 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 			}
 			if p.playing {
 				p.out.Play()
-				p.fade.fade(1, fadeIn, nil)
+				if !p.out.DirectTransport() {
+					p.fade.fade(1, fadeIn, nil)
+				}
 			}
 			p.sync()
 		})

@@ -44,6 +44,9 @@ func (a *app) setMenu() {
 				a.nowPlaying = false
 				a.newPlaylist(nil)
 			})},
+			{Label: "导入网易云歌单…", Accelerator: "CmdOrCtrl+Shift+I", Click: run(func() {
+				a.openImport()
+			})},
 		}},
 		{Label: "编辑", Submenu: []*mygo.MenuItem{
 			{Role: mygo.RoleUndo, Label: "撤销"},

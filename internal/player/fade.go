@@ -21,7 +21,7 @@ const (
 // would redraw the windows with each step.
 type fader struct {
 	mu    sync.Mutex
-	out   *audio.Player
+	out   OutputSink
 	gain  float64 // the listener's volume and the track's gain, together
 	from  float64 // the level faded from at start, to to over dur
 	to    float64
@@ -41,12 +41,20 @@ func (f *fader) level(now time.Time) float64 {
 
 func (f *fader) apply(now time.Time) {
 	if f.out != nil {
-		f.out.SetVolume(f.gain * f.level(now))
+		f.out.SetSinkVolume(f.gain * f.level(now))
 	}
 }
 
 // attach makes out the player faded, at level.
 func (f *fader) attach(out *audio.Player, level float64) {
+	if out == nil {
+		f.attachSink(nil, level)
+		return
+	}
+	f.attachSink(localSink{Player: out}, level)
+}
+
+func (f *fader) attachSink(out OutputSink, level float64) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.gen++

@@ -60,10 +60,13 @@ type app struct {
 	savingPl     map[string]bool // the playlists whose saving or its end is on its way
 	recPlaylists []ytm.Playlist  // the day's playlists picked for the listener
 	login        loginState
-	accountOpen  bool            // the dropdown of the account row shows
-	naming       nameDialog      // the name of a playlist asked for
-	deleting     deleteDialog    // whether to delete a playlist, asked
-	liked        map[string]bool // the songs the listener likes
+	accountOpen    bool            // the dropdown of the account row shows
+	naming         nameDialog      // the name of a playlist asked for
+	deleting       deleteDialog    // whether to delete a playlist, asked
+	imp            importState     // NetEase playlist one-click import dialog
+	localPlaylists []ytm.Playlist  // local playlists persisted on disk
+	localPath      string          // path to local_playlists.json when initialized
+	liked          map[string]bool // the songs the listener likes
 	toast        string          // a message to show once
 	picked       pickedUp        // the song a login picked up, waiting to play
 
@@ -161,6 +164,7 @@ type app struct {
 
 	settings        settings
 	settingsWin     *mygo.Window
+	audio           audioChainState
 	proxyMode       int    // 0: system, 1: custom, 2: direct
 	proxyInput      string // custom proxy address edited in settings
 	proxyMasked     bool   // true while proxyInput holds an unedited RedactedProxy mask
@@ -171,15 +175,19 @@ type app struct {
 	cacheUsed       int64 // the bytes the song cache takes, -1 until measured
 	updates     bool  // the update plugin is used (useUpdater)
 
-	restored     bool   // playback picked up where it was left
-	savedSession string // the session as last kept
-	sessionDue   bool   // a save of the session is due
+	restored     bool         // playback picked up where it was left
+	savedSession string       // the session as last kept
+	sessionDue   bool         // a save of the session is due
+	postHook     func(func()) // test hook receiving post callbacks when win == nil
 }
 
 // post runs fn on the main thread and redraws both windows. Without a
-// window, as in tests, it drops fn.
+// window, as in tests, it drops fn unless postHook is set.
 func (a *app) post(fn func()) {
 	if a.win == nil {
+		if a.postHook != nil {
+			a.postHook(fn)
+		}
 		return
 	}
 	a.win.Update(func() {
@@ -236,6 +244,7 @@ func Run() error {
 	}
 	mygo.App.WhenReady(func() {
 		a.settings = loadSettings()
+		a.initLocalPlaylists()
 		_ = ytm.SetProxy(a.settings.Proxy)
 		ytm.InitWebViewProxy(a.settings.Proxy)
 		http.DefaultTransport = ytm.Transport()
@@ -258,6 +267,7 @@ func Run() error {
 		}
 		a.volume = a.settings.Volume
 		a.pl.SetVolume(a.volume)
+		a.initAudioChain()
 		a.win = mygo.NewWindow(mygo.WindowOptions{
 			Title:         mygo.App.Name(),
 			Width:         1180,
@@ -352,6 +362,7 @@ func Run() error {
 		a.settings.Volume = a.volume
 		a.settings.save()
 		a.saveSession()
+		a.closeAudioChain()
 		if write := a.transcriptWrite(); write != nil {
 			write()
 		}

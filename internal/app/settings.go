@@ -67,6 +67,21 @@ type settings struct {
 	// Proxy is "", to follow the environment and OS system proxy, "direct"
 	// to connect directly, or an HTTP/SOCKS5 proxy URL.
 	Proxy string `json:"proxy,omitempty"`
+	// NetEaseMusicU optionally keeps the listener's NetEase MUSIC_U cookie
+	// for importing private or >1000-song playlists.
+	NetEaseMusicU string `json:"neteaseMusicU,omitempty"`
+	// OutputMode selects the audio playback chain: "local", "roon", or "hqplayer".
+	OutputMode string `json:"outputMode,omitempty"`
+	// HQPlayerAddr is the TCP control endpoint of HQPlayer Desktop/Embedded (default 127.0.0.1:4321).
+	HQPlayerAddr string `json:"hqplayerAddr,omitempty"`
+	// BridgeListen is the local HTTP listen address serving WAV/ICY streams to HQPlayer and Roon (default 127.0.0.1:17890).
+	BridgeListen string `json:"bridgeListen,omitempty"`
+	// RoonZoneID and RoonZoneName remember the Roon output zone paired with HQPlayer or another endpoint.
+	RoonZoneID   string            `json:"roonZoneId,omitempty"`
+	RoonZoneName string            `json:"roonZoneName,omitempty"`
+	RoonTokens   map[string]string `json:"roonTokens,omitempty"`
+	// RoonStreamFormat selects the Live Radio stream format ("wav" or "aac").
+	RoonStreamFormat string `json:"roonStreamFormat,omitempty"`
 	// SearchHistory keeps submitted keywords, most recent first.
 	SearchHistory []string `json:"searchHistory,omitempty"`
 
@@ -74,7 +89,20 @@ type settings struct {
 }
 
 func defaultSettings() settings {
-	return settings{NotchActivity: true, Quality: "standard", Appearance: "system", Volume: 0.8, Normalize: true, AppIcon: "dock-and-menubar", CacheMB: 2048, Captions: true}
+	return settings{
+		NotchActivity:    true,
+		Quality:          "standard",
+		Appearance:       "system",
+		Volume:           0.8,
+		Normalize:        true,
+		AppIcon:          "dock-and-menubar",
+		CacheMB:          2048,
+		Captions:         true,
+		OutputMode:       "local",
+		HQPlayerAddr:     "127.0.0.1:4321",
+		BridgeListen:     "127.0.0.1:17890",
+		RoonStreamFormat: "wav",
+	}
 }
 
 func settingsPath() (string, error) {
