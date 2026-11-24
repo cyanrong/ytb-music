@@ -753,7 +753,9 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 				OpenPCM:  func() (PCMDecoder, error) { return openSharedWithSpec(dl, spec) },
 				OpenRaw:  func() (RawStream, error) { return openSharedRaw(dl) },
 			}
+			stopLoad := context.AfterFunc(ctx, func() { _ = s.Close() })
 			extOut, backendErr = backend.Open(ctx, src)
+			stopLoad()
 		}
 		p.post(func() {
 			if gen != p.gen {

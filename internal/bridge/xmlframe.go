@@ -191,7 +191,8 @@ scanElements:
 	return 0, 0, "", false
 }
 
-// parseXMLAttrs parses the root element's attributes from a complete XML frame.
+// parseXMLAttrs parses the root element's attributes and trimmed inner text
+// from a complete XML frame.
 func parseXMLAttrs(doc []byte) (name string, attrs map[string]string, err error) {
 	dec := xml.NewDecoder(bytes.NewReader(doc))
 	for {
@@ -200,9 +201,30 @@ func parseXMLAttrs(doc []byte) (name string, attrs map[string]string, err error)
 			return "", nil, terr
 		}
 		if se, ok := tok.(xml.StartElement); ok {
-			attrs = make(map[string]string, len(se.Attr))
+			attrs = make(map[string]string, len(se.Attr)+1)
 			for _, a := range se.Attr {
 				attrs[a.Name.Local] = a.Value
+			}
+			var text strings.Builder
+			depth := 1
+			for depth > 0 {
+				inner, ierr := dec.Token()
+				if ierr != nil {
+					break
+				}
+				switch v := inner.(type) {
+				case xml.StartElement:
+					depth++
+				case xml.EndElement:
+					depth--
+				case xml.CharData:
+					if depth == 1 {
+						text.Write(v)
+					}
+				}
+			}
+			if body := strings.TrimSpace(text.String()); body != "" {
+				attrs["_text"] = body
 			}
 			return se.Name.Local, attrs, nil
 		}

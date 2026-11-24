@@ -94,11 +94,13 @@ type hqpConn struct {
 	product  string
 }
 
-// HQPlayerBackend streams native-rate 24-bit WAV over HTTP to Signalyst
-// HQPlayer Desktop / Embedded via its TCP 4321 XML control protocol.
+// HQPlayerBackend delivers native-rate 24-bit WAV (via local file:/// URI on
+// the same host, or HTTP 206 byte-range WAV across LAN) to Signalyst HQPlayer
+// Desktop / Embedded via its TCP 4321 XML control protocol.
 type HQPlayerBackend struct {
-	srv *Server
-	now func() time.Time
+	srv       *Server
+	now       func() time.Time
+	ForceHTTP bool
 
 	cfgMu   sync.RWMutex
 	addr    string
@@ -362,6 +364,9 @@ func (b *HQPlayerBackend) sendLocked(ctx context.Context, hc *hqpConn, expectTag
 			if errText == "" {
 				errText = rep.attrs["error"]
 			}
+			if errText == "" {
+				errText = rep.attrs["_text"]
+			}
 			if expectTag == "Volume" && strings.Contains(errText, "GetAlbumGain") {
 				return rep, nil
 			}
@@ -415,13 +420,43 @@ func (b *HQPlayerBackend) sendStopExisting(epoch uint64) {
 	_, _ = b.sendLocked(ctx, hc, "Stop", `<Stop/>`, 1500*time.Millisecond)
 }
 
-func buildHQPPlaylistAdd(wavURL string, src player.TrackSource, coverURL string, startMs int64, seekGen uint64) string {
-	uri := wavURL
-	if startMs > 0 || seekGen > 0 {
-		uri = fmt.Sprintf("%s?start_ms=%d&s=%d", wavURL, max(int64(0), startMs), seekGen)
+func isLocalHQPPeer(peerAddr string) bool {
+	host, _, err := net.SplitHostPort(strings.TrimSpace(peerAddr))
+	if err != nil {
+		host = strings.TrimSpace(peerAddr)
 	}
-	remDur := src.Duration - time.Duration(max(int64(0), startMs))*time.Millisecond
-	secs := max(1, int(remDur.Round(time.Second).Seconds()))
+	if host == "" || strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false
+	}
+	if ip.IsLoopback() || ip.IsUnspecified() {
+		return true
+	}
+	if addrs, err := net.InterfaceAddrs(); err == nil {
+		for _, a := range addrs {
+			if ipn, ok := a.(*net.IPNet); ok && ipn.IP != nil && ipn.IP.Equal(ip) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func absDuration(d time.Duration) time.Duration {
+	if d < 0 {
+		return -d
+	}
+	return d
+}
+
+func buildHQPPlaylistAdd(uri string, src player.TrackSource, coverURL string, dur time.Duration) string {
+	if dur <= 0 {
+		dur = src.Duration
+	}
+	secs := max(1, int(dur.Round(time.Second).Seconds()))
 	var meta strings.Builder
 	meta.WriteString(`<metadata`)
 	fmt.Fprintf(&meta, ` song="%s"`, xmlEscapeAttr(src.Track.Name))
@@ -450,13 +485,26 @@ func buildHQPPlaylistAdd(wavURL string, src player.TrackSource, coverURL string,
 func (b *HQPlayerBackend) Open(ctx context.Context, src player.TrackSource) (player.OutputSink, error) {
 	epoch := b.epoch.Add(1)
 	addr := b.Addr()
-	seq, wavURL, coverURL := b.srv.RegisterHQPTrack(src, addr)
 
+	// Verify HQPlayer TCP 4321 control connection upfront before decoding PCM.
 	if _, err := b.execForEpoch(ctx, epoch, "PlaylistClear", `<PlaylistClear/>`, 5*time.Second); err != nil {
 		return nil, err
 	}
 
-	addCmd := buildHQPPlaylistAdd(wavURL, src, coverURL, 0, 0)
+	seq, fileURI, wavURL, coverURL, actualDur, err := b.srv.PrepareHQPTrack(ctx, src, addr)
+	if err != nil {
+		return nil, err
+	}
+	if actualDur <= 0 {
+		actualDur = src.Duration
+	}
+
+	targetURI := wavURL
+	if !b.ForceHTTP && isLocalHQPPeer(addr) && fileURI != "" {
+		targetURI = fileURI
+	}
+
+	addCmd := buildHQPPlaylistAdd(targetURI, src, coverURL, actualDur)
 	if _, err := b.execForEpoch(ctx, epoch, "PlaylistAdd", addCmd, 25*time.Second); err != nil {
 		return nil, fmt.Errorf("HQPlayer 加载音轨失败: %w", err)
 	}
@@ -467,9 +515,10 @@ func (b *HQPlayerBackend) Open(ctx context.Context, src player.TrackSource) (pla
 		epoch:    epoch,
 		seq:      seq,
 		src:      src,
+		uri:      targetURI,
 		wavURL:   wavURL,
 		coverURL: coverURL,
-		duration: src.Duration,
+		duration: actualDur,
 		posAt:    b.nowTime(),
 		ctx:      sinkCtx,
 		cancel:   sinkCancel,
@@ -501,6 +550,7 @@ type hqpSink struct {
 	epoch    uint64
 	seq      uint64
 	src      player.TrackSource
+	uri      string
 	wavURL   string
 	coverURL string
 	duration time.Duration
@@ -513,8 +563,8 @@ type hqpSink struct {
 	hqState         int
 	sawPlaying      bool
 	playRequestedAt time.Time
-	baseOffset      time.Duration
-	seekSeq         uint64
+	seekDoneAt      time.Time
+	lastSeekTarget  time.Duration
 	pos             time.Duration
 	posAt           time.Time
 	pendingSeek     time.Duration
@@ -694,21 +744,19 @@ func (s *hqpSink) transportWorker() {
 			s.playDirty = false
 			doSeek, seekTo := s.seekDirty, s.seekTarget
 			s.seekDirty = false
-			currentlyPlaying := s.playing
+			wasStopped := s.hqState == 0
 			if doSeek && doPlay && !wantPlay {
 				s.pendingSeek = seekTo
 				s.hasPendingSeek = true
 				doSeek = false
 			}
-			var seekGen uint64
 			if doSeek {
-				s.seekSeq++
-				seekGen = s.seekSeq
+				now := s.backend.nowTime()
 				s.seekInFlight = true
-				s.sawPlaying = false
-				s.baseOffset = seekTo
+				s.lastSeekTarget = seekTo
+				s.seekDoneAt = now
 				s.pos = seekTo
-				s.posAt = s.backend.nowTime()
+				s.posAt = now
 			}
 			s.mu.Unlock()
 
@@ -719,23 +767,24 @@ func (s *hqpSink) transportWorker() {
 				s.sendVolume(vol)
 			}
 			if doSeek {
-				s.backend.srv.ResetHQPTrackEOF(s.seq)
-				ctx, cancel := context.WithTimeout(s.ctx, 12*time.Second)
-				_, _ = s.backend.execForEpoch(ctx, s.epoch, "PlaylistClear", `<PlaylistClear/>`, 4*time.Second)
-				addCmd := buildHQPPlaylistAdd(s.wavURL, s.src, s.coverURL, seekTo.Milliseconds(), seekGen)
-				_, _ = s.backend.execForEpoch(ctx, s.epoch, "PlaylistAdd", addCmd, 10*time.Second)
-				s.mu.Lock()
-				s.seekInFlight = false
-				s.playRequestedAt = s.backend.nowTime()
-				s.posAt = s.playRequestedAt
-				s.mu.Unlock()
-				shouldPlay := currentlyPlaying
-				if doPlay {
-					shouldPlay = wantPlay
+				seekSec := max(0, int(seekTo.Round(time.Second).Seconds()))
+				seekCmd := fmt.Sprintf(`<Seek position="%d"/>`, seekSec)
+				ctx, cancel := context.WithTimeout(s.ctx, 8*time.Second)
+				if doPlay && wantPlay {
 					doPlay = false
-				}
-				if shouldPlay {
-					_, _ = s.backend.execForEpoch(ctx, s.epoch, "Play", `<Play/>`, 4*time.Second)
+					if wasStopped && seekSec > 0 {
+						// Start track 1 from stopped state first, then seek into it.
+						_, _ = s.backend.execForEpoch(ctx, s.epoch, "Play", `<Play/>`, 4*time.Second)
+						_, _ = s.backend.execForEpoch(ctx, s.epoch, "Seek", seekCmd, 4*time.Second)
+						s.finishSeek(seekTo)
+					} else {
+						_, _ = s.backend.execForEpoch(ctx, s.epoch, "Seek", seekCmd, 4*time.Second)
+						s.finishSeek(seekTo)
+						_, _ = s.backend.execForEpoch(ctx, s.epoch, "Play", `<Play/>`, 4*time.Second)
+					}
+				} else {
+					_, _ = s.backend.execForEpoch(ctx, s.epoch, "Seek", seekCmd, 4*time.Second)
+					s.finishSeek(seekTo)
 				}
 				cancel()
 			}
@@ -750,6 +799,17 @@ func (s *hqpSink) transportWorker() {
 			}
 		}
 	}
+}
+
+func (s *hqpSink) finishSeek(seekTo time.Duration) {
+	now := s.backend.nowTime()
+	s.mu.Lock()
+	s.seekInFlight = false
+	s.seekDoneAt = now
+	s.lastSeekTarget = seekTo
+	s.pos = seekTo
+	s.posAt = now
+	s.mu.Unlock()
 }
 
 func (s *hqpSink) sendVolume(gain float64) {
@@ -776,31 +836,34 @@ func (s *hqpSink) sendVolume(gain float64) {
 func (s *hqpSink) updateFromHQP(state int, posSec float64) {
 	var fireEnd func()
 	now := s.backend.nowTime()
-	eofDelivered := s.backend.srv.HQPTrackEOFDelivered(s.seq)
 	s.mu.Lock()
 	if !s.closed && s.isCurrent() {
 		s.hqState = state
-		if state == 2 && !s.seekInFlight {
+		if state == 2 {
 			s.sawPlaying = true
 		}
 		if !s.hasPendingSeek && !s.seekDirty && !s.seekInFlight && (state == 2 || state == 1) {
-			s.pos = s.baseOffset + time.Duration(posSec*float64(time.Second))
-			s.posAt = now
+			repPos := time.Duration(posSec * float64(time.Second))
+			stalePreSeek := !s.seekDoneAt.IsZero() && now.Sub(s.seekDoneAt) < 800*time.Millisecond && absDuration(repPos-s.lastSeekTarget) > 3*time.Second
+			if !stalePreSeek {
+				s.pos = repPos
+				s.posAt = now
+			}
 		}
 		if state == 0 && s.sawPlaying && s.playing && !s.endedOnce && !s.hasPendingSeek && !s.seekDirty && !s.seekInFlight && now.Sub(s.playRequestedAt) > 500*time.Millisecond {
 			estPos := s.pos
 			if !s.posAt.IsZero() {
-				estPos += now.Sub(s.posAt)
+				estPos += min(max(time.Duration(0), now.Sub(s.posAt)), 2500*time.Millisecond)
 			}
-			nearEnd := s.duration <= 0 || s.duration <= 5*time.Second || estPos >= s.duration-4*time.Second
-			if eofDelivered || nearEnd {
+			nearEnd := s.duration <= 0 || s.duration <= 5*time.Second || estPos >= s.duration-5*time.Second
+			if nearEnd {
 				s.endedOnce = true
 				s.playing = false
 				s.pos = s.duration
 				fireEnd = s.onEnd
 			} else {
-				// Stopped prematurely (e.g. stream interrupt or manual Stop in HQPlayer):
-				// stop playback in place without falsely skipping to the next track.
+				// Stopped prematurely (e.g. manual Stop in HQPlayer): stop playback
+				// in place without falsely skipping to the next track.
 				s.playing = false
 				s.sawPlaying = false
 			}
