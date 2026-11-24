@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -41,6 +42,15 @@ var (
 			mygo.Shell.ShowItemInFolder(path)
 		}
 	}
+	acquireRoonManager = func(a *app) (*bridge.RoonManager, error) {
+		if a.audio.roonMgr != nil {
+			return a.audio.roonMgr, nil
+		}
+		if _, err := a.ensureRoonBackend(); err != nil {
+			return nil, err
+		}
+		return a.audio.roonMgr, nil
+	}
 	fetchRoonGenres = func(mgr *bridge.RoonManager, ctx context.Context) ([]bridge.RoonAlbumGenre, error) {
 		if mgr == nil {
 			return nil, errors.New("尚未连接或授权 Roon Core")
@@ -73,11 +83,23 @@ type localUIState struct {
 	picking      bool
 	syncingRoon  bool
 
-	tracksList ui.ListState
-	tracksSig  string
+	tracksList        ui.ListState
+	tracksSig         string
+	tracksCacheSig    string
+	tracksCacheRev    uint64
+	tracksCacheReady  bool
+	cachedLocalTracks []localmusic.LocalTrack
+	cachedYTMTracks   []ytm.Track
 
 	newPl localPlaylistPrompt
 }
+
+type localFileRawStream struct {
+	*os.File
+	size int64
+}
+
+func (r *localFileRawStream) Size() (int64, error) { return r.size, nil }
 
 type localPlayerProvider struct {
 	lib *localmusic.Library
@@ -91,16 +113,41 @@ func (p localPlayerProvider) OpenLocalTrack(id string) (*player.LocalOpenedTrack
 	if p.lib == nil {
 		return nil, errors.New("localmusic: library not initialized")
 	}
-	dec, tr, err := p.lib.OpenDecoder(id)
-	if err != nil {
-		return nil, err
+	tr, ok := p.lib.TrackByID(id)
+	if !ok || tr == nil {
+		return nil, errors.New("localmusic: track not found: " + id)
 	}
 	var cover []byte
 	if tr.CoverID != "" {
 		cover, _ = p.lib.CoverBytes(tr.CoverID)
 	}
+	openPCM := func() (player.PCMDecoder, error) {
+		dec, err := localmusic.OpenTrackDecoder(tr)
+		if err != nil {
+			return nil, err
+		}
+		return player.WrapPCMDecoder(dec), nil
+	}
+	var openRaw func() (player.RawStream, error)
+	ext := strings.ToLower(filepath.Ext(tr.Path))
+	if !tr.Spec.IsCUE && strings.EqualFold(tr.Spec.Codec, "AAC") && (ext == ".m4a" || ext == ".mp4") {
+		path := tr.Path
+		openRaw = func() (player.RawStream, error) {
+			f, err := os.Open(path)
+			if err != nil {
+				return nil, err
+			}
+			st, err := f.Stat()
+			if err != nil {
+				_ = f.Close()
+				return nil, err
+			}
+			return &localFileRawStream{File: f, size: st.Size()}, nil
+		}
+	}
 	return &player.LocalOpenedTrack{
-		Decoder:   dec,
+		OpenPCM:   openPCM,
+		OpenRaw:   openRaw,
 		Stream:    tr.ToYTMStream(),
 		LocalPath: tr.Path,
 		NativeHQP: tr.NativeHQP(),
@@ -117,8 +164,7 @@ func (p localPlayerProvider) LocalLyrics(id string) (lrc, trans string, plain []
 }
 
 // initLocalLibrary initializes the persistent local music index and cover cache
-// on startup, wiring it to the cover loader and player, and starting an
-// incremental background scan if folders are already configured.
+// on startup, wiring it to the cover loader and player before the window first renders.
 func (a *app) initLocalLibrary() {
 	userDataDir, err := mygo.App.Path(mygo.PathUserData)
 	if err != nil || userDataDir == "" {
@@ -133,7 +179,12 @@ func (a *app) initLocalLibrary() {
 	lib := localmusic.NewLibrary(filepath.Join(userDataDir, "local_library.json"), coverCacheDir)
 	_ = lib.Load()
 	a.setLocalLibrary(lib)
-	if len(lib.Folders()) > 0 {
+}
+
+// startInitialLocalScan begins the incremental background folder check once the
+// main window exists and can deliver completion posts to the UI thread.
+func (a *app) startInitialLocalScan() {
+	if a.local.lib != nil && len(a.local.lib.Folders()) > 0 {
 		a.rescanLocalLibrary()
 	}
 }
@@ -141,6 +192,9 @@ func (a *app) initLocalLibrary() {
 // setLocalLibrary attaches lib to the app, cover cache, and player.
 func (a *app) setLocalLibrary(lib *localmusic.Library) {
 	a.local.lib = lib
+	a.local.tracksCacheReady = false
+	a.local.cachedLocalTracks = nil
+	a.local.cachedYTMTracks = nil
 	if a.local.sort == "" {
 		a.local.sort = "recent"
 	}
@@ -287,10 +341,11 @@ func (a *app) syncLocalRoonGenres() {
 		a.toast = "请先导入本地音乐文件夹"
 		return
 	}
-	if a.audio.roonMgr == nil {
-		_, _ = a.ensureRoonBackend()
+	mgr, mgrErr := acquireRoonManager(a)
+	if mgrErr != nil {
+		a.toast = "启动 Roon 同步失败：" + mgrErr.Error()
+		return
 	}
-	mgr := a.audio.roonMgr
 	lib := a.local.lib
 	a.local.syncingRoon = true
 
@@ -1006,11 +1061,23 @@ func (a *app) localTracksLens(c *ui.Context, stats localmusic.Stats, folders []s
 		a.local.tracksSig = sig
 		a.local.tracksList = ui.ListState{}
 	}
-	var localTracks []localmusic.LocalTrack
+	var rev uint64
 	if a.local.lib != nil {
-		localTracks = a.local.lib.Tracks(a.local.filter, a.local.genre, a.local.focus)
+		rev = a.local.lib.Revision()
 	}
-	tracks := toYTMTracks(localTracks)
+	if !a.local.tracksCacheReady || a.local.tracksCacheSig != sig || a.local.tracksCacheRev != rev {
+		var fresh []localmusic.LocalTrack
+		if a.local.lib != nil {
+			fresh = a.local.lib.Tracks(a.local.filter, a.local.genre, a.local.focus)
+		}
+		a.local.cachedLocalTracks = fresh
+		a.local.cachedYTMTracks = toYTMTracks(fresh)
+		a.local.tracksCacheSig = sig
+		a.local.tracksCacheRev = rev
+		a.local.tracksCacheReady = true
+	}
+	localTracks := a.local.cachedLocalTracks
+	tracks := a.local.cachedYTMTracks
 
 	w, _ := c.Size()
 	wide := w-sidebarWidth > 820

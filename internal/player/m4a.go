@@ -192,6 +192,10 @@ func (d *download) fetchRanges(ctx context.Context, url string) error {
 			if err == nil || ctx.Err() != nil {
 				break
 			}
+			var se httpStatusError
+			if errors.As(err, &se) && se.code == http.StatusForbidden && d.inStartupProbe() && ytm.RouteSignature() == routeSig {
+				break
+			}
 			if !refreshed && d.refresh != nil && needsStreamRefresh(err, &routeSig) {
 				refreshed = true
 				if fresh, rerr := d.refresh(); rerr == nil && fresh != "" {

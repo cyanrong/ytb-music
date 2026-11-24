@@ -344,6 +344,15 @@ func SongURL(id string, level string) (*Stream, error) {
 		if s, vErr := visionStream(id); vErr == nil {
 			return s, nil
 		}
+		if wr == nil && wrErr == nil {
+			if s, wErr := webRemixStandardStream(id); wErr == nil {
+				return s, nil
+			} else if errors.Is(wErr, ErrBotCheck) {
+				return nil, wErr
+			} else {
+				wrErr = wErr
+			}
+		}
 		if stdErr := func() error {
 			_, e := standardFromPlayer(tr.p, tr.err)
 			return e

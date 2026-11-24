@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
@@ -40,12 +41,20 @@ var supportedAudioExts = map[string]bool{
 // an audio file from disk (rather than reusing its cached entry).
 var onFileParsedHook func(path string)
 
+// renameIndexFile is swapped in tests to simulate atomic rename failures.
+var renameIndexFile = os.Rename
+
 type cachedFile struct {
-	Path      string     `json:"path"`
-	Size      int64      `json:"size"`
-	ModTimeNs int64      `json:"modTimeNs"`
-	AddedAt   int64      `json:"addedAt"`
-	Track     LocalTrack `json:"track"`
+	Path          string     `json:"path"`
+	Size          int64      `json:"size"`
+	ModTimeNs     int64      `json:"modTimeNs"`
+	AddedAt       int64      `json:"addedAt"`
+	CoverTracked  bool       `json:"coverTracked,omitempty"`
+	EmbeddedCover bool       `json:"embeddedCover,omitempty"`
+	SidecarCover  string     `json:"sidecarCover,omitempty"`
+	SidecarModNs  int64      `json:"sidecarModNs,omitempty"`
+	SidecarSize   int64      `json:"sidecarSize,omitempty"`
+	Track         LocalTrack `json:"track"`
 }
 
 type cachedCueFileRef struct {
@@ -54,13 +63,24 @@ type cachedCueFileRef struct {
 	ModTimeNs int64  `json:"modTimeNs"`
 }
 
+type cachedCueTrackCover struct {
+	EmbeddedCover bool   `json:"embeddedCover,omitempty"`
+	AlbumTitle    string `json:"albumTitle,omitempty"`
+	SidecarCover  string `json:"sidecarCover,omitempty"`
+	SidecarModNs  int64  `json:"sidecarModNs,omitempty"`
+	SidecarSize   int64  `json:"sidecarSize,omitempty"`
+}
+
 type cachedCue struct {
-	Path      string             `json:"path"`
-	Size      int64              `json:"size"`
-	ModTimeNs int64              `json:"modTimeNs"`
-	AddedAt   int64              `json:"addedAt"`
-	Consumed  []cachedCueFileRef `json:"consumed,omitempty"`
-	Tracks    []LocalTrack       `json:"tracks,omitempty"`
+	Path         string                `json:"path"`
+	Size         int64                 `json:"size"`
+	ModTimeNs    int64                 `json:"modTimeNs"`
+	AddedAt      int64                 `json:"addedAt"`
+	CoverTracked bool                  `json:"coverTracked,omitempty"`
+	AllRefs      []string              `json:"allRefs,omitempty"`
+	Consumed     []cachedCueFileRef    `json:"consumed,omitempty"`
+	TrackCovers  []cachedCueTrackCover `json:"trackCovers,omitempty"`
+	Tracks       []LocalTrack          `json:"tracks,omitempty"`
 }
 
 type persistedIndex struct {
@@ -77,9 +97,11 @@ type Library struct {
 	indexPath string
 	coverDir  string
 
+	saveMu sync.Mutex
 	scanMu sync.Mutex
 	mu     sync.RWMutex
 
+	revision   uint64
 	folders    []string
 	files      map[string]cachedFile
 	cues       map[string]cachedCue
@@ -150,13 +172,28 @@ func (l *Library) Load() error {
 		l.roonGenres = map[string][]string{}
 	}
 	l.rebuildLocked()
+	l.revision++
 	return nil
 }
 
-// Save atomically persists the library index to indexPath via a .part temporary file.
-func (l *Library) Save() error {
+// Revision returns a monotonic counter incremented whenever library state mutates.
+func (l *Library) Revision() uint64 {
+	if l == nil {
+		return 0
+	}
 	l.mu.RLock()
-	if l.indexPath == "" {
+	defer l.mu.RUnlock()
+	return l.revision
+}
+
+// Save atomically persists the library index to indexPath via a private temp file.
+func (l *Library) Save() error {
+	l.saveMu.Lock()
+	defer l.saveMu.Unlock()
+
+	l.mu.RLock()
+	indexPath := l.indexPath
+	if indexPath == "" {
 		l.mu.RUnlock()
 		return nil
 	}
@@ -172,26 +209,42 @@ func (l *Library) Save() error {
 	if err != nil {
 		return err
 	}
-	return atomicWriteFile(l.indexPath, b)
+	return atomicWriteFile(indexPath, b)
 }
 
 func atomicWriteFile(dst string, data []byte) error {
 	if dst == "" {
 		return nil
 	}
-	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+	dir := filepath.Dir(dst)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
 	}
-	tmp := dst + ".part"
-	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+	f, err := os.CreateTemp(dir, ".local_library-*.tmp")
+	if err != nil {
 		return err
 	}
-	if err := os.Rename(tmp, dst); err != nil {
-		_ = os.Remove(dst)
-		if err2 := os.Rename(tmp, dst); err2 != nil {
-			_ = os.Remove(tmp)
-			return err
-		}
+	tmpPath := f.Name()
+	cleanup := func() {
+		_ = os.Remove(tmpPath)
+	}
+	if _, err := f.Write(data); err != nil {
+		_ = f.Close()
+		cleanup()
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		_ = f.Close()
+		cleanup()
+		return err
+	}
+	if err := f.Close(); err != nil {
+		cleanup()
+		return err
+	}
+	if err := renameIndexFile(tmpPath, dst); err != nil {
+		cleanup()
+		return err
 	}
 	return nil
 }
@@ -210,6 +263,11 @@ func (l *Library) Folders() []string {
 	return slices.Clone(l.folders)
 }
 
+// AddFolder registers a single music directory, returning true if it was newly added.
+func (l *Library) AddFolder(path string) bool {
+	return l.AddFolders(path)
+}
+
 // AddFolders registers one or more music directories, returning true if any new
 // directory was added.
 func (l *Library) AddFolders(paths ...string) bool {
@@ -226,6 +284,9 @@ func (l *Library) AddFolders(paths ...string) bool {
 		}
 		l.folders = append(l.folders, clean)
 		added = true
+	}
+	if added {
+		l.revision++
 	}
 	l.mu.Unlock()
 	if added {
@@ -267,6 +328,7 @@ func (l *Library) RemoveFolder(path string) bool {
 		delete(l.cues, k)
 	}
 	l.rebuildLocked()
+	l.revision++
 	l.mu.Unlock()
 
 	_ = l.Save()
@@ -351,22 +413,57 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 		}
 	}()
 
+	type unavailableRoot struct {
+		path string
+		err  error
+	}
 	var (
-		audioDisk []walkedFile
-		cueDisk   []walkedFile
-		seenAudio = map[string]walkedFile{}
-		seenCue   = map[string]bool{}
+		audioDisk        []walkedFile
+		cueDisk          []walkedFile
+		seenAudio        = map[string]walkedFile{}
+		seenCue          = map[string]bool{}
+		readableRoots    []string
+		unavailableRoots []unavailableRoot
 	)
 
 	for _, root := range roots {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		_ = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		st, err := os.Stat(root)
+		if err != nil {
+			unavailableRoots = append(unavailableRoots, unavailableRoot{
+				path: root,
+				err:  fmt.Errorf("localmusic: unavailable folder %s: %w", root, err),
+			})
+			continue
+		}
+		if !st.IsDir() {
+			unavailableRoots = append(unavailableRoots, unavailableRoot{
+				path: root,
+				err:  fmt.Errorf("localmusic: path is not a folder %s", root),
+			})
+			continue
+		}
+		if _, err := os.ReadDir(root); err != nil {
+			unavailableRoots = append(unavailableRoots, unavailableRoot{
+				path: root,
+				err:  fmt.Errorf("localmusic: unreadable folder %s: %w", root, err),
+			})
+			continue
+		}
+
+		rootKey := canonicalPathKey(root)
+		var rootWalkErr error
+		walkErr := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 			if ctx.Err() != nil {
 				return ctx.Err()
 			}
 			if err != nil {
+				if canonicalPathKey(path) == rootKey {
+					rootWalkErr = err
+					return err
+				}
 				return nil
 			}
 			name := d.Name()
@@ -410,6 +507,17 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 			}
 			return nil
 		})
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if rootWalkErr != nil {
+			unavailableRoots = append(unavailableRoots, unavailableRoot{
+				path: root,
+				err:  fmt.Errorf("localmusic: unreadable folder %s: %w", root, walkErr),
+			})
+			continue
+		}
+		readableRoots = append(readableRoots, root)
 	}
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -418,10 +526,7 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 	slices.SortFunc(cueDisk, func(a, b walkedFile) int { return cmp.Compare(a.key, b.key) })
 	slices.SortFunc(audioDisk, func(a, b walkedFile) int { return cmp.Compare(a.key, b.key) })
 
-	var (
-		dirCoversMu sync.Mutex
-		dirCovers   = map[string]string{}
-	)
+	covers := newFolderCoverResolver(l.coverDir)
 	coverPresent := func(coverID string) bool {
 		if coverID == "" || l.coverDir == "" {
 			return true
@@ -438,31 +543,87 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
-		if prev, ok := prevCues[cw.key]; ok && prev.Size == cw.size && prev.ModTimeNs == cw.modTimeNs && len(prev.Consumed) > 0 {
+		if prev, ok := prevCues[cw.key]; ok &&
+			prev.Size == cw.size &&
+			prev.ModTimeNs == cw.modTimeNs &&
+			prev.CoverTracked &&
+			len(prev.AllRefs) > 0 &&
+			len(prev.TrackCovers) == len(prev.Tracks) {
+
 			refsUnchanged := true
+			prevConsMap := make(map[string]cachedCueFileRef, len(prev.Consumed))
 			for _, ref := range prev.Consumed {
-				rk := canonicalPathKey(ref.Path)
-				diskRef, exists := seenAudio[rk]
+				prevConsMap[canonicalPathKey(ref.Path)] = ref
+			}
+			curResolved := make(map[string]cachedCueFileRef, len(prev.AllRefs))
+			for _, litRef := range prev.AllRefs {
+				rPath, rSize, rModNs, exists := resolveCueLiteralRef(cw.path, litRef, seenAudio)
 				if !exists {
-					if st, err := os.Stat(ref.Path); err == nil && !st.IsDir() {
-						diskRef = walkedFile{path: ref.Path, key: rk, size: st.Size(), modTimeNs: st.ModTime().UnixNano()}
-						exists = true
+					continue
+				}
+				rk := canonicalPathKey(rPath)
+				curResolved[rk] = cachedCueFileRef{Path: rPath, Size: rSize, ModTimeNs: rModNs}
+			}
+			if len(curResolved) != len(prevConsMap) {
+				refsUnchanged = false
+			} else {
+				for rk, cur := range curResolved {
+					old, exists := prevConsMap[rk]
+					if !exists || old.Size != cur.Size || old.ModTimeNs != cur.ModTimeNs {
+						refsUnchanged = false
+						break
 					}
 				}
-				if !exists || diskRef.size != ref.Size || diskRef.modTimeNs != ref.ModTimeNs {
-					refsUnchanged = false
-					break
-				}
 			}
-			for i := range prev.Tracks {
-				if !coverPresent(prev.Tracks[i].CoverID) {
-					refsUnchanged = false
-					break
-				}
-			}
+
 			if refsUnchanged {
-				nextCues[cw.key] = prev
-				for _, ref := range prev.Consumed {
+				for i := range prev.Tracks {
+					if prev.TrackCovers[i].EmbeddedCover {
+						if l.coverDir != "" && (prev.Tracks[i].CoverID == "" || !coverPresent(prev.Tracks[i].CoverID)) {
+							refsUnchanged = false
+							break
+						}
+					}
+				}
+			}
+
+			if refsUnchanged {
+				updatedCue := prev
+				clonedSlices := false
+				for i := range updatedCue.Tracks {
+					tc := updatedCue.TrackCovers[i]
+					if tc.EmbeddedCover {
+						continue
+					}
+					cand := covers.candidate(updatedCue.Tracks[i].Dir, tc.AlbumTitle)
+					sameSidecar := sameSidecarPath(cand.path, tc.SidecarCover) &&
+						cand.modTimeNs == tc.SidecarModNs &&
+						cand.size == tc.SidecarSize
+					coverOK := cand.path == "" || l.coverDir == "" || (updatedCue.Tracks[i].CoverID != "" && coverPresent(updatedCue.Tracks[i].CoverID))
+					if sameSidecar && coverOK {
+						continue
+					}
+					if !clonedSlices {
+						tracksCp := make([]LocalTrack, len(updatedCue.Tracks))
+						for ti := range updatedCue.Tracks {
+							tracksCp[ti] = cloneTrack(updatedCue.Tracks[ti])
+						}
+						updatedCue.Tracks = tracksCp
+						updatedCue.TrackCovers = slices.Clone(updatedCue.TrackCovers)
+						clonedSlices = true
+					}
+					updatedCue.Tracks[i].CoverID = covers.ingest(cand)
+					updatedCue.TrackCovers[i] = cachedCueTrackCover{
+						EmbeddedCover: false,
+						AlbumTitle:    tc.AlbumTitle,
+						SidecarCover:  cand.path,
+						SidecarModNs:  cand.modTimeNs,
+						SidecarSize:   cand.size,
+					}
+				}
+
+				nextCues[cw.key] = updatedCue
+				for _, ref := range updatedCue.Consumed {
 					consumedByCue[canonicalPathKey(ref.Path)] = true
 				}
 				continue
@@ -476,15 +637,13 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 			addedAt = nowMs
 		}
 
-		dirCoversMu.Lock()
-		tracks, consumedPaths, err := loadCueTracks(cw.path, l.coverDir, addedAt, dirCovers)
-		dirCoversMu.Unlock()
-		if err != nil || len(tracks) == 0 {
+		loaded, err := loadCueTracks(cw.path, addedAt, covers)
+		if err != nil || loaded == nil || (len(loaded.tracks) == 0 && len(loaded.allRefs) == 0) {
 			continue
 		}
 
 		var refs []cachedCueFileRef
-		for _, cp := range consumedPaths {
+		for _, cp := range loaded.consumed {
 			ck := canonicalPathKey(cp)
 			consumedByCue[ck] = true
 			if wf, ok := seenAudio[ck]; ok {
@@ -494,12 +653,15 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 			}
 		}
 		nextCues[cw.key] = cachedCue{
-			Path:      cw.path,
-			Size:      cw.size,
-			ModTimeNs: cw.modTimeNs,
-			AddedAt:   addedAt,
-			Consumed:  refs,
-			Tracks:    tracks,
+			Path:         cw.path,
+			Size:         cw.size,
+			ModTimeNs:    cw.modTimeNs,
+			AddedAt:      addedAt,
+			CoverTracked: true,
+			AllRefs:      loaded.allRefs,
+			Consumed:     refs,
+			TrackCovers:  loaded.trackCovers,
+			Tracks:       loaded.tracks,
 		}
 	}
 
@@ -510,9 +672,31 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 		if consumedByCue[aw.key] {
 			continue
 		}
-		if prev, ok := prevFiles[aw.key]; ok && prev.Size == aw.size && prev.ModTimeNs == aw.modTimeNs && coverPresent(prev.Track.CoverID) {
-			nextFiles[aw.key] = prev
-			continue
+		if prev, ok := prevFiles[aw.key]; ok && prev.Size == aw.size && prev.ModTimeNs == aw.modTimeNs && prev.CoverTracked {
+			if prev.EmbeddedCover {
+				if l.coverDir == "" || (prev.Track.CoverID != "" && coverPresent(prev.Track.CoverID)) {
+					nextFiles[aw.key] = prev
+					continue
+				}
+			} else {
+				cand := covers.candidate(prev.Track.Dir, prev.Track.Album)
+				sameSidecar := sameSidecarPath(cand.path, prev.SidecarCover) &&
+					cand.modTimeNs == prev.SidecarModNs &&
+					cand.size == prev.SidecarSize
+				coverOK := cand.path == "" || l.coverDir == "" || (prev.Track.CoverID != "" && coverPresent(prev.Track.CoverID))
+				if sameSidecar && coverOK {
+					nextFiles[aw.key] = prev
+					continue
+				}
+				updated := prev
+				updated.Track = cloneTrack(prev.Track)
+				updated.Track.CoverID = covers.ingest(cand)
+				updated.SidecarCover = cand.path
+				updated.SidecarModNs = cand.modTimeNs
+				updated.SidecarSize = cand.size
+				nextFiles[aw.key] = updated
+				continue
+			}
 		}
 		toParse = append(toParse, aw)
 	}
@@ -566,18 +750,12 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 						} else if addedAt <= 0 {
 							addedAt = nowMs
 						}
-						tr := l.buildTrackFromMeta(wf, meta, addedAt, &dirCoversMu, dirCovers)
+						entry := l.buildCachedFileFromMeta(wf, meta, addedAt, covers)
 						results[idx] = parseResult{
-							ok:   true,
-							key:  wf.key,
-							base: baseName,
-							entry: cachedFile{
-								Path:      wf.path,
-								Size:      wf.size,
-								ModTimeNs: wf.modTimeNs,
-								AddedAt:   addedAt,
-								Track:     tr,
-							},
+							ok:    true,
+							key:   wf.key,
+							base:  baseName,
+							entry: entry,
 						}
 					}
 					progMu.Lock()
@@ -606,11 +784,50 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 		}
 	}
 
+	var activeRootErrs []error
 	l.mu.Lock()
+	if len(unavailableRoots) > 0 {
+		var unavailPaths []string
+		for _, ur := range unavailableRoots {
+			if containsPathKey(l.folders, ur.path) {
+				unavailPaths = append(unavailPaths, ur.path)
+				activeRootErrs = append(activeRootErrs, ur.err)
+			}
+		}
+		if len(unavailPaths) > 0 {
+			for k, cf := range l.files {
+				if _, already := nextFiles[k]; already {
+					continue
+				}
+				if isUnderAnyFolder(cf.Path, unavailPaths) && !isUnderAnyFolder(cf.Path, readableRoots) {
+					nextFiles[k] = cf
+				}
+			}
+			for k, cc := range l.cues {
+				if _, already := nextCues[k]; already {
+					continue
+				}
+				if isUnderAnyFolder(cc.Path, unavailPaths) && !isUnderAnyFolder(cc.Path, readableRoots) {
+					nextCues[k] = cc
+				}
+			}
+		}
+	}
+	for k, cf := range nextFiles {
+		if !isUnderAnyFolder(cf.Path, l.folders) {
+			delete(nextFiles, k)
+		}
+	}
+	for k, cc := range nextCues {
+		if !isUnderAnyFolder(cc.Path, l.folders) {
+			delete(nextCues, k)
+		}
+	}
 	l.files = nextFiles
 	l.cues = nextCues
 	l.applyPersistedRoonGenresLocked()
 	l.rebuildLocked()
+	l.revision++
 	l.progress = ScanProgress{
 		Scanning: false,
 		Scanned:  totalItems,
@@ -618,7 +835,14 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 	}
 	l.mu.Unlock()
 
-	return l.Save()
+	saveErr := l.Save()
+	if len(activeRootErrs) > 0 {
+		if saveErr != nil {
+			activeRootErrs = append(activeRootErrs, saveErr)
+		}
+		return errors.Join(activeRootErrs...)
+	}
+	return saveErr
 }
 
 var leadingTrackNumRe = regexp.MustCompile(`^\s*0*(\d{1,3})(?:[\s._-]+)(.+)$`)
@@ -635,7 +859,7 @@ func parseFilenameFallback(filename string) (trackNo int, title string) {
 	return 0, stem
 }
 
-func (l *Library) buildTrackFromMeta(wf walkedFile, meta *parsedMeta, addedAt int64, dirCoversMu *sync.Mutex, dirCovers map[string]string) LocalTrack {
+func (l *Library) buildCachedFileFromMeta(wf walkedFile, meta *parsedMeta, addedAt int64, covers *folderCoverResolver) cachedFile {
 	dir := filepath.Clean(filepath.Dir(wf.path))
 	fnTrackNo, fnTitle := parseFilenameFallback(filepath.Base(wf.path))
 
@@ -656,14 +880,19 @@ func (l *Library) buildTrackFromMeta(wf walkedFile, meta *parsedMeta, addedAt in
 		album = defaultAlbumFromDir(dir)
 	}
 
-	var coverID string
+	var (
+		coverID       string
+		embeddedCover bool
+		sidecarInfo   sidecarCoverInfo
+	)
 	if len(meta.cover) > 0 {
-		coverID, _ = saveCoverBytes(l.coverDir, meta.cover)
+		if cid, err := saveCoverBytes(l.coverDir, meta.cover); err == nil && cid != "" {
+			coverID = cid
+			embeddedCover = true
+		}
 	}
-	if coverID == "" {
-		dirCoversMu.Lock()
-		coverID = findFolderCover(dir, album, l.coverDir, dirCovers)
-		dirCoversMu.Unlock()
+	if !embeddedCover {
+		coverID, sidecarInfo = covers.resolveAndIngest(dir, album)
 	}
 
 	artists := slices.Clone(meta.artists)
@@ -677,7 +906,7 @@ func (l *Library) buildTrackFromMeta(wf walkedFile, meta *parsedMeta, addedAt in
 		effAlbumArtist = artists[0]
 	}
 
-	return LocalTrack{
+	tr := LocalTrack{
 		ID:             makeTrackID(wf.path, false, 0, 0),
 		Path:           wf.path,
 		Dir:            dir,
@@ -700,6 +929,18 @@ func (l *Library) buildTrackFromMeta(wf walkedFile, meta *parsedMeta, addedAt in
 		Size:           wf.size,
 		ModTimeNs:      wf.modTimeNs,
 		EmbeddedLyrics: meta.lyrics,
+	}
+	return cachedFile{
+		Path:          wf.path,
+		Size:          wf.size,
+		ModTimeNs:     wf.modTimeNs,
+		AddedAt:       addedAt,
+		CoverTracked:  true,
+		EmbeddedCover: embeddedCover,
+		SidecarCover:  sidecarInfo.path,
+		SidecarModNs:  sidecarInfo.modTimeNs,
+		SidecarSize:   sidecarInfo.size,
+		Track:         tr,
 	}
 }
 
@@ -888,6 +1129,9 @@ func (l *Library) rebuildLocked() {
 		}
 		bestSpec.ClipStartMs = 0
 		bestSpec.ClipEndMs = 0
+		bestSpec.ClipStartFrames = 0
+		bestSpec.ClipEndFrames = 0
+		bestSpec.HasCueFrames = false
 		bestSpec.IsCUE = anyCUE
 		al.Spec = bestSpec
 		al.DiscCount = max(len(discs), 1)
@@ -1089,6 +1333,9 @@ func compareAlbumTrackOrder(a, b LocalTrack) int {
 			return -1
 		}
 		return cmp.Compare(a.TrackNo, b.TrackNo)
+	}
+	if a.Spec.HasCueFrames && b.Spec.HasCueFrames && a.Spec.ClipStartFrames != b.Spec.ClipStartFrames {
+		return cmp.Compare(a.Spec.ClipStartFrames, b.Spec.ClipStartFrames)
 	}
 	if a.Spec.ClipStartMs != b.Spec.ClipStartMs {
 		return cmp.Compare(a.Spec.ClipStartMs, b.Spec.ClipStartMs)
@@ -1403,8 +1650,11 @@ func (l *Library) Tracks(query, genre, focus string) []LocalTrack {
 	return out
 }
 
-// TrackByID looks up a track by ID.
+// TrackByID looks up a cloned track by ID without opening an audio decoder.
 func (l *Library) TrackByID(id string) (*LocalTrack, bool) {
+	if l == nil {
+		return nil, false
+	}
 	l.mu.RLock()
 	defer l.mu.RUnlock()
 	idx, ok := l.tracksByID[id]
@@ -1775,6 +2025,7 @@ func (l *Library) ApplyRoonGenres(items []RoonAlbumGenre) int {
 
 	l.applyPersistedRoonGenresLocked()
 	l.rebuildLocked()
+	l.revision++
 	l.mu.Unlock()
 
 	_ = l.Save()

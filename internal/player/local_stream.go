@@ -130,3 +130,35 @@ func (s *localPCMStream) Close() error {
 	})
 	return s.closeErr
 }
+
+// inertLocalStream stands in for p.stream when an external backend (such as
+// native file:/// HQPlayer pass-through on WavPack .wv) opens a local track
+// that has no pure-Go preview PCM decoder.
+type inertLocalStream struct {
+	rate   int
+	frames int64
+	spec   *spectrum
+}
+
+func newInertLocalStream(sampleRate int, durationMs int64, spec *spectrum) *inertLocalStream {
+	if sampleRate <= 0 {
+		sampleRate = 44100
+	}
+	var frames int64
+	if durationMs > 0 {
+		frames = durationMs * int64(sampleRate) / 1000
+	}
+	return &inertLocalStream{
+		rate:   sampleRate,
+		frames: frames,
+		spec:   spec,
+	}
+}
+
+func (s *inertLocalStream) SampleRate() int                 { return s.rate }
+func (s *inertLocalStream) Channels() int                   { return 2 }
+func (s *inertLocalStream) Len() int64                      { return s.frames }
+func (s *inertLocalStream) Read(_ []float32) (int, error)   { return 0, io.EOF }
+func (s *inertLocalStream) SetPosition(_ int64) error       { return nil }
+func (s *inertLocalStream) source() (*download, *spectrum)  { return nil, s.spec }
+func (s *inertLocalStream) Close() error                    { return nil }

@@ -13,6 +13,7 @@ import (
 	"math"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -37,8 +38,58 @@ type hqpTrackEntry struct {
 	seq       uint64
 	src       player.TrackSource
 	wavPath   string
+	modTime   time.Time
+	prog      *progressiveWAV
 	coverOnce sync.Once
 	coverData []byte
+}
+
+type progressiveWAV struct {
+	mu        sync.Mutex
+	cond      sync.Cond
+	totalSize int64
+	written   int64
+	done      bool
+	err       error
+	cancel    context.CancelFunc
+	doneCh    chan struct{}
+}
+
+func newProgressiveWAV(totalSize, written int64, cancel context.CancelFunc) *progressiveWAV {
+	p := &progressiveWAV{
+		totalSize: totalSize,
+		written:   written,
+		cancel:    cancel,
+		doneCh:    make(chan struct{}),
+	}
+	p.cond.L = &p.mu
+	return p
+}
+
+func (p *progressiveWAV) advance(written int64) {
+	p.mu.Lock()
+	p.written = written
+	p.cond.Broadcast()
+	p.mu.Unlock()
+}
+
+func (p *progressiveWAV) finish(err error) {
+	p.mu.Lock()
+	p.done = true
+	if p.err == nil && err != nil {
+		p.err = err
+	}
+	p.cond.Broadcast()
+	p.mu.Unlock()
+}
+
+func (p *progressiveWAV) failureState() (failed bool, written int64, err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.done && p.err != nil {
+		return true, p.written, p.err
+	}
+	return false, p.written, nil
 }
 
 type streamChunk struct {
@@ -63,7 +114,9 @@ type Server struct {
 	secret     string
 
 	hqpSeq    atomic.Uint64
+	tempRoot  string
 	hqpDir    string
+	hqpLock   *os.File
 	hqpTracks map[uint64]*hqpTrackEntry
 
 	hubMu       sync.Mutex
@@ -229,11 +282,27 @@ func (s *Server) Close() error {
 	s.httpSrv = nil
 	hqpDir := s.hqpDir
 	s.hqpDir = ""
+	hqpLock := s.hqpLock
+	s.hqpLock = nil
+	var progs []*progressiveWAV
+	for _, e := range s.hqpTracks {
+		if e != nil && e.prog != nil {
+			e.prog.cancel()
+			progs = append(progs, e.prog)
+		}
+	}
 	clear(s.hqpTracks)
 	s.mu.Unlock()
+
 	var err error
 	if srv != nil {
 		err = srv.Close()
+	}
+	for _, p := range progs {
+		<-p.doneCh
+	}
+	if hqpLock != nil {
+		_ = hqpLock.Close()
 	}
 	if hqpDir != "" {
 		_ = os.RemoveAll(hqpDir)
@@ -249,6 +318,25 @@ func (s *Server) Addr() string {
 
 func (s *Server) ActiveListeners() int {
 	return int(s.listeners.Load())
+}
+
+// HasOnlyAACListeners reports whether Roon Live Radio currently has at least
+// one connected ADTS-AAC listener and zero WAV listeners.
+func (s *Server) HasOnlyAACListeners() bool {
+	if s == nil {
+		return false
+	}
+	s.hubMu.Lock()
+	defer s.hubMu.Unlock()
+	hasWAV, hasAAC := false, false
+	for sub := range s.subs {
+		if sub.aac {
+			hasAAC = true
+		} else {
+			hasWAV = true
+		}
+	}
+	return hasAAC && !hasWAV
 }
 
 func (s *Server) SetOnListeners(fn func(int)) {
@@ -331,6 +419,25 @@ func outboundIPFor(peerAddr string) string {
 	return "127.0.0.1"
 }
 
+func scavengeHQPDirs(root string, now time.Time) {
+	if root == "" {
+		root = os.TempDir()
+	}
+	matches, err := filepath.Glob(filepath.Join(root, "ytb-music-hqp-*"))
+	if err != nil {
+		return
+	}
+	for _, old := range matches {
+		info, serr := os.Stat(old)
+		if serr != nil || !info.IsDir() || now.Sub(info.ModTime()) <= 6*time.Hour {
+			continue
+		}
+		if removeLockFile(filepath.Join(old, ".lock")) == nil {
+			_ = os.RemoveAll(old)
+		}
+	}
+}
+
 func (s *Server) ensureHQPDir() (string, error) {
 	s.mu.Lock()
 	if s.hqpDir != "" {
@@ -338,17 +445,21 @@ func (s *Server) ensureHQPDir() (string, error) {
 		s.mu.Unlock()
 		return dir, nil
 	}
+	root := s.tempRoot
 	s.mu.Unlock()
 
-	if matches, err := filepath.Glob(filepath.Join(os.TempDir(), "ytb-music-hqp-*")); err == nil {
-		for _, old := range matches {
-			if info, serr := os.Stat(old); serr == nil && time.Since(info.ModTime()) > 6*time.Hour {
-				_ = os.RemoveAll(old)
-			}
-		}
+	if root == "" {
+		root = os.TempDir()
 	}
-	dir, err := os.MkdirTemp("", "ytb-music-hqp-*")
+	scavengeHQPDirs(root, time.Now())
+
+	dir, err := os.MkdirTemp(root, "ytb-music-hqp-*")
 	if err != nil {
+		return "", err
+	}
+	lf, err := openExclusiveLockFile(filepath.Join(dir, ".lock"))
+	if err != nil {
+		_ = os.RemoveAll(dir)
 		return "", err
 	}
 
@@ -356,34 +467,165 @@ func (s *Server) ensureHQPDir() (string, error) {
 	if s.hqpDir != "" {
 		existing := s.hqpDir
 		s.mu.Unlock()
+		_ = lf.Close()
 		_ = os.RemoveAll(dir)
 		return existing, nil
 	}
 	s.hqpDir = dir
+	s.hqpLock = lf
 	s.mu.Unlock()
 	return dir, nil
 }
 
-func localFileURI(absPath string) string {
-	if absPath != "" {
-		if abs, err := filepath.Abs(absPath); err == nil {
-			absPath = abs
-		}
-	}
-	slash := filepath.ToSlash(absPath)
-	return "file:///" + strings.TrimPrefix(slash, "/")
+func isASCIIAlpha(b byte) bool {
+	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
-// LocalFileURI formats an absolute local filesystem path as a file:/// URI for HQPlayer.
+func escapeFileSegments(slashPath string) string {
+	if slashPath == "" {
+		return ""
+	}
+	parts := strings.Split(slashPath, "/")
+	for i, seg := range parts {
+		parts[i] = url.PathEscape(seg)
+	}
+	return strings.Join(parts, "/")
+}
+
+func localFileURI(rawPath string) string {
+	if rawPath == "" {
+		return "file:///"
+	}
+	p := rawPath
+	switch {
+	case strings.HasPrefix(p, `\\?\UNC\`) || strings.HasPrefix(p, `\\.\UNC\`) ||
+		strings.HasPrefix(p, `//?/UNC/`) || strings.HasPrefix(p, `//./UNC/`):
+		p = `\\` + p[8:]
+	case strings.HasPrefix(p, `\\?\`) || strings.HasPrefix(p, `\\.\`) ||
+		strings.HasPrefix(p, `//?/`) || strings.HasPrefix(p, `//./`):
+		p = p[4:]
+	}
+
+	isUNC := len(p) >= 2 && (p[0] == '\\' || p[0] == '/') && (p[1] == '\\' || p[1] == '/') && (len(p) == 2 || (p[2] != '\\' && p[2] != '/'))
+	if isUNC {
+		s := strings.ReplaceAll(p, `\`, `/`)
+		rest := strings.TrimPrefix(s, "//")
+		host, rem, ok := strings.Cut(rest, "/")
+		if !ok || rem == "" {
+			return "file://" + host + "/"
+		}
+		return "file://" + host + "/" + escapeFileSegments(rem)
+	}
+
+	s := strings.ReplaceAll(p, `\`, `/`)
+	hasDrive := len(s) >= 2 && isASCIIAlpha(s[0]) && s[1] == ':'
+	isPOSIXAbs := strings.HasPrefix(p, "/")
+
+	if !hasDrive && !isPOSIXAbs {
+		if abs, err := filepath.Abs(p); err == nil {
+			p = abs
+			s = strings.ReplaceAll(p, `\`, `/`)
+			hasDrive = len(s) >= 2 && isASCIIAlpha(s[0]) && s[1] == ':'
+			isPOSIXAbs = strings.HasPrefix(p, "/")
+		}
+	}
+
+	if hasDrive {
+		drive := s[:2]
+		rem := strings.TrimPrefix(s[2:], "/")
+		if rem == "" {
+			return "file:///" + drive + "/"
+		}
+		return "file:///" + drive + "/" + escapeFileSegments(rem)
+	}
+
+	rem := strings.TrimPrefix(p, "/")
+	if rem == "" {
+		return "file:///"
+	}
+	return "file:///" + escapeFileSegments(rem)
+}
+
+// LocalFileURI formats an absolute local filesystem path as an RFC 8089 file URI for HQPlayer.
 func LocalFileURI(absPath string) string {
 	return localFileURI(absPath)
 }
 
-// PrepareHQPTrack decodes src once into a materialized 24-bit stereo WAV file
-// with embedded UTF-8 ID3v2.4 metadata and cover art. Same-machine HQPlayer
-// instances open fileURI directly via native file I/O (zero HTTP Range
-// connections or ephemeral port churn), while remote LAN HQPlayer instances
-// stream wavURL via HTTP 206 byte ranges from OS page cache.
+func isHTTPURL(u string) bool {
+	u = strings.TrimSpace(u)
+	return strings.HasPrefix(u, "http://") || strings.HasPrefix(u, "https://")
+}
+
+// RegisterHQPCover registers artwork for a native file:/// HQPlayer track so
+// HQPlayer can fetch local or HTTP cover art without materializing a WAV file.
+func (s *Server) RegisterHQPCover(src player.TrackSource, peerAddr string) (uint64, string) {
+	if s == nil {
+		return 0, ""
+	}
+	var coverData []byte
+	if len(src.CoverBytes) > 0 {
+		coverData = append([]byte(nil), src.CoverBytes...)
+	}
+	if len(coverData) == 0 && !isHTTPURL(src.Track.Album.PicURL) {
+		return 0, ""
+	}
+	seq := s.hqpSeq.Add(1)
+	entry := &hqpTrackEntry{
+		seq:       seq,
+		src:       src,
+		modTime:   time.Now(),
+		coverData: coverData,
+	}
+	if len(coverData) > 0 {
+		entry.coverOnce.Do(func() {})
+	}
+	secret := s.registerHQPEntry(seq, entry)
+	return seq, fmt.Sprintf("%s/hqp/%s/%d/cover.jpg", s.BaseURL(peerAddr), secret, seq)
+}
+
+func (s *Server) registerHQPEntry(seq uint64, entry *hqpTrackEntry) string {
+	var evicted []*hqpTrackEntry
+	s.mu.Lock()
+	s.hqpTracks[seq] = entry
+	for k, old := range s.hqpTracks {
+		if seq > 3 && k < seq-2 {
+			evicted = append(evicted, old)
+			delete(s.hqpTracks, k)
+		}
+	}
+	secret := s.secret
+	s.mu.Unlock()
+
+	if len(evicted) > 0 {
+		go func(items []*hqpTrackEntry) {
+			for _, old := range items {
+				if old == nil {
+					continue
+				}
+				if old.prog != nil {
+					old.prog.cancel()
+					<-old.prog.doneCh
+				}
+				if old.wavPath != "" {
+					_ = os.Remove(old.wavPath)
+				}
+			}
+		}(evicted)
+	}
+	return secret
+}
+
+func finalizeHQPWAVHeader(w io.WriterAt, sampleRate int, id3Chunk []byte, pcmBytes int64) error {
+	hdr := encodeWAVContainerHeader(sampleRate, 2, 24, id3Chunk, pcmBytes)
+	_, err := w.WriteAt(hdr, 0)
+	return err
+}
+
+// PrepareHQPTrack prepares a 24-bit stereo WAV/RF64 file with UTF-8 ID3v2.4
+// tags and artwork placed before the "data" chunk. Cached and local tracks are
+// fully materialized so same-host HQPlayer opens fileURI directly via native
+// file I/O, while active network downloads pre-buffer ~256 KB and stream
+// progressively over HTTP 206 byte ranges without waiting for full download.
 func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, peerAddr string) (seq uint64, fileURI, wavURL, coverURL string, actualDur time.Duration, err error) {
 	if src.OpenPCM == nil {
 		return 0, "", "", "", 0, errors.New("bridge: missing PCM decoder")
@@ -393,8 +635,11 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 		return 0, "", "", "", 0, err
 	}
 
+	var coverData []byte
 	var coverCh chan []byte
-	if picURL := strings.TrimSpace(src.Track.Album.PicURL); strings.HasPrefix(picURL, "http://") || strings.HasPrefix(picURL, "https://") {
+	if len(src.CoverBytes) > 0 {
+		coverData = append([]byte(nil), src.CoverBytes...)
+	} else if picURL := strings.TrimSpace(src.Track.Album.PicURL); isHTTPURL(picURL) {
 		coverCh = make(chan []byte, 1)
 		go func() {
 			data, ferr := ytm.Fetch(ytm.Sized(picURL, 600))
@@ -410,164 +655,292 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 	if err != nil {
 		return 0, "", "", "", 0, err
 	}
-	defer dec.Close()
 
 	sr := dec.SampleRate()
 	if sr <= 0 {
 		sr = 44100
 	}
 
-	seq = s.hqpSeq.Add(1)
-	wavPath := filepath.Join(hqpDir, fmt.Sprintf("track-%d.wav", seq))
-	f, err := os.OpenFile(wavPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
-	if err != nil {
-		return 0, "", "", "", 0, err
-	}
-	cleanupErr := func(cerr error) (uint64, string, string, string, time.Duration, error) {
-		_ = f.Close()
-		_ = os.Remove(wavPath)
-		return 0, "", "", "", 0, cerr
-	}
-
 	const (
-		channels      = 2
-		bytesPerSamp  = 3 // 24-bit signed LE PCM
-		blockAlign    = channels * bytesPerSamp
-		wavHeaderSize = 44
-		chunkFrames   = 16384
-		maxPCMBytes   = (int64(math.MaxUint32) - (4 << 20)) / blockAlign * blockAlign
+		channels     = 2
+		bytesPerSamp = 3 // 24-bit signed LE PCM
+		blockAlign   = channels * bytesPerSamp
+		chunkFrames  = 16384
+		prebufTarget = 43692 * blockAlign // ~256 KB, exact multiple of blockAlign
 	)
 
-	bw := bufio.NewWriterSize(f, 256<<10)
-	placeholderHdr := buildWAVHeader(sr, channels, 24, 0)
-	if _, err := bw.Write(placeholderHdr[:]); err != nil {
-		return cleanupErr(err)
-	}
-
+	// Pre-buffer up to ~256 KB of 24-bit PCM before deciding between full file
+	// materialization and progressive HTTP Range streaming.
+	preBuf := make([]byte, 0, prebufTarget)
 	floatBuf := make([]float32, chunkFrames*channels)
 	pcmBuf := make([]byte, chunkFrames*blockAlign)
-	var pcmBytes int64
-	for pcmBytes < maxPCMBytes {
+	hitEOF := false
+	for len(preBuf) < prebufTarget {
 		if cerr := ctx.Err(); cerr != nil {
-			return cleanupErr(cerr)
+			_ = dec.Close()
+			return 0, "", "", "", 0, cerr
 		}
-		nFloats, derr := dec.Read(floatBuf)
+		remFrames := (prebufTarget - len(preBuf)) / blockAlign
+		readFrames := min(chunkFrames, max(1, remFrames))
+		nFloats, derr := dec.Read(floatBuf[:readFrames*channels])
 		nFrames := nFloats / channels
 		if nFrames > 0 {
 			nBytes := encodePCM24LE(pcmBuf, floatBuf[:nFrames*channels], 1.0)
-			rem := maxPCMBytes - pcmBytes
-			if int64(nBytes) > rem {
-				nBytes = int(rem)
-			}
-			if nBytes > 0 {
-				if _, werr := bw.Write(pcmBuf[:nBytes]); werr != nil {
-					return cleanupErr(werr)
-				}
-				pcmBytes += int64(nBytes)
-			}
+			preBuf = append(preBuf, pcmBuf[:nBytes]...)
 		}
 		if derr != nil {
 			if errors.Is(derr, io.EOF) {
+				hitEOF = true
 				break
 			}
+			_ = dec.Close()
 			if cerr := ctx.Err(); cerr != nil {
-				return cleanupErr(cerr)
+				return 0, "", "", "", 0, cerr
 			}
-			return cleanupErr(derr)
+			return 0, "", "", "", 0, derr
+		}
+		if nFloats == 0 {
+			hitEOF = true
+			break
 		}
 	}
 
-	if pcmBytes == 0 {
-		// Ensure valid non-empty WAV data chunk even on a zero-sample edge case.
-		var silentFrame [blockAlign]byte
-		if _, werr := bw.Write(silentFrame[:]); werr != nil {
-			return cleanupErr(werr)
-		}
-		pcmBytes = blockAlign
-	}
-
-	var coverData []byte
+	progressive := src.Downloading && !hitEOF
 	if coverCh != nil {
-		timer := time.NewTimer(1500 * time.Millisecond)
+		coverWait := 1500 * time.Millisecond
+		if progressive {
+			coverWait = 120 * time.Millisecond
+		}
+		timer := time.NewTimer(coverWait)
 		select {
 		case coverData = <-coverCh:
 		case <-ctx.Done():
 			timer.Stop()
-			return cleanupErr(ctx.Err())
+			_ = dec.Close()
+			return 0, "", "", "", 0, ctx.Err()
 		case <-timer.C:
 		}
 		timer.Stop()
 	}
 
 	id3Chunk := buildWAVID3Chunk(src.Track.Name, src.Track.ArtistNames(), src.Track.Album.Name, coverData)
-	if len(id3Chunk) > 0 {
-		if _, werr := bw.Write(id3Chunk); werr != nil {
-			return cleanupErr(werr)
-		}
-	}
-	if err := bw.Flush(); err != nil {
-		return cleanupErr(err)
-	}
 
-	riffPayload := 36 + pcmBytes + int64(len(id3Chunk))
-	var sizePatch [4]byte
-	if riffPayload <= math.MaxUint32 {
-		binary.LittleEndian.PutUint32(sizePatch[:], uint32(riffPayload))
-	} else {
-		binary.LittleEndian.PutUint32(sizePatch[:], math.MaxUint32)
-	}
-	if _, err := f.WriteAt(sizePatch[:], 4); err != nil {
-		return cleanupErr(err)
-	}
-	binary.LittleEndian.PutUint32(sizePatch[:], uint32(pcmBytes))
-	if _, err := f.WriteAt(sizePatch[:], 40); err != nil {
-		return cleanupErr(err)
-	}
-	if err := f.Close(); err != nil {
-		_ = os.Remove(wavPath)
+	seq = s.hqpSeq.Add(1)
+	wavPath := filepath.Join(hqpDir, fmt.Sprintf("track-%d.wav", seq))
+	f, err := os.OpenFile(wavPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
+	if err != nil {
+		_ = dec.Close()
 		return 0, "", "", "", 0, err
 	}
+	cleanupSyncErr := func(cerr error) (uint64, string, string, string, time.Duration, error) {
+		_ = dec.Close()
+		_ = f.Close()
+		_ = os.Remove(wavPath)
+		return 0, "", "", "", 0, cerr
+	}
+
+	if !progressive {
+		bw := bufio.NewWriterSize(f, 256<<10)
+		placeholderHdr := encodeWAVContainerHeader(sr, channels, 24, id3Chunk, 0)
+		if _, err := bw.Write(placeholderHdr); err != nil {
+			return cleanupSyncErr(err)
+		}
+		var pcmBytes int64
+		if len(preBuf) > 0 {
+			if _, err := bw.Write(preBuf); err != nil {
+				return cleanupSyncErr(err)
+			}
+			pcmBytes += int64(len(preBuf))
+		}
+		for !hitEOF {
+			if cerr := ctx.Err(); cerr != nil {
+				return cleanupSyncErr(cerr)
+			}
+			nFloats, derr := dec.Read(floatBuf)
+			nFrames := nFloats / channels
+			if nFrames > 0 {
+				nBytes := encodePCM24LE(pcmBuf, floatBuf[:nFrames*channels], 1.0)
+				if _, werr := bw.Write(pcmBuf[:nBytes]); werr != nil {
+					return cleanupSyncErr(werr)
+				}
+				pcmBytes += int64(nBytes)
+			}
+			if derr != nil {
+				if errors.Is(derr, io.EOF) {
+					break
+				}
+				if cerr := ctx.Err(); cerr != nil {
+					return cleanupSyncErr(cerr)
+				}
+				return cleanupSyncErr(derr)
+			}
+			if nFloats == 0 {
+				break
+			}
+		}
+		_ = dec.Close()
+
+		if pcmBytes == 0 {
+			var silentFrame [blockAlign]byte
+			if _, werr := bw.Write(silentFrame[:]); werr != nil {
+				_ = f.Close()
+				_ = os.Remove(wavPath)
+				return 0, "", "", "", 0, werr
+			}
+			pcmBytes = blockAlign
+		}
+		if err := bw.Flush(); err != nil {
+			_ = f.Close()
+			_ = os.Remove(wavPath)
+			return 0, "", "", "", 0, err
+		}
+		if err := finalizeHQPWAVHeader(f, sr, id3Chunk, pcmBytes); err != nil {
+			_ = f.Close()
+			_ = os.Remove(wavPath)
+			return 0, "", "", "", 0, err
+		}
+		if err := f.Close(); err != nil {
+			_ = os.Remove(wavPath)
+			return 0, "", "", "", 0, err
+		}
+
+		entry := &hqpTrackEntry{
+			seq:       seq,
+			src:       src,
+			wavPath:   wavPath,
+			modTime:   time.Now(),
+			coverData: coverData,
+		}
+		if len(coverData) > 0 {
+			entry.coverOnce.Do(func() {})
+		}
+		secret := s.registerHQPEntry(seq, entry)
+
+		actualFrames := pcmBytes / blockAlign
+		actualDur = time.Duration(float64(actualFrames) / float64(sr) * float64(time.Second))
+		if actualDur <= 0 {
+			actualDur = src.Duration
+		}
+		base := s.BaseURL(peerAddr)
+		fileURI = localFileURI(wavPath)
+		wavURL = fmt.Sprintf("%s/hqp/%s/%d.wav", base, secret, seq)
+		if len(coverData) > 0 || isHTTPURL(src.Track.Album.PicURL) {
+			coverURL = fmt.Sprintf("%s/hqp/%s/%d/cover.jpg", base, secret, seq)
+		}
+		return seq, fileURI, wavURL, coverURL, actualDur, nil
+	}
+
+	// Progressive streaming path: write upfront RIFF/RF64 header for estimatedDataBytes
+	// and continue decoding in a background goroutine while serving HTTP 206 byte ranges.
+	estimatedFrames := dec.Len()
+	if estimatedFrames <= 0 && src.Duration > 0 {
+		estimatedFrames = int64(math.Round(src.Duration.Seconds() * float64(sr)))
+	}
+	preFrames := int64(len(preBuf) / blockAlign)
+	if estimatedFrames <= preFrames {
+		estimatedFrames = preFrames + int64(sr)*30
+	}
+	estimatedDataBytes := estimatedFrames * blockAlign
+	hdr := encodeWAVContainerHeader(sr, channels, 24, id3Chunk, estimatedDataBytes)
+	if _, err := f.Write(hdr); err != nil {
+		return cleanupSyncErr(err)
+	}
+	if len(preBuf) > 0 {
+		if _, err := f.Write(preBuf); err != nil {
+			return cleanupSyncErr(err)
+		}
+	}
+
+	written := int64(len(hdr)) + int64(len(preBuf))
+	totalSize := int64(len(hdr)) + estimatedDataBytes
+	bgCtx, bgCancel := context.WithCancel(context.Background())
+	prog := newProgressiveWAV(totalSize, written, bgCancel)
 
 	entry := &hqpTrackEntry{
 		seq:       seq,
 		src:       src,
 		wavPath:   wavPath,
+		modTime:   time.Now(),
+		prog:      prog,
 		coverData: coverData,
 	}
 	if len(coverData) > 0 {
 		entry.coverOnce.Do(func() {})
 	}
+	secret := s.registerHQPEntry(seq, entry)
 
-	var evictedPaths []string
-	s.mu.Lock()
-	s.hqpTracks[seq] = entry
-	for k, old := range s.hqpTracks {
-		if seq > 3 && k < seq-2 {
-			if old.wavPath != "" {
-				evictedPaths = append(evictedPaths, old.wavPath)
+	go func() {
+		defer close(prog.doneCh)
+		defer f.Close()
+		defer dec.Close()
+
+		bgFloats := make([]float32, chunkFrames*channels)
+		bgPCM := make([]byte, chunkFrames*blockAlign)
+		cur := written
+		for cur < totalSize {
+			if cerr := bgCtx.Err(); cerr != nil {
+				prog.finish(cerr)
+				return
 			}
-			delete(s.hqpTracks, k)
+			nFloats, derr := dec.Read(bgFloats)
+			nFrames := nFloats / channels
+			if nFrames > 0 {
+				nBytes := encodePCM24LE(bgPCM, bgFloats[:nFrames*channels], 1.0)
+				if rem := totalSize - cur; int64(nBytes) > rem {
+					nBytes = int(rem)
+				}
+				if nBytes > 0 {
+					if _, werr := f.Write(bgPCM[:nBytes]); werr != nil {
+						prog.finish(werr)
+						return
+					}
+					cur += int64(nBytes)
+					prog.advance(cur)
+				}
+			}
+			if derr != nil {
+				if errors.Is(derr, io.EOF) {
+					break
+				}
+				prog.finish(derr)
+				return
+			}
+			if nFloats == 0 {
+				break
+			}
 		}
-	}
-	secret := s.secret
-	s.mu.Unlock()
-	for _, p := range evictedPaths {
-		_ = os.Remove(p)
-	}
 
-	actualFrames := pcmBytes / blockAlign
-	actualDur = time.Duration(float64(actualFrames) / float64(sr) * float64(time.Second))
+		// Pad trailing zeros to estimatedDataBytes when EOF arrives slightly early
+		// (e.g. AAC priming/padding trim) so Content-Range never short-reads.
+		if cur < totalSize {
+			zeroBuf := make([]byte, 64<<10)
+			for cur < totalSize {
+				if cerr := bgCtx.Err(); cerr != nil {
+					prog.finish(cerr)
+					return
+				}
+				step := int(min(int64(len(zeroBuf)), totalSize-cur))
+				if _, werr := f.Write(zeroBuf[:step]); werr != nil {
+					prog.finish(werr)
+					return
+				}
+				cur += int64(step)
+				prog.advance(cur)
+			}
+		}
+		prog.finish(nil)
+	}()
+
+	actualDur = time.Duration(float64(estimatedFrames) / float64(sr) * float64(time.Second))
 	if actualDur <= 0 {
 		actualDur = src.Duration
 	}
-
 	base := s.BaseURL(peerAddr)
-	fileURI = localFileURI(wavPath)
 	wavURL = fmt.Sprintf("%s/hqp/%s/%d.wav", base, secret, seq)
-	if src.Track.Album.PicURL != "" || len(coverData) > 0 {
+	if len(coverData) > 0 || isHTTPURL(src.Track.Album.PicURL) {
 		coverURL = fmt.Sprintf("%s/hqp/%s/%d/cover.jpg", base, secret, seq)
 	}
-	return seq, fileURI, wavURL, coverURL, actualDur, nil
+	return seq, "", wavURL, coverURL, actualDur, nil
 }
 
 func id3Syncsafe(n int) [4]byte {
@@ -702,12 +1075,15 @@ func (s *Server) HQPWAVURL(seq uint64, peerAddr string) string {
 
 func (s *Server) serveHQPCover(w http.ResponseWriter, r *http.Request, seq uint64) {
 	entry := s.lookupHQP(seq)
-	if entry == nil || (entry.src.Track.Album.PicURL == "" && len(entry.coverData) == 0) {
+	if entry == nil {
 		http.NotFound(w, r)
 		return
 	}
 	entry.coverOnce.Do(func() {
-		if len(entry.coverData) == 0 && entry.src.Track.Album.PicURL != "" {
+		if len(entry.coverData) == 0 && len(entry.src.CoverBytes) > 0 {
+			entry.coverData = append([]byte(nil), entry.src.CoverBytes...)
+		}
+		if len(entry.coverData) == 0 && isHTTPURL(entry.src.Track.Album.PicURL) {
 			if data, err := ytm.Fetch(ytm.Sized(entry.src.Track.Album.PicURL, 600)); err == nil {
 				entry.coverData = data
 			}
@@ -717,13 +1093,124 @@ func (s *Server) serveHQPCover(w http.ResponseWriter, r *http.Request, seq uint6
 		http.NotFound(w, r)
 		return
 	}
-	w.Header().Set("Content-Type", "image/jpeg")
+	contentType := "image/jpeg"
+	if len(entry.coverData) >= 8 && string(entry.coverData[:4]) == "\x89PNG" {
+		contentType = "image/png"
+	}
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("Content-Length", strconv.Itoa(len(entry.coverData)))
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)
 		return
 	}
 	_, _ = w.Write(entry.coverData)
+}
+
+type progressiveWAVReader struct {
+	f    *os.File
+	prog *progressiveWAV
+	ctx  context.Context
+	pos  int64
+}
+
+func (r *progressiveWAVReader) Seek(offset int64, whence int) (int64, error) {
+	var next int64
+	switch whence {
+	case io.SeekStart:
+		next = offset
+	case io.SeekCurrent:
+		next = r.pos + offset
+	case io.SeekEnd:
+		next = r.prog.totalSize + offset
+	default:
+		return 0, errors.New("bridge: invalid seek whence")
+	}
+	if next < 0 {
+		return 0, errors.New("bridge: negative seek position")
+	}
+	r.pos = next
+	return next, nil
+}
+
+func (r *progressiveWAVReader) Read(p []byte) (int, error) {
+	if r.pos >= r.prog.totalSize {
+		return 0, io.EOF
+	}
+	if rem := r.prog.totalSize - r.pos; int64(len(p)) > rem {
+		p = p[:rem]
+	}
+	if len(p) == 0 {
+		return 0, nil
+	}
+
+	stopWake := context.AfterFunc(r.ctx, func() {
+		r.prog.mu.Lock()
+		r.prog.cond.Broadcast()
+		r.prog.mu.Unlock()
+	})
+	defer stopWake()
+
+	r.prog.mu.Lock()
+	for r.prog.written <= r.pos && !r.prog.done && r.ctx.Err() == nil {
+		r.prog.cond.Wait()
+	}
+	avail := r.prog.written - r.pos
+	done := r.prog.done
+	pErr := r.prog.err
+	r.prog.mu.Unlock()
+
+	if cerr := r.ctx.Err(); cerr != nil {
+		return 0, cerr
+	}
+	if avail <= 0 {
+		if pErr != nil {
+			return 0, pErr
+		}
+		if done {
+			return 0, io.EOF
+		}
+		return 0, io.ErrUnexpectedEOF
+	}
+
+	toRead := int(min(int64(len(p)), avail))
+	n, err := r.f.ReadAt(p[:toRead], r.pos)
+	r.pos += int64(n)
+	if n > 0 && errors.Is(err, io.EOF) && r.pos < r.prog.totalSize {
+		err = nil
+	}
+	return n, err
+}
+
+func parseFirstByteRangeStart(rangeHdr string, totalSize int64) (int64, bool) {
+	s := strings.TrimSpace(rangeHdr)
+	if !strings.HasPrefix(s, "bytes=") {
+		return 0, false
+	}
+	spec := strings.TrimPrefix(s, "bytes=")
+	if i := strings.IndexByte(spec, ','); i >= 0 {
+		spec = spec[:i]
+	}
+	startStr, endStr, ok := strings.Cut(strings.TrimSpace(spec), "-")
+	if !ok {
+		return 0, false
+	}
+	startStr, endStr = strings.TrimSpace(startStr), strings.TrimSpace(endStr)
+	if startStr == "" {
+		// Suffix range bytes=-N
+		suf, err := strconv.ParseInt(endStr, 10, 64)
+		if err != nil || suf <= 0 {
+			return 0, false
+		}
+		if suf > totalSize {
+			return 0, true
+		}
+		return totalSize - suf, true
+	}
+	start, err := strconv.ParseInt(startStr, 10, 64)
+	if err != nil || start < 0 {
+		return 0, false
+	}
+	return start, true
 }
 
 func (s *Server) serveHQPWAV(w http.ResponseWriter, r *http.Request, seq uint64) {
@@ -738,6 +1225,25 @@ func (s *Server) serveHQPWAV(w http.ResponseWriter, r *http.Request, seq uint64)
 		return
 	}
 	defer f.Close()
+
+	if entry.prog != nil {
+		if failed, written, pErr := entry.prog.failureState(); failed {
+			if rng := r.Header.Get("Range"); rng != "" {
+				if start, ok := parseFirstByteRangeStart(rng, entry.prog.totalSize); ok && start >= written {
+					http.Error(w, pErr.Error(), http.StatusBadGateway)
+					return
+				}
+			} else if written <= 0 {
+				http.Error(w, pErr.Error(), http.StatusBadGateway)
+				return
+			}
+		}
+		w.Header().Set("Content-Type", "audio/wav")
+		rs := &progressiveWAVReader{f: f, prog: entry.prog, ctx: r.Context()}
+		http.ServeContent(w, r, fmt.Sprintf("%d.wav", seq), entry.modTime, rs)
+		return
+	}
+
 	info, err := f.Stat()
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -745,6 +1251,65 @@ func (s *Server) serveHQPWAV(w http.ResponseWriter, r *http.Request, seq uint64)
 	}
 	w.Header().Set("Content-Type", "audio/wav")
 	http.ServeContent(w, r, fmt.Sprintf("%d.wav", seq), info.ModTime(), f)
+}
+
+// encodeWAVContainerHeader builds a RIFF/WAVE header with a 28-byte "JUNK"
+// placeholder chunk or promotes it in-place to an EBU Tech 3306 RF64/WAVE
+// header with a 28-byte "ds64" chunk whenever pcmBytes or riffPayload exceeds
+// math.MaxUint32. Placing "fmt " and the optional 2-byte-aligned "id3 " chunk
+// before "data" lets HQPlayer read tags and artwork from the start of the stream.
+func encodeWAVContainerHeader(sampleRate, channels, bitsPerSample int, id3Chunk []byte, pcmBytes int64) []byte {
+	blockAlign := channels * (bitsPerSample / 8)
+	if blockAlign <= 0 {
+		blockAlign = 6
+	}
+	hdrLen := 80 + len(id3Chunk)
+	riffPayload := int64(hdrLen-8) + pcmBytes
+	isRF64 := pcmBytes > math.MaxUint32 || riffPayload > math.MaxUint32
+
+	h := make([]byte, hdrLen)
+	if isRF64 {
+		copy(h[0:4], "RF64")
+		binary.LittleEndian.PutUint32(h[4:8], 0xFFFFFFFF)
+		copy(h[8:12], "WAVE")
+		copy(h[12:16], "ds64")
+		binary.LittleEndian.PutUint32(h[16:20], 28)
+		binary.LittleEndian.PutUint64(h[20:28], uint64(riffPayload))
+		binary.LittleEndian.PutUint64(h[28:36], uint64(pcmBytes))
+		binary.LittleEndian.PutUint64(h[36:44], uint64(pcmBytes/int64(blockAlign)))
+		binary.LittleEndian.PutUint32(h[44:48], 0)
+	} else {
+		copy(h[0:4], "RIFF")
+		if pcmBytes >= 0 {
+			binary.LittleEndian.PutUint32(h[4:8], uint32(riffPayload))
+		} else {
+			binary.LittleEndian.PutUint32(h[4:8], 0xFFFFFFFF)
+		}
+		copy(h[8:12], "WAVE")
+		copy(h[12:16], "JUNK")
+		binary.LittleEndian.PutUint32(h[16:20], 28)
+	}
+
+	copy(h[48:52], "fmt ")
+	binary.LittleEndian.PutUint32(h[52:56], 16)
+	binary.LittleEndian.PutUint16(h[56:58], 1) // PCM
+	binary.LittleEndian.PutUint16(h[58:60], uint16(channels))
+	binary.LittleEndian.PutUint32(h[60:64], uint32(sampleRate))
+	binary.LittleEndian.PutUint32(h[64:68], uint32(sampleRate*blockAlign))
+	binary.LittleEndian.PutUint16(h[68:70], uint16(blockAlign))
+	binary.LittleEndian.PutUint16(h[70:72], uint16(bitsPerSample))
+
+	if len(id3Chunk) > 0 {
+		copy(h[72:72+len(id3Chunk)], id3Chunk)
+	}
+	dataOff := 72 + len(id3Chunk)
+	copy(h[dataOff:dataOff+4], "data")
+	if isRF64 || pcmBytes < 0 {
+		binary.LittleEndian.PutUint32(h[dataOff+4:dataOff+8], 0xFFFFFFFF)
+	} else {
+		binary.LittleEndian.PutUint32(h[dataOff+4:dataOff+8], uint32(pcmBytes))
+	}
+	return h
 }
 
 func buildWAVHeader(sampleRate, channels, bitsPerSample int, dataBytes int64) [44]byte {
@@ -886,8 +1451,11 @@ func (s *Server) runRoonClock() {
 				title = rs.streamTitle()
 			}
 
-			// Pull or advance PCM clock when WAV listeners exist or sink is playing without AAC-only mode.
-			if rs != nil && (hasWAV || !hasAAC) {
+			canADTS := rs != nil && hasAAC && rs.hasADTS()
+
+			// Pull or advance PCM clock when WAV listeners exist, when no AAC listener is
+			// driving the clock, or when an AAC-only sink cannot produce ADTS packets.
+			if rs != nil && (hasWAV || !hasAAC || !canADTS) {
 				wavPayload = rs.pullPCM24(wavFramesTick)
 			}
 			if len(wavPayload) == 0 {
@@ -906,7 +1474,7 @@ func (s *Server) runRoonClock() {
 			frameDurNs := int64(1024*1e9) / int64(aacRate)
 			for aacAccumNs >= frameDurNs {
 				aacAccumNs -= frameDurNs
-				if rs != nil && hasAAC {
+				if canADTS {
 					if pkt := rs.pullADTS(!hasWAV); len(pkt) > 0 {
 						aacFrames = append(aacFrames, pkt)
 						if sr, sf := rs.aacFormat(); sr > 0 && sr != aacRate {

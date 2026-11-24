@@ -257,10 +257,28 @@ func TestStreamSpecMetadataAndFormatting(t *testing.T) {
 			detail: "AAC 128kbps · 44.1kHz",
 		},
 		{
+			st:     &Stream{Codec: "AAC", SampleRate: 44100, Bitrate: 96},
+			dur:    3 * time.Minute,
+			badge:  "AAC 96k",
+			detail: "AAC 96kbps · 44.1kHz",
+		},
+		{
 			st:     &Stream{Codec: "AAC", Level: "exhigh", SampleRate: 44100, Bitrate: 256},
 			dur:    3 * time.Minute,
 			badge:  "AAC 256k",
 			detail: "AAC 256kbps · 44.1kHz",
+		},
+		{
+			st:     &Stream{Codec: "AAC", Level: "exhigh", SampleRate: 44100},
+			dur:    3 * time.Minute,
+			badge:  "AAC 256k",
+			detail: "AAC 256kbps · 44.1kHz",
+		},
+		{
+			st:     &Stream{Codec: "AAC", Level: "standard", SampleRate: 44100},
+			dur:    3 * time.Minute,
+			badge:  "AAC 128k",
+			detail: "AAC 128kbps · 44.1kHz",
 		},
 		{
 			st:     &Stream{Codec: "MP3", SampleRate: 44100, Bitrate: 320},
@@ -311,5 +329,91 @@ func TestStreamSpecMetadataAndFormatting(t *testing.T) {
 	sized := &Stream{Size: 4_800_000}
 	if got := sized.EffectiveKbps(200 * time.Second); got != 192 {
 		t.Fatalf("EffectiveKbps from Size = %d, want 192", got)
+	}
+}
+
+// Marking WEB_REMIX exhigh forbidden skips 256 kbps WEB_REMIX streams while keeping WEB_REMIX 128 kbps standard fallback when TVHTML5 and VISIONOS fail.
+func TestExhighBlockedPreservesWebRemixStandardFallback(t *testing.T) {
+	SetCookies("SAPISID=prem_blocked; SID=xyz")
+	defer ClearSession()
+
+	origVision, origTV, origWR, origSolver := fetchVisionPlayer, fetchTVPlayer, fetchWebRemixPlayer, getSolver
+	defer func() {
+		fetchVisionPlayer, fetchTVPlayer, fetchWebRemixPlayer, getSolver = origVision, origTV, origWR, origSolver
+		clearStreamCaches()
+		forgetPremium()
+	}()
+
+	getSolver = func() (*solver, error) { return stubSolver(), nil }
+	sawPremium(true)
+	MarkExhighForbidden()
+
+	fetchVisionPlayer = func(id string) (any, error) {
+		return map[string]any{
+			"playabilityStatus": map[string]any{
+				"status": "LOGIN_REQUIRED",
+				"reason": "Sign in to confirm you’re not a bot",
+			},
+		}, nil
+	}
+	fetchTVPlayer = func(id string, sts int) (any, error) {
+		if id == "tv_and_vision_blocked" {
+			return map[string]any{
+				"playabilityStatus": map[string]any{"status": "UNPLAYABLE", "reason": "Unavailable on TV"},
+			}, nil
+		}
+		return map[string]any{
+			"videoDetails":      map[string]any{"videoId": id},
+			"playabilityStatus": map[string]any{"status": "OK"},
+			"streamingData": map[string]any{
+				"adaptiveFormats": []any{
+					map[string]any{
+						"itag":          float64(140),
+						"url":           "https://rr1.googlevideo.com/videoplayback?itag=140&c=TVHTML5",
+						"contentLength": "3100000",
+					},
+				},
+			},
+		}, nil
+	}
+	wrCalls := 0
+	fetchWebRemixPlayer = func(id string, sts int) (any, error) {
+		wrCalls++
+		return map[string]any{
+			"videoDetails":      map[string]any{"videoId": id},
+			"playabilityStatus": map[string]any{"status": "OK"},
+			"streamingData": map[string]any{
+				"adaptiveFormats": []any{
+					map[string]any{
+						"itag":          float64(141),
+						"url":           "https://rr1.googlevideo.com/videoplayback?itag=141&c=WEB_REMIX",
+						"contentLength": "6200000",
+					},
+					map[string]any{
+						"itag":          float64(140),
+						"url":           "https://rr1.googlevideo.com/videoplayback?itag=140&c=WEB_REMIX",
+						"contentLength": "3100000",
+					},
+				},
+			},
+		}, nil
+	}
+
+	// TVHTML5 succeeds directly without touching WEB_REMIX when exhigh is blocked.
+	stTV, err := SongURL("tv_ok", "exhigh")
+	if err != nil {
+		t.Fatalf("SongURL(tv_ok, exhigh): %v", err)
+	}
+	if stTV.Level != "standard" || !strings.Contains(stTV.URL, "c=TVHTML5") || wrCalls != 0 {
+		t.Fatalf("tv_ok got %+v wrCalls=%d", stTV, wrCalls)
+	}
+
+	// When both TVHTML5 and VISIONOS fail, SongURL still falls back to WEB_REMIX standard (itag 140), never wr.exhigh (itag 141).
+	stWR, err := SongURL("tv_and_vision_blocked", "exhigh")
+	if err != nil {
+		t.Fatalf("SongURL(tv_and_vision_blocked, exhigh): %v", err)
+	}
+	if stWR.Level != "standard" || !strings.Contains(stWR.URL, "itag=140&c=WEB_REMIX") {
+		t.Fatalf("fallback stream = %+v, want WEB_REMIX itag=140 standard", stWR)
 	}
 }

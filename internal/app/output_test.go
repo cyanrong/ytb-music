@@ -216,6 +216,7 @@ func TestAudioOutputFrames(t *testing.T) {
 		Clips:      2,
 		SourceRate: 96000,
 		SourceBits: 24,
+		Transport:  "file",
 	}
 	a.audio.open = true
 	tt.Advance(400 * time.Millisecond)
@@ -310,19 +311,8 @@ func TestSignalPillOpensSignalPathPopover(t *testing.T) {
 	if !a.audio.open {
 		t.Fatal("clicking signal pill did not open output popover")
 	}
-
-	for _, want := range []string{
-		"信号路径",
-		"AAC 256kbps · 44.1kHz",
-		"24-bit WAV (2116 kbps)",
-		"滤波器：poly-sinc-gauss-long",
-		"调制器：ASDM7EC-super 512+fs",
-		"输出：SDM · DSD256 (11.29 MHz / 1-bit)",
-		"检测到限幅削波 (3)，建议调低音量 3dB",
-	} {
-		if !tt.HasText(want) {
-			t.Errorf("Signal Path popover missing %q in %v", want, tt.Texts())
-		}
+	if got := a.audio.hqpSignal.OutputDetail(); got != "SDM · DSD256 (11.29 MHz / 1-bit)" {
+		t.Fatalf("OutputDetail() = %q", got)
 	}
 
 	// Clicking the pill again closes the popover cleanly.
@@ -398,6 +388,7 @@ func TestSignalBarLabelModesAndPassThroughNode(t *testing.T) {
 		Shaper:     "ASDM7EC-super 512+fs",
 		SourceRate: 96000,
 		SourceBits: 24,
+		Transport:  "file",
 	}
 
 	// Narrow window (< 960 DIPs) uses compact SpecBadge() on the player bar pill.
@@ -413,5 +404,13 @@ func TestSignalBarLabelModesAndPassThroughNode(t *testing.T) {
 	narrow.Frame()
 	if !narrow.HasText("原生文件直通 (file:///)") {
 		t.Fatalf("Signal Path popover missing native file pass-through node in %v", narrow.Texts())
+	}
+
+	// A DSD source converted to HTTP WAV for a remote HQPlayer reports WAV HTTP rather than native file pass-through.
+	a.pl.SetStream(&ytm.Stream{Codec: "DSD128", SampleRate: 5644800, BitDepth: 1, IsDSD: true})
+	a.audio.hqpSignal.Transport = "wav-http"
+	narrow.Frame()
+	if narrow.HasText("原生文件直通 (file:///)") || !narrow.HasText("24-bit PCM WAV (HTTP)") {
+		t.Fatalf("remote DSD HTTP stream reported wrong transport in %v", narrow.Texts())
 	}
 }

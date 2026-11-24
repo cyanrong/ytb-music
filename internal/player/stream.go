@@ -33,10 +33,11 @@ type download struct {
 	cancel context.CancelFunc
 	// part is the file's path until the cache keeps it, which keep does
 	// once the song has all come in: the path it is at then.
-	part    string
-	keep    func(part string, n int64) (string, bool)
-	refresh func() (string, error) // reacquires a fresh signed URL after a route change
-	ua      string                 // client User-Agent expected by googlevideo.com
+	part       string
+	keep       func(part string, n int64) (string, bool)
+	refresh    func() (string, error) // reacquires a fresh signed URL after a route change
+	ua         string                 // client User-Agent expected by googlevideo.com
+	probeUntil int64                  // startup byte threshold while HTTP 403 skips URL refresh
 	// users counts what reads or writes the song: the stream decoding it,
 	// until it closes, and the goroutine fetching it. The last to go
 	// closes the file, and removes it unless the cache kept it.
@@ -51,8 +52,19 @@ func startDownload(url string, size int64, part *os.File, keep func(string, int6
 }
 
 func startDownloadWithRefresh(url, ua string, size int64, part *os.File, keep func(string, int64) (string, bool), refresh func() (string, error)) *download {
+	var fn func(*download) (string, error)
+	if refresh != nil {
+		fn = func(*download) (string, error) { return refresh() }
+	}
+	return startDownloadOpts(url, ua, size, 0, part, keep, fn)
+}
+
+func startDownloadOpts(url, ua string, size, probeUntil int64, part *os.File, keep func(string, int64) (string, bool), refresh func(*download) (string, error)) *download {
 	ctx, cancel := context.WithCancel(context.Background())
-	d := &download{size: size, cancel: cancel, refresh: refresh, ua: ua, users: 2}
+	d := &download{size: size, probeUntil: probeUntil, cancel: cancel, ua: ua, users: 2}
+	if refresh != nil {
+		d.refresh = func() (string, error) { return refresh(d) }
+	}
 	d.cond.L = &d.mu
 	switch {
 	case part != nil:
@@ -267,6 +279,22 @@ func (d *download) Progress() float64 {
 	return float64(d.n) / float64(d.size)
 }
 
+// completed reports whether the download finished cleanly with all bytes in.
+func (d *download) completed() bool {
+	if d == nil {
+		return true
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.done && d.err == nil
+}
+
+func (d *download) inStartupProbe() bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.probeUntil > 0 && d.n < d.probeUntil
+}
+
 // waitFor waits until n bytes are in, or the download ended, and returns
 // how many there are.
 func (d *download) waitFor(n int64) int64 {
@@ -280,18 +308,25 @@ func (d *download) waitFor(n int64) int64 {
 
 // probeRange waits until at least want bytes (clamped to d.size) have arrived,
 // or returns the download error if the stream ended early (e.g. 403 on chunk 2).
+// During this startup probe, HTTP 403 does not invoke d.refresh so PO-token
+// rejections fall back to standard immediately.
 func (d *download) probeRange(want int64) error {
 	if d.size > 0 {
 		want = min(want, d.size)
 	}
 	d.mu.Lock()
-	defer d.mu.Unlock()
+	if want > d.probeUntil {
+		d.probeUntil = want
+	}
 	for d.n < want && !d.done {
 		d.cond.Wait()
 	}
-	if d.n < want {
-		if d.err != nil {
-			return d.err
+	d.probeUntil = 0
+	got, err := d.n, d.err
+	d.mu.Unlock()
+	if got < want {
+		if err != nil {
+			return err
 		}
 		return io.ErrUnexpectedEOF
 	}

@@ -3,11 +3,13 @@ package player
 import (
 	"context"
 	"errors"
+	"io"
 	"math"
 	"math/rand/v2"
 	"net/http"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/egoist/mygo"
@@ -416,7 +418,25 @@ func (p *Player) OpenAudio() (Audio, error) {
 		if err != nil {
 			return nil, err
 		}
-		if opened == nil || opened.Decoder == nil {
+		if opened == nil {
+			return nil, errors.New("player: empty local audio")
+		}
+		if opened.OpenPCM != nil {
+			if opened.Decoder != nil {
+				if c, ok := opened.Decoder.(io.Closer); ok {
+					_ = c.Close()
+				}
+			}
+			dec, derr := opened.OpenPCM()
+			if derr != nil {
+				return nil, derr
+			}
+			if dec == nil {
+				return nil, errors.New("player: empty local audio")
+			}
+			return newLocalPCMStream(dec, nil), nil
+		}
+		if opened.Decoder == nil {
 			return nil, errors.New("player: empty local audio")
 		}
 		return newLocalPCMStream(opened.Decoder, nil), nil
@@ -777,10 +797,29 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 		if isLocal {
 			var opened *LocalOpenedTrack
 			opened, err = localProv.OpenLocalTrack(t.ID)
-			if err == nil && (opened == nil || opened.Decoder == nil) {
+			if err == nil && opened == nil {
 				err = errors.New("player: empty local audio")
 			}
 			if err == nil {
+				var (
+					decMu    sync.Mutex
+					firstDec = opened.Decoder
+					specMu   sync.Mutex
+					spec     *spectrum
+				)
+				closeUnusedFirst := func() {
+					decMu.Lock()
+					d := firstDec
+					firstDec = nil
+					decMu.Unlock()
+					if d != nil {
+						if c, ok := d.(io.Closer); ok {
+							_ = c.Close()
+						}
+					}
+				}
+				defer closeUnusedFirst()
+
 				if len(opened.Cover) > 0 {
 					cover := opened.Cover
 					p.post(func() {
@@ -789,54 +828,137 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 						}
 					})
 				}
-				sr := opened.Decoder.SampleRate()
-				if sr <= 0 {
-					sr = 44100
-				}
-				frames := max(opened.Decoder.Len(), int64(0))
-				if frames == 0 && t.Duration > 0 {
-					frames = t.Duration * int64(sr) / 1000
-				}
-				spec := newSpectrum(sr, frames)
-				s = newLocalPCMStream(opened.Decoder, spec)
+
 				if opened.Stream != nil {
 					cp := *opened.Stream
 					info = &cp
 				} else {
 					info = &ytm.Stream{}
 				}
-				if info.SampleRate <= 0 {
-					info.SampleRate = sr
+				if firstDec != nil && info.SampleRate <= 0 && firstDec.SampleRate() > 0 {
+					info.SampleRate = firstDec.SampleRate()
 				}
+
+				getOrInitSpec := func(sr int, frames int64) *spectrum {
+					specMu.Lock()
+					defer specMu.Unlock()
+					if spec == nil {
+						spec = newSpectrum(sr, frames)
+					}
+					return spec
+				}
+				currentSpec := func() *spectrum {
+					specMu.Lock()
+					defer specMu.Unlock()
+					return spec
+				}
+
+				openPCM := func() (*localPCMStream, error) {
+					var base audio.Decoder
+					if opened.OpenPCM != nil {
+						var oerr error
+						base, oerr = opened.OpenPCM()
+						if oerr != nil {
+							return nil, oerr
+						}
+						if base == nil {
+							return nil, errors.New("player: empty local audio")
+						}
+					} else {
+						decMu.Lock()
+						if firstDec != nil {
+							base = firstDec
+							firstDec = nil
+						}
+						decMu.Unlock()
+						if base == nil {
+							op, oerr := localProv.OpenLocalTrack(t.ID)
+							if oerr != nil {
+								return nil, oerr
+							}
+							if op == nil {
+								return nil, errors.New("player: empty local audio")
+							}
+							if op.OpenPCM != nil {
+								if op.Decoder != nil {
+									if c, ok := op.Decoder.(io.Closer); ok {
+										_ = c.Close()
+									}
+								}
+								var perr error
+								base, perr = op.OpenPCM()
+								if perr != nil {
+									return nil, perr
+								}
+							} else {
+								base = op.Decoder
+							}
+							if base == nil {
+								return nil, errors.New("player: empty local audio")
+							}
+						}
+					}
+					sr := base.SampleRate()
+					if sr <= 0 {
+						if info.SampleRate > 0 {
+							sr = info.SampleRate
+						} else {
+							sr = 44100
+						}
+					}
+					frames := max(base.Len(), int64(0))
+					if frames == 0 && t.Duration > 0 {
+						frames = t.Duration * int64(sr) / 1000
+					}
+					return newLocalPCMStream(base, getOrInitSpec(sr, frames)), nil
+				}
+
 				if backend != nil {
 					if ctx.Err() != nil {
-						_ = s.Close()
+						backendErr = ctx.Err()
 					} else {
 						dur := t.Length()
-						if f := s.Len(); f > 0 && s.SampleRate() > 0 {
-							dur = time.Duration(float64(f) / float64(s.SampleRate()) * float64(time.Second))
+						if firstDec != nil && firstDec.Len() > 0 && firstDec.SampleRate() > 0 {
+							dur = time.Duration(float64(firstDec.Len()) / float64(firstDec.SampleRate()) * float64(time.Second))
 						}
 						src := TrackSource{
-							Track:     t,
-							Stream:    info,
-							Duration:  dur,
-							Gain:      initGain * normGain(info),
-							LocalPath: opened.LocalPath,
-							NativeHQP: opened.NativeHQP,
-							OpenPCM: func() (PCMDecoder, error) {
-								op, oerr := localProv.OpenLocalTrack(t.ID)
-								if oerr != nil {
-									return nil, oerr
-								}
-								if op == nil || op.Decoder == nil {
-									return nil, errors.New("player: empty local audio")
-								}
-								return newLocalPCMStream(op.Decoder, spec), nil
-							},
+							Track:      t,
+							Stream:     info,
+							Duration:   dur,
+							Gain:       initGain * normGain(info),
+							LocalPath:  opened.LocalPath,
+							NativeHQP:  opened.NativeHQP,
+							CoverBytes: opened.Cover,
+							OpenPCM:    func() (PCMDecoder, error) { return openPCM() },
+							OpenRaw:    opened.OpenRaw,
 						}
-						stopLoad := context.AfterFunc(ctx, func() { _ = s.Close() })
 						extOut, backendErr = backend.Open(ctx, src)
-						stopLoad()
+						if backendErr == nil {
+							if ls, lerr := openPCM(); lerr == nil {
+								s = ls
+								if info.SampleRate <= 0 {
+									info.SampleRate = ls.SampleRate()
+								}
+							} else {
+								s = newInertLocalStream(info.SampleRate, t.Duration, currentSpec())
+								if info.SampleRate <= 0 {
+									info.SampleRate = s.SampleRate()
+								}
+							}
+							if ctx.Err() != nil {
+								_ = s.Close()
+							}
+						}
+					}
+				} else {
+					ls, lerr := openPCM()
+					if lerr != nil {
+						err = lerr
+					} else {
+						s = ls
+						if info.SampleRate <= 0 {
+							info.SampleRate = ls.SampleRate()
+						}
 					}
 				}
 			}
@@ -857,12 +979,13 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 					dur = time.Duration(float64(frames) / float64(s.SampleRate()) * float64(time.Second))
 				}
 				src := TrackSource{
-					Track:    t,
-					Stream:   info,
-					Duration: dur,
-					Gain:     initGain * normGain(info),
-					OpenPCM:  func() (PCMDecoder, error) { return openSharedWithSpec(dl, spec) },
-					OpenRaw:  func() (RawStream, error) { return openSharedRaw(dl) },
+					Track:       t,
+					Stream:      info,
+					Duration:    dur,
+					Gain:        initGain * normGain(info),
+					Downloading: dl != nil && !dl.completed(),
+					OpenPCM:     func() (PCMDecoder, error) { return openSharedWithSpec(dl, spec) },
+					OpenRaw:     func() (RawStream, error) { return openSharedRaw(dl) },
 				}
 				stopLoad := context.AfterFunc(ctx, func() { _ = s.Close() })
 				extOut, backendErr = backend.Open(ctx, src)

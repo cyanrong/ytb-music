@@ -1,11 +1,13 @@
 package app
 
 import (
+	"context"
 	"testing"
 	"time"
 
 	"github.com/egoist/mygo/ui"
 
+	"ytb-music/internal/localmusic"
 	"ytb-music/internal/lyrics"
 	"ytb-music/internal/ytm"
 )
@@ -100,5 +102,51 @@ func TestBackdropFadeEnds(t *testing.T) {
 	tt.Frame()
 	if a.backdropCache.before != nil {
 		t.Error("the last song's backdrop still fades after the fade")
+	}
+}
+
+// Idle Local Music lenses and local album detail pages do not schedule layout/state frames via FramePending once settled.
+func TestLocalLibraryFrameBudget(t *testing.T) {
+	musicRoot := writeSampleMusicFolder(t)
+	a, posts, _ := newLocalTestApp(t)
+	a.local.lib.AddFolders(musicRoot)
+	if err := a.local.lib.Scan(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	a.open(route{page: pageLocal})
+
+	tt := ui.NewTester(a.view, 1180, 780)
+	tt.SetDark(true)
+	tt.Frame()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(a.art.busy) > 0 && time.Now().Before(deadline) {
+		select {
+		case fn := <-posts:
+			fn()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	for len(posts) > 0 {
+		(<-posts)()
+	}
+
+	for _, tc := range []struct {
+		name string
+		prep func()
+	}{
+		{"local-albums", func() { a.local.tab = localTabAlbums }},
+		{"local-genres", func() { a.local.tab = localTabGenres }},
+		{"local-tracks", func() { a.local.tab = localTabTracks }},
+		{"local-folders", func() { a.local.tab = localTabFolders }},
+		{"local-album-detail", func() {
+			if albums := a.local.lib.Albums(localmusic.AlbumFilter{}); len(albums) > 0 {
+				a.open(route{page: pageAlbum, id: albums[0].ID})
+			}
+		}},
+	} {
+		tc.prep()
+		if n := framesAt(a, tt, 0); n != 0 {
+			t.Errorf("%s scheduled %d FramePending rebuilds over 1s while idle, want 0", tc.name, n)
+		}
 	}
 }

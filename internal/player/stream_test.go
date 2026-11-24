@@ -481,8 +481,10 @@ func TestExhighChunk2ForbiddenFallsBackToStandard(t *testing.T) {
 
 	was := songURL
 	defer func() { songURL = was }()
+	exhighCalls := 0
 	songURL = func(id, level string) (*ytm.Stream, error) {
 		if level == "exhigh" {
+			exhighCalls++
 			return &ytm.Stream{
 				URL:   exhighSrv.URL + "/.googlevideo.com/videoplayback?id=" + id,
 				Size:  bigSize,
@@ -503,11 +505,129 @@ func TestExhighChunk2ForbiddenFallsBackToStandard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open(exhigh) failed instead of falling back: %v", err)
 	}
-	defer s.Close()
+	dl, _ := s.source()
+	defer func() {
+		s.Close()
+		waitDownloadReleased(dl)
+	}()
+	if exhighCalls != 1 {
+		t.Fatalf("startup chunk-2 403 invoked songURL(exhigh) %d times, want 1 (no refresh)", exhighCalls)
+	}
 	if info.Level != "standard" {
 		t.Fatalf("fallback level = %q, want standard", info.Level)
 	}
 	if n, rerr := s.Read(make([]float32, 4096)); n == 0 || rerr != nil {
 		t.Fatalf("reading fallback stream: n=%d err=%v", n, rerr)
+	}
+}
+
+// Once an exhigh stream passes its startup second-range probe, a subsequent range rejected with HTTP 403 refreshes the signed exhigh URL and completes downloading.
+func TestExhighRefreshAfterStartupProbe(t *testing.T) {
+	b, err := os.ReadFile("testdata/seek.m4a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	total := int64(firstRange + rangeSize + 64<<10)
+	payload := make([]byte, total)
+	copy(payload, b)
+	for i := len(b); i < len(payload); i++ {
+		payload[i] = byte(i % 251)
+	}
+
+	serveSlice := func(w http.ResponseWriter, r *http.Request) {
+		rng := r.URL.Query().Get("range")
+		var from, to int64
+		if _, err := fmt.Sscanf(rng, "%d-%d", &from, &to); err != nil || from < 0 || to >= total {
+			http.Error(w, "bad range", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(payload[from : to+1])
+	}
+
+	oldSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rng := r.URL.Query().Get("range")
+		var from, to int64
+		_, _ = fmt.Sscanf(rng, "%d-%d", &from, &to)
+		if from < int64(firstRange+rangeSize) {
+			serveSlice(w, r)
+			return
+		}
+		// Chunk 3 expires mid-playback and returns HTTP 403.
+		http.Error(w, "signature expired", http.StatusForbidden)
+	}))
+	defer oldSrv.Close()
+
+	var gotFreshUA string
+	freshSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotFreshUA = r.Header.Get("User-Agent")
+		serveSlice(w, r)
+	}))
+	defer freshSrv.Close()
+
+	ytm.SetCookies("SAPISID=prem_refresh; SID=xyz")
+	defer ytm.ClearSession()
+
+	was := songURL
+	defer func() { songURL = was }()
+	exhighCalls := 0
+	songURL = func(id, level string) (*ytm.Stream, error) {
+		if level != "exhigh" {
+			t.Fatalf("unexpected fallback level %q", level)
+		}
+		exhighCalls++
+		if exhighCalls == 1 {
+			return &ytm.Stream{
+				URL:       oldSrv.URL + "/.googlevideo.com/videoplayback?id=" + id,
+				UserAgent: "Initial-Exhigh-UA/1.0",
+				Size:      total,
+				Type:      "m4a",
+				Level:     "exhigh",
+			}, nil
+		}
+		return &ytm.Stream{
+			URL:       freshSrv.URL + "/.googlevideo.com/videoplayback?id=" + id,
+			UserAgent: "Fresh-Exhigh-UA/2.0",
+			Size:      total,
+			Type:      "m4a",
+			Level:     "exhigh",
+		}, nil
+	}
+
+	p := &Player{Cache: NewCache(t.TempDir(), 1<<30)}
+	info, s, err := p.open(ytm.Track{ID: "prem_refresh_song"}, "exhigh")
+	if err != nil {
+		t.Fatalf("open(exhigh): %v", err)
+	}
+	if info.Level != "exhigh" {
+		s.Close()
+		t.Fatalf("level = %q, want exhigh", info.Level)
+	}
+	dl, _ := s.source()
+	if got := dl.waitFor(total); got != total {
+		s.Close()
+		waitDownloadReleased(dl)
+		t.Fatalf("downloaded %d/%d bytes, err=%v", got, total, dl.err)
+	}
+	for start := time.Now(); !dl.completed() && time.Since(start) < 2*time.Second; time.Sleep(2 * time.Millisecond) {
+	}
+	s.Close()
+	waitDownloadReleased(dl)
+	if exhighCalls != 2 || gotFreshUA != "Fresh-Exhigh-UA/2.0" {
+		t.Fatalf("exhighCalls=%d gotFreshUA=%q, want 2 and Fresh-Exhigh-UA/2.0", exhighCalls, gotFreshUA)
+	}
+}
+
+func waitDownloadReleased(dl *download) {
+	if dl == nil {
+		return
+	}
+	for start := time.Now(); time.Since(start) < 2*time.Second; time.Sleep(2 * time.Millisecond) {
+		dl.mu.Lock()
+		users := dl.users
+		dl.mu.Unlock()
+		if users <= 0 {
+			return
+		}
 	}
 }

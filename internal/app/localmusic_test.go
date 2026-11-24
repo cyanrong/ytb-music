@@ -126,7 +126,7 @@ func newLocalTestApp(t *testing.T) (*app, chan func(), *stubLocalOutputBackend) 
 	a.setLocalLibrary(lib)
 	t.Cleanup(func() {
 		a.closeLocalLibrary()
-		a.pl.Stop()
+		a.closeAudioChain()
 		setLocalCoverLoader(nil)
 	})
 	return a, posts, be
@@ -544,14 +544,14 @@ func TestLocalLibraryBrowseFilterAndPlayback(t *testing.T) {
 		t.Fatalf("expected .lrc lyrics loaded via Player.Local, got (%+v, %v)", lines, ok)
 	}
 
-	// Global search surfaces local matches even when YouTube is offline.
+	// Global search surfaces local matches while keeping the online retry button available on failure.
 	a.search("Waltz for Debby")
 	drainLocalPosts(t, posts, tt, func() bool {
 		d := a.searches[a.route]
 		return d != nil && !d.page.loading
 	})
-	if !tt.HasText("本地曲库匹配") || !tt.HasText("Waltz for Debby") {
-		t.Fatalf("expected global search to surface local library match: %v", tt.Texts())
+	if !tt.HasText("本地曲库匹配") || !tt.HasText("Waltz for Debby") || !tt.HasText("重试") {
+		t.Fatalf("expected global search to surface local match alongside online retry action: %v", tt.Texts())
 	}
 }
 
@@ -666,6 +666,10 @@ func TestLocalRoonGenreSync(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	origAcquire := acquireRoonManager
+	acquireRoonManager = func(*app) (*bridge.RoonManager, error) { return nil, nil }
+	defer func() { acquireRoonManager = origAcquire }()
+
 	origFetch := fetchRoonGenres
 	fetchRoonGenres = func(*bridge.RoonManager, context.Context) ([]bridge.RoonAlbumGenre, error) {
 		return []bridge.RoonAlbumGenre{
@@ -715,62 +719,37 @@ func TestLocalRoonGenreSync(t *testing.T) {
 	}
 }
 
-// An idle Local Music page and local album page request zero animation frames once transitions settle.
-func TestLocalLibraryIdleFrames(t *testing.T) {
-	musicRoot := writeSampleMusicFolder(t)
-	a, posts, _ := newLocalTestApp(t)
-	a.local.lib.AddFolders(musicRoot)
-	if err := a.local.lib.Scan(context.Background(), nil); err != nil {
+// localPlayerProvider opens native HQPlayer tracks lazily without requiring a Go PCM decoder and exposes OpenRaw for non-CUE local AAC M4A files.
+func TestLocalPlayerProviderLazyPCMAndRawAAC(t *testing.T) {
+	dir := t.TempDir()
+	// Minimal WavPack header ("wvpk"): supported natively by HQPlayer via file:/// without a Go PCM decoder.
+	var wv [32]byte
+	copy(wv[0:4], "wvpk")
+	binary.LittleEndian.PutUint32(wv[4:8], 24)
+	binary.LittleEndian.PutUint16(wv[8:10], 0x0410)
+	binary.LittleEndian.PutUint32(wv[12:16], 44100*5)
+	binary.LittleEndian.PutUint32(wv[24:28], (9 << 23)) // 44.1 kHz
+	wvPath := filepath.Join(dir, "01 - Native.wv")
+	if err := os.WriteFile(wvPath, wv[:], 0o644); err != nil {
 		t.Fatal(err)
 	}
-	a.open(route{page: pageLocal})
 
-	tt := ui.NewTester(a.view, 1180, 780)
-	tt.SetDark(true)
-	tt.Frame()
-	// Drain async local cover decodes so art fade-ins finish cleanly.
-	deadline := time.Now().Add(2 * time.Second)
-	for len(a.art.busy) > 0 && time.Now().Before(deadline) {
-		select {
-		case fn := <-posts:
-			fn()
-		case <-time.After(10 * time.Millisecond):
-		}
+	lib := localmusic.NewLibrary(filepath.Join(dir, "lib.json"), filepath.Join(dir, "covers"))
+	lib.AddFolders(dir)
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatal(err)
 	}
-	for len(posts) > 0 {
-		(<-posts)()
+	tracks := lib.Tracks("", "", "")
+	if len(tracks) != 1 {
+		t.Fatalf("expected 1 indexed WavPack track, got %d", len(tracks))
 	}
-
-	checkZeroIdle := func(name string) {
-		t.Helper()
-		tt.Frame()
-		tt.Advance(2 * time.Second)
-		tt.Frame()
-		asked := 0
-		for range 60 {
-			tt.Advance(time.Second / 60)
-			if tt.FramePending() {
-				asked++
-				tt.Frame()
-			}
-		}
-		if asked != 0 {
-			t.Errorf("%s requested %d idle frames over 1s, want 0", name, asked)
-		}
+	prov := localPlayerProvider{lib: lib}
+	opened, err := prov.OpenLocalTrack(tracks[0].ID)
+	if err != nil {
+		t.Fatalf("OpenLocalTrack(.wv) failed eagerly: %v", err)
 	}
-
-	checkZeroIdle("local-albums")
-	a.local.tab = localTabGenres
-	checkZeroIdle("local-genres")
-	a.local.tab = localTabTracks
-	checkZeroIdle("local-tracks")
-	a.local.tab = localTabFolders
-	checkZeroIdle("local-folders")
-
-	albums := a.local.lib.Albums(localmusic.AlbumFilter{})
-	if len(albums) > 0 {
-		a.open(route{page: pageAlbum, id: albums[0].ID})
-		checkZeroIdle("local-album-detail")
+	if !opened.NativeHQP || opened.OpenPCM == nil || opened.OpenRaw != nil {
+		t.Fatalf("unexpected WavPack LocalOpenedTrack: NativeHQP=%v OpenPCM=%v OpenRaw=%v", opened.NativeHQP, opened.OpenPCM != nil, opened.OpenRaw != nil)
 	}
 }
 

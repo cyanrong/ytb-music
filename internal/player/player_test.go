@@ -2,9 +2,12 @@ package player
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"math"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -500,3 +503,186 @@ func TestLocalProviderPlaybackLyricsAndSpectrum(t *testing.T) {
 }
 
 func valueTrue(fn func() bool) bool { return fn() }
+
+type passthroughStubBackend struct {
+	gotSrc TrackSource
+}
+
+func (b *passthroughStubBackend) Name() string { return "hqp-passthrough" }
+func (b *passthroughStubBackend) Open(_ context.Context, src TrackSource) (OutputSink, error) {
+	b.gotSrc = src
+	return &stubSink{dur: src.Duration}, nil
+}
+
+type noDecoderLocalProvider struct {
+	cover []byte
+}
+
+func (p *noDecoderLocalProvider) IsLocalTrack(id string) bool {
+	return strings.HasPrefix(id, "localfile:")
+}
+
+func (p *noDecoderLocalProvider) OpenLocalTrack(id string) (*LocalOpenedTrack, error) {
+	return &LocalOpenedTrack{
+		OpenPCM: func() (PCMDecoder, error) {
+			return nil, errors.New("unsupported codec: WV")
+		},
+		Stream:    &ytm.Stream{Codec: "WV", SampleRate: 96000, BitDepth: 24, Bitrate: 2500},
+		LocalPath: "/music/album.wv",
+		NativeHQP: true,
+		Cover:     p.cover,
+	}, nil
+}
+
+func (p *noDecoderLocalProvider) LocalLyrics(string) (string, string, []string) {
+	return "", "", nil
+}
+
+// A local track without a pure-Go PCM decoder plays through a native external backend via inert stream metadata, fails cleanly on local output, and online loads report Downloading state accurately.
+func TestLocalNativeBackendWithoutPCMDecoderAndDownloadingFlag(t *testing.T) {
+	ch := make(chan func(), 32)
+	p := New(func(fn func()) { ch <- fn })
+	coverBytes := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A}
+	p.Local = &noDecoderLocalProvider{cover: coverBytes}
+	be := &passthroughStubBackend{}
+	p.SetBackend(be)
+
+	p.PlayQueue([]ytm.Track{{
+		ID:       "localfile:wv1",
+		Name:     "WavPack Native",
+		Duration: 180000,
+	}}, 0)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for p.Loading() && time.Now().Before(deadline) {
+		select {
+		case fn := <-ch:
+			fn()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	for len(ch) > 0 {
+		(<-ch)()
+	}
+
+	if !p.Ready() || !p.Playing() || p.Err() != "" {
+		t.Fatalf("native backend without preview decoder: ready=%v playing=%v err=%q", p.Ready(), p.Playing(), p.Err())
+	}
+	if !be.gotSrc.NativeHQP || be.gotSrc.LocalPath != "/music/album.wv" || be.gotSrc.Downloading || string(be.gotSrc.CoverBytes) != string(coverBytes) {
+		t.Fatalf("TrackSource = %+v", be.gotSrc)
+	}
+	if st := p.Stream(); st == nil || st.SampleRate != 96000 {
+		t.Fatalf("Stream() = %+v, want 96000Hz", st)
+	}
+	if prog, ok := p.Downloaded(); !ok || prog != 1 {
+		t.Fatalf("Downloaded() = (%v, %v), want (1, true)", prog, ok)
+	}
+
+	// Switching to built-in OS output (backend == nil) requires OpenPCM and surfaces the decoder error.
+	p.SetBackend(nil)
+	deadline = time.Now().Add(2 * time.Second)
+	for p.Loading() && time.Now().Before(deadline) {
+		select {
+		case fn := <-ch:
+			fn()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	for len(ch) > 0 {
+		(<-ch)()
+	}
+	if p.Ready() || p.Playing() || p.Err() != "unsupported codec: WV" {
+		t.Fatalf("local output without decoder: ready=%v playing=%v err=%q", p.Ready(), p.Playing(), p.Err())
+	}
+
+	// Verify online TrackSource.Downloading is true while an uncached song is still streaming in, and false once cached.
+	m4aBytes, err := os.ReadFile("testdata/seek.m4a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	holdDownload := make(chan struct{})
+	var closeHoldOnce struct{ done bool }
+	releaseHold := func() {
+		if !closeHoldOnce.done {
+			closeHoldOnce.done = true
+			close(holdDownload)
+		}
+	}
+	defer releaseHold()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/slow.m4a" {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(m4aBytes)+4096))
+			_, _ = w.Write(m4aBytes)
+			if fl, ok := w.(http.Flusher); ok {
+				fl.Flush()
+			}
+			<-holdDownload
+			return
+		}
+		_, _ = w.Write(m4aBytes)
+	}))
+	defer srv.Close()
+
+	was := songURL
+	defer func() { songURL = was }()
+	songURL = func(id, level string) (*ytm.Stream, error) {
+		if id == "online_slow" {
+			return &ytm.Stream{URL: srv.URL + "/slow.m4a", Size: int64(len(m4aBytes) + 4096), Type: "m4a", Level: "standard"}, nil
+		}
+		return &ytm.Stream{URL: srv.URL + "/fast.m4a", Size: int64(len(m4aBytes)), Type: "m4a", Level: "standard"}, nil
+	}
+
+	p.Cache = NewCache(t.TempDir(), 1<<30)
+	p.SetBackend(be)
+	p.PlayQueue([]ytm.Track{{ID: "online_slow", Name: "Streaming", Duration: 5000}}, 0)
+	deadline = time.Now().Add(2 * time.Second)
+	for p.Loading() && time.Now().Before(deadline) {
+		select {
+		case fn := <-ch:
+			fn()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	for len(ch) > 0 {
+		(<-ch)()
+	}
+	if !be.gotSrc.Downloading {
+		t.Fatal("active uncached online download reported TrackSource.Downloading = false, want true")
+	}
+	var slowDL *download
+	if p.stream != nil {
+		slowDL, _ = p.stream.source()
+	}
+
+	// Pre-populate cache for online_cached and verify Downloading is false.
+	dl := p.Cache.download("online_cached", &ytm.Stream{URL: srv.URL + "/fast.m4a", Size: int64(len(m4aBytes)), Type: "m4a", Level: "standard"})
+	dl.waitFor(int64(len(m4aBytes)))
+	for start := time.Now(); !dl.completed() && time.Since(start) < time.Second; time.Sleep(5 * time.Millisecond) {
+	}
+	dl.Close()
+	waitDownloadReleased(dl)
+
+	p.PlayQueue([]ytm.Track{{ID: "online_cached", Name: "Cached", Duration: 5000}}, 0)
+	deadline = time.Now().Add(2 * time.Second)
+	for p.Loading() && time.Now().Before(deadline) {
+		select {
+		case fn := <-ch:
+			fn()
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	for len(ch) > 0 {
+		(<-ch)()
+	}
+	if be.gotSrc.Downloading {
+		t.Fatal("cached online track reported TrackSource.Downloading = true, want false")
+	}
+	var curDL *download
+	if p.stream != nil {
+		curDL, _ = p.stream.source()
+	}
+	p.Stop()
+	releaseHold()
+	waitDownloadReleased(slowDL)
+	waitDownloadReleased(curDL)
+}

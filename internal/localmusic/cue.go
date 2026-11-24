@@ -32,17 +32,19 @@ type cueFileBlock struct {
 }
 
 type cueTrackEntry struct {
-	number      int
-	mode        string
-	title       string
-	performer   string
-	songwriter  string
-	trackGainDB float64
-	hasTrkGain  bool
-	index00Ms   int64
-	hasIndex00  bool
-	index01Ms   int64
-	hasIndex01  bool
+	number        int
+	mode          string
+	title         string
+	performer     string
+	songwriter    string
+	trackGainDB   float64
+	hasTrkGain    bool
+	index00Frames int64
+	index00Ms     int64
+	hasIndex00    bool
+	index01Frames int64
+	index01Ms     int64
+	hasIndex01    bool
 }
 
 var (
@@ -129,12 +131,15 @@ func parseCueBytes(data []byte) (*cueSheet, error) {
 					mm, _ := strconv.Atoi(m[2])
 					ss, _ := strconv.Atoi(m[3])
 					ff, _ := strconv.Atoi(m[4])
-					ms := int64(mm*60+ss)*1000 + int64(ff)*1000/75
+					frames := int64(mm*60+ss)*75 + int64(ff)
+					ms := frames * 1000 / 75
 					switch idxNum {
 					case 0:
+						curTrack.index00Frames = frames
 						curTrack.index00Ms = ms
 						curTrack.hasIndex00 = true
 					case 1:
+						curTrack.index01Frames = frames
 						curTrack.index01Ms = ms
 						curTrack.hasIndex01 = true
 					}
@@ -224,15 +229,19 @@ func extractCueFileArg(rest string) string {
 	return rest
 }
 
+func cueLiteralRefPath(cueDir, refName string) string {
+	rel := filepath.FromSlash(strings.ReplaceAll(refName, "\\", "/"))
+	return filepath.Clean(filepath.Join(cueDir, rel))
+}
+
 // resolveCueAudioFile resolves a CUE FILE reference relative to cuePath's
 // directory, falling back to sibling lossless/audio extensions when the
 // referenced file was transcoded (e.g. CDImage.wav -> CDImage.flac).
 func resolveCueAudioFile(cuePath, refName string) (string, os.FileInfo, bool) {
 	cueDir := filepath.Dir(cuePath)
-	rel := filepath.FromSlash(strings.ReplaceAll(refName, "\\", "/"))
-	exact := filepath.Join(cueDir, rel)
-	if st, err := os.Stat(exact); err == nil && !st.IsDir() {
-		return filepath.Clean(exact), st, true
+	exact := cueLiteralRefPath(cueDir, refName)
+	if st, err := os.Stat(exact); err == nil && !st.IsDir() && st.Size() > 0 {
+		return exact, st, true
 	}
 
 	searchDir := filepath.Dir(exact)
@@ -250,6 +259,33 @@ func resolveCueAudioFile(cuePath, refName string) (string, os.FileInfo, bool) {
 	return "", nil, false
 }
 
+// resolveCueLiteralRef resolves a previously recorded literal CUE FILE path
+// using the same exact + sibling-extension + cue-basename fallback rules as
+// resolveCueAudioFile, returning (resolvedPath, size, modTimeNs, ok).
+func resolveCueLiteralRef(cuePath, exact string, seenAudio map[string]walkedFile) (string, int64, int64, bool) {
+	if wf, ok := seenAudio[canonicalPathKey(exact)]; ok {
+		return wf.path, wf.size, wf.modTimeNs, true
+	}
+	if st, err := os.Stat(exact); err == nil && !st.IsDir() && st.Size() > 0 {
+		return filepath.Clean(exact), st.Size(), st.ModTime().UnixNano(), true
+	}
+
+	searchDir := filepath.Dir(exact)
+	wantBase := strings.TrimSuffix(filepath.Base(exact), filepath.Ext(exact))
+	if found, st, ok := findAudioByBase(searchDir, wantBase); ok {
+		return found, st.Size(), st.ModTime().UnixNano(), true
+	}
+
+	cueDir := filepath.Clean(filepath.Dir(cuePath))
+	cueBase := strings.TrimSuffix(filepath.Base(cuePath), filepath.Ext(cuePath))
+	if !strings.EqualFold(cueBase, wantBase) {
+		if found, st, ok := findAudioByBase(cueDir, cueBase); ok {
+			return found, st.Size(), st.ModTime().UnixNano(), true
+		}
+	}
+	return "", 0, 0, false
+}
+
 func findAudioByBase(dir, base string) (string, os.FileInfo, bool) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -263,7 +299,7 @@ func findAudioByBase(dir, base string) (string, os.FileInfo, bool) {
 			}
 			if strings.EqualFold(ent.Name(), want) {
 				full := filepath.Join(dir, ent.Name())
-				if st, err := ent.Info(); err == nil {
+				if st, err := ent.Info(); err == nil && st.Size() > 0 {
 					return filepath.Clean(full), st, true
 				}
 			}
@@ -280,48 +316,67 @@ func parseDiscNumberFromDir(dir string) int {
 	return 0
 }
 
+type loadedCue struct {
+	tracks      []LocalTrack
+	trackCovers []cachedCueTrackCover
+	consumed    []string
+	allRefs     []string
+}
+
 // loadCueTracks parses cuePath, resolves its referenced audio files, extracts
-// audio specs and covers, and returns the sliced CUE tracks plus the list of
-// referenced audio file paths consumed by the CUE sheet.
-func loadCueTracks(cuePath, coverDir string, addedAt int64, dirCovers map[string]string) ([]LocalTrack, []string, error) {
+// audio specs and covers, and returns the sliced CUE tracks together with
+// sidecar cover dependencies, resolved consumed files, and all literal FILE refs.
+func loadCueTracks(cuePath string, addedAt int64, covers *folderCoverResolver) (*loadedCue, error) {
 	raw, err := os.ReadFile(cuePath)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	cs, err := parseCueBytes(raw)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 
-	cueDir := filepath.Clean(filepath.Dir(cuePath))
+	cleanCuePath := filepath.Clean(cuePath)
+	cueDir := filepath.Clean(filepath.Dir(cleanCuePath))
 	discNo := cs.discNo
 	if discNo == 0 {
 		discNo = parseDiscNumberFromDir(cueDir)
 	}
 
 	var (
-		tracks   []LocalTrack
-		consumed []string
-		seenCons = map[string]bool{}
+		tracks      []LocalTrack
+		trackCovers []cachedCueTrackCover
+		consumed    []string
+		allRefs     []string
+		seenCons    = map[string]bool{}
+		seenAllRefs = map[string]bool{}
 	)
 
 	for _, fb := range cs.files {
 		if fb.rawName == "" || len(fb.tracks) == 0 {
 			continue
 		}
-		audioPath, audioInfo, ok := resolveCueAudioFile(cuePath, fb.rawName)
+		litRef := cueLiteralRefPath(cueDir, fb.rawName)
+		litKey := canonicalPathKey(litRef)
+		if !seenAllRefs[litKey] {
+			seenAllRefs[litKey] = true
+			allRefs = append(allRefs, litRef)
+		}
+
+		audioPath, audioInfo, ok := resolveCueAudioFile(cleanCuePath, fb.rawName)
 		if !ok {
 			continue
-		}
-		ckey := canonicalPathKey(audioPath)
-		if !seenCons[ckey] {
-			seenCons[ckey] = true
-			consumed = append(consumed, audioPath)
 		}
 
 		audioMeta, err := parseAudioFile(audioPath, audioInfo.Size())
 		if err != nil {
 			continue
+		}
+
+		ckey := canonicalPathKey(audioPath)
+		if !seenCons[ckey] {
+			seenCons[ckey] = true
+			consumed = append(consumed, audioPath)
 		}
 
 		albumTitle := cs.title
@@ -337,12 +392,19 @@ func loadCueTracks(cuePath, coverDir string, addedAt int64, dirCovers map[string
 			albumArtist = audioMeta.albumArtist
 		}
 
-		var coverID string
-		if len(audioMeta.cover) > 0 {
-			coverID, _ = saveCoverBytes(coverDir, audioMeta.cover)
+		var (
+			coverID       string
+			embeddedCover bool
+			sidecarInfo   sidecarCoverInfo
+		)
+		if len(audioMeta.cover) > 0 && covers != nil {
+			if cid, err := saveCoverBytes(covers.coverDir, audioMeta.cover); err == nil && cid != "" {
+				coverID = cid
+				embeddedCover = true
+			}
 		}
-		if coverID == "" {
-			coverID = findFolderCover(cueDir, albumTitle, coverDir, dirCovers)
+		if !embeddedCover && covers != nil {
+			coverID, sidecarInfo = covers.resolveAndIngest(cueDir, albumTitle)
 		}
 
 		year := cs.year
@@ -364,22 +426,27 @@ func loadCueTracks(cuePath, coverDir string, addedAt int64, dirCovers map[string
 			if te.mode != "AUDIO" {
 				continue
 			}
-			var startMs int64
+			var startMs, startFrames int64
 			if te.hasIndex01 {
 				startMs = te.index01Ms
+				startFrames = te.index01Frames
 			} else if te.hasIndex00 {
 				startMs = te.index00Ms
+				startFrames = te.index00Frames
 			}
 
-			var endMs int64
+			var endMs, endFrames int64
 			if i+1 < len(fb.tracks) {
 				nxt := fb.tracks[i+1]
 				if nxt.mode != "AUDIO" && nxt.hasIndex00 {
 					endMs = nxt.index00Ms
+					endFrames = nxt.index00Frames
 				} else if nxt.hasIndex01 {
 					endMs = nxt.index01Ms
+					endFrames = nxt.index01Frames
 				} else if nxt.hasIndex00 {
 					endMs = nxt.index00Ms
+					endFrames = nxt.index00Frames
 				}
 			} else if audioMeta.durationMs > 0 {
 				endMs = audioMeta.durationMs
@@ -394,6 +461,9 @@ func loadCueTracks(cuePath, coverDir string, addedAt int64, dirCovers map[string
 			spec.IsCUE = true
 			spec.ClipStartMs = startMs
 			spec.ClipEndMs = endMs
+			spec.ClipStartFrames = startFrames
+			spec.ClipEndFrames = endFrames
+			spec.HasCueFrames = true
 
 			title := te.title
 			if title == "" {
@@ -439,6 +509,7 @@ func loadCueTracks(cuePath, coverDir string, addedAt int64, dirCovers map[string
 				ID:             makeTrackID(audioPath, true, te.number, startMs),
 				Path:           audioPath,
 				Dir:            cueDir,
+				CuePath:        cleanCuePath,
 				Title:          title,
 				Artists:        artists,
 				Album:          albumTitle,
@@ -459,10 +530,22 @@ func loadCueTracks(cuePath, coverDir string, addedAt int64, dirCovers map[string
 				ModTimeNs:      audioInfo.ModTime().UnixNano(),
 				EmbeddedLyrics: audioMeta.lyrics,
 			})
+			trackCovers = append(trackCovers, cachedCueTrackCover{
+				EmbeddedCover: embeddedCover,
+				AlbumTitle:    albumTitle,
+				SidecarCover:  sidecarInfo.path,
+				SidecarModNs:  sidecarInfo.modTimeNs,
+				SidecarSize:   sidecarInfo.size,
+			})
 		}
 	}
 
-	return tracks, consumed, nil
+	return &loadedCue{
+		tracks:      tracks,
+		trackCovers: trackCovers,
+		consumed:    consumed,
+		allRefs:     allRefs,
+	}, nil
 }
 
 func defaultAlbumFromDir(dir string) string {

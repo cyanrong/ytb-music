@@ -103,6 +103,7 @@ type RoonManager struct {
 	stopCh   chan struct{}
 	wakeCh   chan struct{}
 	startCh  chan struct{}
+	stateCh  chan struct{}
 }
 
 func NewRoonManager(srv *Server, cb RoonCallbacks) *RoonManager {
@@ -113,6 +114,7 @@ func NewRoonManager(srv *Server, cb RoonCallbacks) *RoonManager {
 		stopCh:   make(chan struct{}),
 		wakeCh:   make(chan struct{}, 1),
 		startCh:  make(chan struct{}, 1),
+		stateCh:  make(chan struct{}),
 		status: RoonStatus{
 			Detail: "正在局域网搜索 Roon Core…",
 		},
@@ -168,11 +170,41 @@ func (m *RoonManager) Close() {
 		}
 		sess := m.moo
 		m.moo = nil
+		m.notifyStateLocked()
 		m.mu.Unlock()
 		if sess != nil {
 			sess.Close()
 		}
 	})
+}
+
+func (m *RoonManager) notifyStateLocked() {
+	if m.stateCh != nil {
+		close(m.stateCh)
+		m.stateCh = make(chan struct{})
+	}
+}
+
+// WaitPaired blocks until RoonManager has an active paired MOO session, the
+// manager is closed, or ctx expires.
+func (m *RoonManager) WaitPaired(ctx context.Context) error {
+	for {
+		m.mu.RLock()
+		paired := m.moo != nil && m.status.Paired
+		waitCh := m.stateCh
+		m.mu.RUnlock()
+		if paired {
+			return nil
+		}
+		m.Wake()
+		select {
+		case <-m.stopCh:
+			return errors.New("尚未连接或授权 Roon Core")
+		case <-ctx.Done():
+			return fmt.Errorf("尚未连接或授权 Roon Core: %w", ctx.Err())
+		case <-waitCh:
+		}
+	}
 }
 
 func (m *RoonManager) signalStartWorker() {
@@ -385,6 +417,7 @@ func (m *RoonManager) runSession(addr, hintName string) {
 		m.status.Paired = false
 		m.startedZoneID = ""
 		m.zonesMap = make(map[string]RoonZone)
+		m.notifyStateLocked()
 		m.mu.Unlock()
 		m.emit()
 	}()
@@ -454,6 +487,7 @@ func (m *RoonManager) runSession(addr, hintName string) {
 			m.status.Detail = "已连接 Roon Core：" + m.status.CoreName
 			needSub := !zonesSubscribed
 			zonesSubscribed = true
+			m.notifyStateLocked()
 			m.mu.Unlock()
 			m.emit()
 
@@ -803,9 +837,15 @@ func isRoonNonAlbumRow(it roonBrowseItem, atRoot bool) bool {
 // multi_session_key ("ytb-genre-sync") so Live Radio browsing is never disturbed,
 // returning deduplicated (Album, Artist) -> Genres mappings.
 func (m *RoonManager) FetchLibraryGenres(ctx context.Context) ([]RoonAlbumGenre, error) {
+	if err := m.WaitPaired(ctx); err != nil {
+		return nil, err
+	}
 	m.genreMu.Lock()
 	defer m.genreMu.Unlock()
 
+	if err := m.WaitPaired(ctx); err != nil {
+		return nil, err
+	}
 	m.mu.RLock()
 	sess := m.moo
 	paired := m.status.Paired
@@ -1272,24 +1312,47 @@ func parseMOOFrame(raw []byte) (mooMessage, bool) {
 
 // --- RoonBackend & roonSink ---
 
+var errRoonAACUnsupported = errors.New("当前曲目不支持 Roon AAC 直通，请在音频链路设置中将 Roon 流格式切换为 24-bit WAV")
+
 // RoonBackend feeds YTB Music's decoded PCM / lossless ADTS-AAC stream into
 // Server's continuous Live Radio broadcaster and coordinates playback with Roon Core.
 type RoonBackend struct {
-	srv    *Server
-	mgr    *RoonManager
-	mu     sync.RWMutex
-	zoneID string
+	srv          *Server
+	mgr          *RoonManager
+	mu           sync.RWMutex
+	zoneID       string
+	streamFormat string
 }
 
 func NewRoonBackend(srv *Server, mgr *RoonManager, zoneID string) *RoonBackend {
 	return &RoonBackend{
-		srv:    srv,
-		mgr:    mgr,
-		zoneID: zoneID,
+		srv:          srv,
+		mgr:          mgr,
+		zoneID:       zoneID,
+		streamFormat: "wav",
 	}
 }
 
 func (b *RoonBackend) Name() string { return "roon" }
+
+func (b *RoonBackend) SetStreamFormat(format string) {
+	norm := "wav"
+	if strings.EqualFold(strings.TrimSpace(format), "aac") {
+		norm = "aac"
+	}
+	b.mu.Lock()
+	b.streamFormat = norm
+	b.mu.Unlock()
+}
+
+func (b *RoonBackend) StreamFormat() string {
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.streamFormat == "aac" {
+		return "aac"
+	}
+	return "wav"
+}
 
 func (b *RoonBackend) SetZoneID(id string) {
 	id = strings.TrimSpace(id)
@@ -1312,14 +1375,76 @@ func (b *RoonBackend) Open(ctx context.Context, src player.TrackSource) (player.
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	dec, err := src.OpenPCM()
+	needAAC := b.StreamFormat() == "aac" || (b.srv != nil && b.srv.HasOnlyAACListeners())
+
+	var (
+		dec player.PCMDecoder
+		err error
+	)
+	if src.OpenPCM != nil {
+		dec, err = src.OpenPCM()
+	} else {
+		err = errors.New("bridge: missing PCM decoder")
+	}
 	if err != nil {
+		if needAAC && src.OpenRaw == nil && ctx.Err() == nil {
+			return nil, errRoonAACUnsupported
+		}
 		return nil, err
 	}
 	if ctx.Err() != nil {
 		_ = dec.Close()
 		return nil, ctx.Err()
 	}
+
+	var (
+		raw       player.RawStream
+		adts      *aacADTSReader
+		adtsTried bool
+		aacRate   = roonTargetRate
+		aacSilent = silentADTSFrame44kStereo
+	)
+	if needAAC {
+		if src.OpenRaw == nil {
+			_ = dec.Close()
+			return nil, errRoonAACUnsupported
+		}
+		r, rerr := src.OpenRaw()
+		if rerr != nil {
+			_ = dec.Close()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, errRoonAACUnsupported
+		}
+		sz, serr := r.Size()
+		if serr != nil || sz <= 0 {
+			_ = r.Close()
+			_ = dec.Close()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			return nil, errRoonAACUnsupported
+		}
+		ar, aerr := openAACADTSReader(r, sz)
+		if aerr != nil {
+			_ = r.Close()
+			_ = dec.Close()
+			if ctx.Err() != nil {
+				return nil, ctx.Err()
+			}
+			if strings.Contains(aerr.Error(), "403") {
+				return nil, aerr
+			}
+			return nil, errRoonAACUnsupported
+		}
+		raw = r
+		adts = ar
+		adtsTried = true
+		aacRate = ar.SampleRate()
+		aacSilent = ar.SilentFrame()
+	}
+
 	sr := dec.SampleRate()
 	if sr <= 0 {
 		sr = roonTargetRate
@@ -1333,9 +1458,12 @@ func (b *RoonBackend) Open(ctx context.Context, src player.TrackSource) (player.
 		backend:   b,
 		src:       src,
 		dec:       dec,
+		raw:       raw,
+		adts:      adts,
+		adtsTried: adtsTried,
 		srcRate:   sr,
-		aacRate:   roonTargetRate,
-		aacSilent: silentADTSFrame44kStereo,
+		aacRate:   aacRate,
+		aacSilent: aacSilent,
 		duration:  src.Duration,
 		gain:      src.Gain,
 		title:     title,
@@ -1503,18 +1631,37 @@ func (s *roonSink) pullPCM24(outFrames int) []byte {
 
 	s.ioMu.Lock()
 	dec := s.dec
+	needSrc := outFrames
+	if s.srcRate != roonTargetRate {
+		needSrc = max(1, int(int64(outFrames)*int64(s.srcRate)/roonTargetRate))
+	}
 	if dec == nil {
 		s.ioMu.Unlock()
+		var fireEnd func()
+		var clearOwner uint64
+		s.stateMu.Lock()
+		if !s.closed && s.playing && s.playGen == wantPlayGen && s.seekGen == wantSeekGen {
+			s.posFrames += int64(needSrc)
+			reachedEnd := s.duration <= 0 || (s.srcRate > 0 && time.Duration(float64(s.posFrames)/float64(s.srcRate)*float64(time.Second)) >= s.duration)
+			if reachedEnd && !s.endedOnce {
+				s.endedOnce = true
+				s.playing = false
+				clearOwner = s.ownerID
+				fireEnd = s.onEnd
+			}
+		}
+		s.stateMu.Unlock()
+		if clearOwner != 0 && s.backend.mgr != nil {
+			s.backend.mgr.SetPlaybackIntent(clearOwner, false, "")
+		}
+		if fireEnd != nil {
+			go fireEnd()
+		}
 		return nil
 	}
 	if s.appliedPCMSeek != wantSeekGen {
 		_ = dec.SetPosition(seekTarget)
 		s.appliedPCMSeek = wantSeekGen
-	}
-
-	needSrc := outFrames
-	if s.srcRate != roonTargetRate {
-		needSrc = max(1, int(int64(outFrames)*int64(s.srcRate)/roonTargetRate))
 	}
 	if cap(s.floatBuf) < needSrc*2 {
 		s.floatBuf = make([]float32, needSrc*2)
@@ -1585,6 +1732,56 @@ func (s *roonSink) pullPCM24(outFrames int) []byte {
 	return out
 }
 
+func (s *roonSink) ensureADTSLocked(curFrames int64, wantSeekGen uint64) {
+	if s.adtsTried || s.src.OpenRaw == nil {
+		return
+	}
+	s.adtsTried = true
+	raw, err := s.src.OpenRaw()
+	if err != nil {
+		return
+	}
+	sz, serr := raw.Size()
+	if serr != nil || sz <= 0 {
+		_ = raw.Close()
+		return
+	}
+	ar, aerr := openAACADTSReader(raw, sz)
+	if aerr != nil {
+		_ = raw.Close()
+		return
+	}
+	initSample := curFrames
+	if s.srcRate > 0 && ar.SampleRate() != s.srcRate {
+		initSample = curFrames * int64(ar.SampleRate()) / int64(s.srcRate)
+	}
+	_ = ar.SeekToSample(initSample)
+	s.raw = raw
+	s.adts = ar
+	s.appliedAACSeek = wantSeekGen
+	sf := ar.SilentFrame()
+	s.stateMu.Lock()
+	s.aacRate = ar.SampleRate()
+	s.aacSilent = sf
+	s.stateMu.Unlock()
+}
+
+func (s *roonSink) hasADTS() bool {
+	s.stateMu.Lock()
+	if s.closed {
+		s.stateMu.Unlock()
+		return false
+	}
+	curFrames := s.posFrames
+	wantSeekGen := s.seekGen
+	s.stateMu.Unlock()
+
+	s.ioMu.Lock()
+	defer s.ioMu.Unlock()
+	s.ensureADTSLocked(curFrames, wantSeekGen)
+	return s.adts != nil
+}
+
 func (s *roonSink) pullADTS(advancePos bool) []byte {
 	s.stateMu.Lock()
 	if s.closed || !s.playing {
@@ -1599,32 +1796,7 @@ func (s *roonSink) pullADTS(advancePos bool) []byte {
 	s.stateMu.Unlock()
 
 	s.ioMu.Lock()
-	if !s.adtsTried && s.src.OpenRaw != nil {
-		s.adtsTried = true
-		if raw, err := s.src.OpenRaw(); err == nil {
-			if sz, serr := raw.Size(); serr == nil && sz > 0 {
-				if ar, aerr := openAACADTSReader(raw, sz); aerr == nil {
-					initSample := curFrames
-					if s.srcRate > 0 && ar.SampleRate() != s.srcRate {
-						initSample = curFrames * int64(ar.SampleRate()) / int64(s.srcRate)
-					}
-					_ = ar.SeekToSample(initSample)
-					s.raw = raw
-					s.adts = ar
-					s.appliedAACSeek = wantSeekGen
-					sf := ar.SilentFrame()
-					s.stateMu.Lock()
-					s.aacRate = ar.SampleRate()
-					s.aacSilent = sf
-					s.stateMu.Unlock()
-				} else {
-					_ = raw.Close()
-				}
-			} else {
-				_ = raw.Close()
-			}
-		}
-	}
+	s.ensureADTSLocked(curFrames, wantSeekGen)
 	ar := s.adts
 	if ar == nil {
 		s.ioMu.Unlock()

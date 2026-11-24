@@ -253,6 +253,7 @@ func (a *app) ensureRoonBackend() (*bridge.RoonBackend, error) {
 	} else {
 		a.audio.roon.SetZoneID(a.settings.RoonZoneID)
 	}
+	a.audio.roon.SetStreamFormat(a.settings.RoonStreamFormat)
 	return a.audio.roon, nil
 }
 
@@ -539,14 +540,31 @@ func (a *app) signalPathCard(c *ui.Context, st *ytm.Stream, mode string, pop pop
 		transportDot := cyan
 		switch mode {
 		case outputHQPlayer:
-			switch {
-			case sig.SourceSDM || st.IsDSD || (lossless && st.SampleRate > 0 && sig.SourceRate == st.SampleRate):
+			switch sig.Transport {
+			case "file":
 				transport = "原生文件直通 (file:///)"
 				transportDot = gold
-			case sig.SourceBitrate > 0:
-				transport = fmt.Sprintf("24-bit WAV (%d kbps)", sig.SourceBitrate/1000)
+			case "wav-file":
+				if sig.SourceBitrate > 0 {
+					transport = fmt.Sprintf("24-bit WAV (%d kbps)", sig.SourceBitrate/1000)
+				} else {
+					transport = "24-bit PCM WAV (file:///)"
+				}
+				if lossless {
+					transportDot = gold
+				}
+			case "wav-http":
+				if sig.SourceBitrate > 0 {
+					transport = fmt.Sprintf("24-bit WAV HTTP (%d kbps)", sig.SourceBitrate/1000)
+				} else {
+					transport = "24-bit PCM WAV (HTTP)"
+				}
 			default:
-				transport = "24-bit PCM WAV"
+				if sig.SourceBitrate > 0 {
+					transport = fmt.Sprintf("24-bit WAV (%d kbps)", sig.SourceBitrate/1000)
+				} else {
+					transport = "24-bit PCM WAV"
+				}
 			}
 		case outputRoon:
 			if a.settings.RoonStreamFormat == "aac" {
@@ -827,6 +845,9 @@ func (a *app) audioChainSettings(c *ui.Context, group func(string, func()), row 
 				}
 				if segmented(c.Key("roon-stream-fmt"), &fIdx, "WAV 24-bit", "AAC 原生") {
 					s.RoonStreamFormat = fmts[fIdx]
+					if a.audio.roon != nil {
+						a.audio.roon.SetStreamFormat(s.RoonStreamFormat)
+					}
 					a.changed()
 				}
 			})

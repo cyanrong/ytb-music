@@ -242,6 +242,22 @@ func parseAudioFile(path string, fileSize int64) (*parsedMeta, error) {
 	return meta, nil
 }
 
+func mulDiv1000(count, rate uint64) int64 {
+	if count == 0 || rate == 0 {
+		return 0
+	}
+	whole := count / rate
+	rem := count % rate
+	if whole > math.MaxInt64/1000 {
+		return math.MaxInt64
+	}
+	ms := whole*1000 + (rem*1000)/rate
+	if ms > math.MaxInt64 {
+		return math.MaxInt64
+	}
+	return int64(ms)
+}
+
 // --- FLAC ---
 
 func parseFLAC(f *os.File, fileSize int64, m *parsedMeta) error {
@@ -328,21 +344,21 @@ func parseVorbisComment(b []byte, m *parsedMeta) {
 	if len(b) < 8 {
 		return
 	}
-	vendorLen := int(binary.LittleEndian.Uint32(b[0:4]))
-	if vendorLen < 0 || 4+vendorLen+4 > len(b) {
+	vendorLen := uint64(binary.LittleEndian.Uint32(b[0:4]))
+	if vendorLen > uint64(len(b)-8) {
 		return
 	}
-	pos := 4 + vendorLen
-	count := int(binary.LittleEndian.Uint32(b[pos : pos+4]))
+	pos := 4 + int(vendorLen)
+	count := binary.LittleEndian.Uint32(b[pos : pos+4])
 	pos += 4
-	for i := 0; i < count && pos+4 <= len(b); i++ {
-		cLen := int(binary.LittleEndian.Uint32(b[pos : pos+4]))
+	for i := uint32(0); i < count && pos+4 <= len(b); i++ {
+		cLen := uint64(binary.LittleEndian.Uint32(b[pos : pos+4]))
 		pos += 4
-		if cLen < 0 || pos+cLen > len(b) {
+		if cLen > uint64(len(b)-pos) {
 			break
 		}
-		line := string(b[pos : pos+cLen])
-		pos += cLen
+		line := string(b[pos : pos+int(cLen)])
+		pos += int(cLen)
 		eq := strings.IndexByte(line, '=')
 		if eq <= 0 {
 			continue
@@ -412,24 +428,24 @@ func parseFLACPicture(b []byte, m *parsedMeta) {
 		return
 	}
 	picType := int(binary.BigEndian.Uint32(b[0:4]))
-	mimeLen := int(binary.BigEndian.Uint32(b[4:8]))
-	if mimeLen < 0 || 8+mimeLen+4 > len(b) {
+	mimeLen := uint64(binary.BigEndian.Uint32(b[4:8]))
+	if mimeLen > uint64(len(b)-32) {
 		return
 	}
-	mime := string(b[8 : 8+mimeLen])
-	pos := 8 + mimeLen
-	descLen := int(binary.BigEndian.Uint32(b[pos : pos+4]))
+	mime := string(b[8 : 8+int(mimeLen)])
+	pos := 8 + int(mimeLen)
+	descLen := uint64(binary.BigEndian.Uint32(b[pos : pos+4]))
 	pos += 4
-	if descLen < 0 || pos+descLen+20 > len(b) {
+	if len(b)-pos < 20 || descLen > uint64(len(b)-pos-20) {
 		return
 	}
-	pos += descLen + 16 // skip width, height, depth, colors
-	dataLen := int(binary.BigEndian.Uint32(b[pos : pos+4]))
+	pos += int(descLen) + 16 // skip width, height, depth, colors
+	dataLen := uint64(binary.BigEndian.Uint32(b[pos : pos+4]))
 	pos += 4
-	if dataLen <= 0 || pos+dataLen > len(b) || mime == "-->" {
+	if dataLen == 0 || dataLen > uint64(len(b)-pos) || mime == "-->" {
 		return
 	}
-	m.setCover(bytes.Clone(b[pos:pos+dataLen]), picType)
+	m.setCover(bytes.Clone(b[pos:pos+int(dataLen)]), picType)
 }
 
 // --- WAV ---
@@ -447,9 +463,9 @@ func parseWAV(f *os.File, fileSize int64, m *parsedMeta) error {
 	m.spec.IsLossless = true
 
 	var (
-		byteRate    int
-		blockAlign  int
-		rf64DataLen int64
+		byteRate    uint32
+		blockAlign  uint16
+		rf64DataLen uint64
 		haveFmt     bool
 	)
 	off := int64(12)
@@ -459,23 +475,25 @@ func parseWAV(f *os.File, fileSize int64, m *parsedMeta) error {
 			break
 		}
 		cid := string(chdr[0:4])
-		csize := int64(binary.LittleEndian.Uint32(chdr[4:8]))
+		csize32 := binary.LittleEndian.Uint32(chdr[4:8])
 		off += 8
+		rem := uint64(fileSize - off)
 
-		if cid == "ds64" && csize >= 28 && off+28 <= fileSize {
+		if cid == "ds64" && csize32 >= 28 && rem >= 28 {
 			var ds [28]byte
 			if _, err := f.ReadAt(ds[:], off); err == nil {
-				rf64DataLen = int64(binary.LittleEndian.Uint64(ds[8:16]))
+				rf64DataLen = binary.LittleEndian.Uint64(ds[8:16])
 			}
 		}
 
-		actualSize := csize
-		if cid == "data" && csize == 0xFFFFFFFF && rf64DataLen > 0 {
-			actualSize = rf64DataLen
+		actualU := uint64(csize32)
+		if cid == "data" && csize32 == 0xFFFFFFFF && rf64DataLen > 0 {
+			actualU = rf64DataLen
 		}
-		if actualSize < 0 || off+actualSize > fileSize {
-			actualSize = max(fileSize-off, 0)
+		if actualU > rem {
+			actualU = rem
 		}
+		actualSize := int64(actualU)
 
 		switch cid {
 		case "fmt ":
@@ -484,9 +502,9 @@ func parseWAV(f *os.File, fileSize int64, m *parsedMeta) error {
 				if _, err := f.ReadAt(b, off); err == nil {
 					tag := binary.LittleEndian.Uint16(b[0:2])
 					ch := int(binary.LittleEndian.Uint16(b[2:4]))
-					sr := int(binary.LittleEndian.Uint32(b[4:8]))
-					byteRate = int(binary.LittleEndian.Uint32(b[8:12]))
-					blockAlign = int(binary.LittleEndian.Uint16(b[12:14]))
+					sr := binary.LittleEndian.Uint32(b[4:8])
+					byteRate = binary.LittleEndian.Uint32(b[8:12])
+					blockAlign = binary.LittleEndian.Uint16(b[12:14])
 					bps := int(binary.LittleEndian.Uint16(b[14:16]))
 					if tag == 0xFFFE && len(b) >= 40 {
 						validBits := int(binary.LittleEndian.Uint16(b[18:20]))
@@ -494,19 +512,21 @@ func parseWAV(f *os.File, fileSize int64, m *parsedMeta) error {
 							bps = validBits
 						}
 					}
-					m.spec.Channels = ch
-					m.spec.SampleRate = sr
-					m.spec.BitDepth = bps
-					haveFmt = true
+					if sr > 0 && sr <= 45158400 && ch > 0 {
+						m.spec.Channels = ch
+						m.spec.SampleRate = int(sr)
+						m.spec.BitDepth = bps
+						haveFmt = true
+					}
 				}
 			}
 		case "data":
 			if haveFmt && m.spec.SampleRate > 0 {
 				if blockAlign > 0 {
-					frames := actualSize / int64(blockAlign)
-					m.durationMs = frames * 1000 / int64(m.spec.SampleRate)
+					frames := actualU / uint64(blockAlign)
+					m.durationMs = mulDiv1000(frames, uint64(m.spec.SampleRate))
 				} else if byteRate > 0 {
-					m.durationMs = actualSize * 1000 / int64(byteRate)
+					m.durationMs = mulDiv1000(actualU, uint64(byteRate))
 				}
 			}
 		case "LIST":
@@ -525,11 +545,11 @@ func parseWAV(f *os.File, fileSize int64, m *parsedMeta) error {
 			}
 		}
 
-		step := actualSize + (actualSize & 1)
-		if step <= 0 && actualSize == 0 {
-			continue
+		step := actualU
+		if step&1 == 1 && step < rem {
+			step++
 		}
-		off += step
+		off += int64(step)
 	}
 	if !haveFmt {
 		return errors.New("localmusic: WAV missing fmt chunk")
@@ -541,13 +561,18 @@ func parseWAVInfo(b []byte, m *parsedMeta) {
 	pos := 0
 	for pos+8 <= len(b) {
 		id := string(b[pos : pos+4])
-		sz := int(binary.LittleEndian.Uint32(b[pos+4 : pos+8]))
+		sz := uint64(binary.LittleEndian.Uint32(b[pos+4 : pos+8]))
 		pos += 8
-		if sz < 0 || pos+sz > len(b) {
+		rem := uint64(len(b) - pos)
+		if sz > rem {
 			break
 		}
-		val := decodeTextAuto(b[pos : pos+sz])
-		pos += sz + (sz & 1)
+		val := decodeTextAuto(b[pos : pos+int(sz)])
+		step := sz
+		if step&1 == 1 && step < rem {
+			step++
+		}
+		pos += int(step)
 		if val == "" {
 			continue
 		}
@@ -600,11 +625,13 @@ func parseAIFF(f *os.File, fileSize int64, m *parsedMeta) error {
 			break
 		}
 		cid := string(chdr[0:4])
-		csize := int64(binary.BigEndian.Uint32(chdr[4:8]))
+		csizeU := uint64(binary.BigEndian.Uint32(chdr[4:8]))
 		off += 8
-		if csize < 0 || off+csize > fileSize {
-			csize = max(fileSize-off, 0)
+		rem := uint64(fileSize - off)
+		if csizeU > rem {
+			csizeU = rem
 		}
+		csize := int64(csizeU)
 
 		switch cid {
 		case "COMM":
@@ -612,16 +639,19 @@ func parseAIFF(f *os.File, fileSize int64, m *parsedMeta) error {
 				b := make([]byte, csize)
 				if _, err := f.ReadAt(b, off); err == nil {
 					ch := int(int16(binary.BigEndian.Uint16(b[0:2])))
-					frames := int64(binary.BigEndian.Uint32(b[2:6]))
+					frames := uint64(binary.BigEndian.Uint32(b[2:6]))
 					sampleSize := int(int16(binary.BigEndian.Uint16(b[6:8])))
-					sr := int(math.Round(parseIEEE80(b[8:18])))
-					m.spec.Channels = ch
-					m.spec.BitDepth = sampleSize
-					m.spec.SampleRate = sr
-					if sr > 0 && frames > 0 {
-						m.durationMs = frames * 1000 / int64(sr)
+					rateF := parseIEEE80(b[8:18])
+					if ch > 0 && sampleSize > 0 && !math.IsNaN(rateF) && !math.IsInf(rateF, 0) && rateF >= 1 && rateF <= 45158400 {
+						sr := int(math.Round(rateF))
+						m.spec.Channels = ch
+						m.spec.BitDepth = sampleSize
+						m.spec.SampleRate = sr
+						if sr > 0 && frames > 0 {
+							m.durationMs = mulDiv1000(frames, uint64(sr))
+						}
+						haveComm = true
 					}
-					haveComm = true
 				}
 			}
 		case "NAME":
@@ -647,7 +677,11 @@ func parseAIFF(f *os.File, fileSize int64, m *parsedMeta) error {
 			}
 		}
 
-		off += csize + (csize & 1)
+		step := csizeU
+		if step&1 == 1 && step < rem {
+			step++
+		}
+		off += int64(step)
 	}
 	if !haveComm {
 		return errors.New("localmusic: AIFF missing COMM chunk")
@@ -679,6 +713,9 @@ func parseIEEE80(b []byte) float64 {
 // --- DSF & DFF (DSD64 - DSD512) ---
 
 func parseDSF(f *os.File, fileSize int64, m *parsedMeta) error {
+	if fileSize < 28+52 {
+		return errors.New("localmusic: invalid DSF header")
+	}
 	var dsdHdr [28]byte
 	if _, err := f.ReadAt(dsdHdr[:], 0); err != nil {
 		return err
@@ -686,11 +723,15 @@ func parseDSF(f *os.File, fileSize int64, m *parsedMeta) error {
 	if string(dsdHdr[0:4]) != "DSD " {
 		return errors.New("localmusic: invalid DSF header")
 	}
-	dsdChunkSize := int64(binary.LittleEndian.Uint64(dsdHdr[4:12]))
-	if dsdChunkSize < 28 {
-		dsdChunkSize = 28
+	dsdChunkU := binary.LittleEndian.Uint64(dsdHdr[4:12])
+	if dsdChunkU < 28 || dsdChunkU > uint64(fileSize) {
+		return errors.New("localmusic: invalid DSF header")
 	}
-	metaOff := int64(binary.LittleEndian.Uint64(dsdHdr[20:28]))
+	dsdChunkSize := int64(dsdChunkU)
+	if fileSize-dsdChunkSize < 52 {
+		return errors.New("localmusic: DSF missing fmt chunk")
+	}
+	metaOffU := binary.LittleEndian.Uint64(dsdHdr[20:28])
 
 	var fmtHdr [52]byte
 	if _, err := f.ReadAt(fmtHdr[:], dsdChunkSize); err != nil {
@@ -699,30 +740,59 @@ func parseDSF(f *os.File, fileSize int64, m *parsedMeta) error {
 	if string(fmtHdr[0:4]) != "fmt " {
 		return errors.New("localmusic: DSF missing fmt chunk")
 	}
-	channels := int(binary.LittleEndian.Uint32(fmtHdr[24:28]))
-	sampleRate := int(binary.LittleEndian.Uint32(fmtHdr[28:32]))
+	fmtChunkU := binary.LittleEndian.Uint64(fmtHdr[4:12])
+	channelsU := binary.LittleEndian.Uint32(fmtHdr[24:28])
+	sampleRateU := binary.LittleEndian.Uint32(fmtHdr[28:32])
 	sampleCount := binary.LittleEndian.Uint64(fmtHdr[36:44])
-	if channels <= 0 || sampleRate <= 0 {
+	blockSizeU := binary.LittleEndian.Uint32(fmtHdr[44:48])
+	if channelsU < 1 || channelsU > 64 || sampleRateU < 1 || sampleRateU > 45158400 {
 		return errors.New("localmusic: invalid DSF format parameters")
+	}
+	channels := int(channelsU)
+	sampleRate := int(sampleRateU)
+
+	// Bound sampleCount by actual data chunk payload when present on disk.
+	if fmtChunkU >= 52 && fmtChunkU <= uint64(fileSize-dsdChunkSize) {
+		dataHdrOff := dsdChunkSize + int64(fmtChunkU)
+		if fileSize-dataHdrOff >= 12 {
+			var dataHdr [12]byte
+			if _, err := f.ReadAt(dataHdr[:], dataHdrOff); err == nil && string(dataHdr[0:4]) == "data" {
+				dataChunkU := binary.LittleEndian.Uint64(dataHdr[4:12])
+				if dataChunkU >= 12 {
+					availU := min(dataChunkU-12, uint64(fileSize-(dataHdrOff+12)))
+					var maxSamples uint64
+					if blockSizeU >= 1 && blockSizeU <= 65536 {
+						groupU := uint64(channels) * uint64(blockSizeU)
+						maxSamples = (availU / groupU) * uint64(blockSizeU) * 8
+					} else {
+						maxSamples = (availU / uint64(channels)) * 8
+					}
+					if sampleCount == 0 || sampleCount > maxSamples {
+						sampleCount = maxSamples
+					}
+				}
+			}
+		}
 	}
 
 	m.spec.Codec = dsdCodecName(sampleRate)
 	m.spec.SampleRate = sampleRate
 	m.spec.BitDepth = 1
 	m.spec.Channels = channels
-	m.spec.BitrateKbps = (sampleRate * channels) / 1000
+	m.spec.BitrateKbps = int((uint64(sampleRate) * uint64(channels)) / 1000)
 	m.spec.IsDSD = true
 	m.spec.IsLossless = true
 	m.spec.IsHiRes = true
 	if sampleCount > 0 {
-		m.durationMs = int64(sampleCount * 1000 / uint64(sampleRate))
+		m.durationMs = mulDiv1000(sampleCount, uint64(sampleRate))
 	}
 
-	if metaOff > 0 && metaOff+10 <= fileSize {
+	if metaOffU > 0 && fileSize >= 10 && metaOffU <= uint64(fileSize-10) {
+		metaOff := int64(metaOffU)
 		var id3h [10]byte
 		if _, err := f.ReadAt(id3h[:], metaOff); err == nil && string(id3h[0:3]) == "ID3" {
 			tagLen := int64(10 + synchsafe32(id3h[6:10]))
-			if metaOff+tagLen > fileSize {
+			if tagLen > fileSize-metaOff {
 				tagLen = fileSize - metaOff
 			}
 			if tagLen >= 10 && tagLen <= maxMetaChunkBytes {
@@ -753,11 +823,13 @@ func parseDFF(f *os.File, fileSize int64, m *parsedMeta) error {
 			break
 		}
 		cid := string(chdr[0:4])
-		csize := int64(binary.BigEndian.Uint64(chdr[4:12]))
+		csizeU := binary.BigEndian.Uint64(chdr[4:12])
 		off += 12
-		if csize < 0 || off+csize > fileSize {
-			csize = max(fileSize-off, 0)
+		rem := uint64(fileSize - off)
+		if csizeU > rem {
+			csizeU = rem
 		}
+		csize := int64(csizeU)
 
 		switch cid {
 		case "PROP":
@@ -768,7 +840,7 @@ func parseDFF(f *os.File, fileSize int64, m *parsedMeta) error {
 				}
 			}
 		case "DSD ":
-			dsdDataBytes = uint64(csize)
+			dsdDataBytes = csizeU
 		case "DIIN":
 			if csize > 0 && csize <= 1<<20 {
 				b := make([]byte, csize)
@@ -784,7 +856,11 @@ func parseDFF(f *os.File, fileSize int64, m *parsedMeta) error {
 				}
 			}
 		}
-		off += csize + (csize & 1)
+		step := csizeU
+		if step&1 == 1 && step < rem {
+			step++
+		}
+		off += int64(step)
 	}
 
 	if m.spec.SampleRate <= 0 || m.spec.Channels <= 0 {
@@ -792,13 +868,14 @@ func parseDFF(f *os.File, fileSize int64, m *parsedMeta) error {
 	}
 	m.spec.Codec = dsdCodecName(m.spec.SampleRate)
 	m.spec.BitDepth = 1
-	m.spec.BitrateKbps = (m.spec.SampleRate * m.spec.Channels) / 1000
+	m.spec.BitrateKbps = int((uint64(m.spec.SampleRate) * uint64(m.spec.Channels)) / 1000)
 	m.spec.IsDSD = true
 	m.spec.IsLossless = true
 	m.spec.IsHiRes = true
 	if dsdDataBytes > 0 {
-		samplesPerCh := (dsdDataBytes * 8) / uint64(m.spec.Channels)
-		m.durationMs = int64(samplesPerCh * 1000 / uint64(m.spec.SampleRate))
+		chU := uint64(m.spec.Channels)
+		samplesPerCh := (dsdDataBytes/chU)*8 + ((dsdDataBytes%chU)*8)/chU
+		m.durationMs = mulDiv1000(samplesPerCh, uint64(m.spec.SampleRate))
 	}
 	return nil
 }
@@ -807,17 +884,25 @@ func parseDFFProp(b []byte, m *parsedMeta) {
 	pos := 0
 	for pos+12 <= len(b) {
 		id := string(b[pos : pos+4])
-		sz := int(binary.BigEndian.Uint64(b[pos+4 : pos+12]))
+		sz := binary.BigEndian.Uint64(b[pos+4 : pos+12])
 		pos += 12
-		if sz < 0 || pos+sz > len(b) {
+		rem := uint64(len(b) - pos)
+		if sz > rem {
 			break
 		}
-		sub := b[pos : pos+sz]
-		pos += sz + (sz & 1)
+		sub := b[pos : pos+int(sz)]
+		step := sz
+		if step&1 == 1 && step < rem {
+			step++
+		}
+		pos += int(step)
 		switch id {
 		case "FS  ":
 			if len(sub) >= 4 {
-				m.spec.SampleRate = int(binary.BigEndian.Uint32(sub[0:4]))
+				sr := binary.BigEndian.Uint32(sub[0:4])
+				if sr <= 45158400 {
+					m.spec.SampleRate = int(sr)
+				}
 			}
 		case "CHNL":
 			if len(sub) >= 2 {
@@ -835,26 +920,31 @@ func parseDFFDiin(b []byte, m *parsedMeta) {
 	pos := 0
 	for pos+12 <= len(b) {
 		id := string(b[pos : pos+4])
-		sz := int(binary.BigEndian.Uint64(b[pos+4 : pos+12]))
+		sz := binary.BigEndian.Uint64(b[pos+4 : pos+12])
 		pos += 12
-		if sz < 0 || pos+sz > len(b) {
+		rem := uint64(len(b) - pos)
+		if sz > rem {
 			break
 		}
-		sub := b[pos : pos+sz]
-		pos += sz + (sz & 1)
+		sub := b[pos : pos+int(sz)]
+		step := sz
+		if step&1 == 1 && step < rem {
+			step++
+		}
+		pos += int(step)
 		switch id {
 		case "DITI":
 			if len(sub) >= 4 && m.title == "" {
-				n := int(binary.BigEndian.Uint32(sub[0:4]))
-				if n > 0 && 4+n <= len(sub) {
-					m.title = decodeTextAuto(sub[4 : 4+n])
+				n := uint64(binary.BigEndian.Uint32(sub[0:4]))
+				if n > 0 && n <= uint64(len(sub)-4) {
+					m.title = decodeTextAuto(sub[4 : 4+int(n)])
 				}
 			}
 		case "DIAR":
 			if len(sub) >= 4 && len(m.artists) == 0 {
-				n := int(binary.BigEndian.Uint32(sub[0:4]))
-				if n > 0 && 4+n <= len(sub) {
-					m.addArtist(decodeTextAuto(sub[4 : 4+n]))
+				n := uint64(binary.BigEndian.Uint32(sub[0:4]))
+				if n > 0 && n <= uint64(len(sub)-4) {
+					m.addArtist(decodeTextAuto(sub[4 : 4+int(n)]))
 				}
 			}
 		}
@@ -870,35 +960,38 @@ func parseMP4(f *os.File, fileSize int64, m *parsedMeta) error {
 		if _, err := f.ReadAt(h[:8], off); err != nil {
 			break
 		}
-		n := int64(binary.BigEndian.Uint32(h[0:4]))
-		head := int64(8)
+		nU := uint64(binary.BigEndian.Uint32(h[0:4]))
+		head := uint64(8)
 		typ := string(h[4:8])
-		switch n {
+		rem := uint64(fileSize - off)
+		switch nU {
 		case 0:
-			n = fileSize - off
+			nU = rem
 		case 1:
-			if off+16 > fileSize {
-				n = -1
+			if rem < 16 {
+				nU = 0
 			} else if _, err := f.ReadAt(h[8:16], off+8); err == nil {
-				n = int64(binary.BigEndian.Uint64(h[8:16]))
+				nU = binary.BigEndian.Uint64(h[8:16])
 				head = 16
+			} else {
+				nU = 0
 			}
 		}
-		if n < head || off+n > fileSize {
+		if nU < head || nU > rem {
 			break
 		}
 		if typ == "moov" {
-			bodyLen := n - head
+			bodyLen := nU - head
 			if bodyLen > maxMetaChunkBytes {
 				return errors.New("localmusic: MP4 moov box too large")
 			}
-			moov = make([]byte, bodyLen)
-			if _, err := f.ReadAt(moov, off+head); err != nil {
+			moov = make([]byte, int(bodyLen))
+			if _, err := f.ReadAt(moov, off+int64(head)); err != nil {
 				return err
 			}
 			break
 		}
-		off += n
+		off += int64(nU)
 	}
 	if moov == nil {
 		return errors.New("localmusic: MP4 missing moov box")
@@ -978,7 +1071,7 @@ func parseMP4Mvhd(b []byte, m *parsedMeta) {
 		dur = uint64(binary.BigEndian.Uint32(b[16:20]))
 	}
 	if timescale > 0 && dur > 0 {
-		m.durationMs = int64(dur * 1000 / uint64(timescale))
+		m.durationMs = mulDiv1000(dur, uint64(timescale))
 	}
 }
 
@@ -1003,7 +1096,7 @@ func parseMP4Trak(trak []byte, m *parsedMeta) {
 				dur = uint64(binary.BigEndian.Uint32(mdhd[16:20]))
 			}
 			if ts > 0 && dur > 0 {
-				m.durationMs = int64(dur * 1000 / uint64(ts))
+				m.durationMs = mulDiv1000(dur, uint64(ts))
 			}
 		}
 	}
@@ -1085,7 +1178,7 @@ func parseMP4Esds(b []byte, m *parsedMeta) {
 				break
 			}
 		}
-		if length < 0 || i+length > len(b) {
+		if length < 0 || length > len(b)-i {
 			return
 		}
 		payload := b[i : i+length]
@@ -1109,9 +1202,9 @@ func parseMP4Esds(b []byte, m *parsedMeta) {
 			return
 		case 0x04: // DecoderConfigDescriptor
 			if len(payload) >= 13 {
-				avgBr := int(binary.BigEndian.Uint32(payload[9:13]))
+				avgBr := uint64(binary.BigEndian.Uint32(payload[9:13]))
 				if avgBr > 0 {
-					m.spec.BitrateKbps = (avgBr + 500) / 1000
+					m.spec.BitrateKbps = int((avgBr + 500) / 1000)
 				}
 				parseMP4Esds(payload[13:], m)
 			}
@@ -1320,14 +1413,14 @@ func parseID3v2(tag []byte, m *parsedMeta) {
 
 	pos := 0
 	if (ver == 3 || ver == 4) && flags&0x40 != 0 && len(body) >= 4 {
-		var extSize int
+		var extU uint64
 		if ver == 4 {
-			extSize = synchsafe32(body[0:4])
+			extU = uint64(synchsafe32(body[0:4]))
 		} else {
-			extSize = int(binary.BigEndian.Uint32(body[0:4])) + 4
+			extU = uint64(binary.BigEndian.Uint32(body[0:4])) + 4
 		}
-		if extSize > 0 && extSize < len(body) {
-			pos = extSize
+		if extU > 0 && extU < uint64(len(body)) {
+			pos = int(extU)
 		}
 	}
 
@@ -1337,13 +1430,13 @@ func parseID3v2(tag []byte, m *parsedMeta) {
 			if body[pos] == 0 {
 				break
 			}
-			fsize := int(body[pos+3])<<16 | int(body[pos+4])<<8 | int(body[pos+5])
+			fsize := uint64(body[pos+3])<<16 | uint64(body[pos+4])<<8 | uint64(body[pos+5])
 			pos += 6
-			if fsize <= 0 || pos+fsize > len(body) {
+			if fsize == 0 || fsize > uint64(len(body)-pos) {
 				break
 			}
-			parseID3v22Frame(fid, body[pos:pos+fsize], m)
-			pos += fsize
+			parseID3v22Frame(fid, body[pos:pos+int(fsize)], m)
+			pos += int(fsize)
 		}
 		return
 	}
@@ -1353,19 +1446,19 @@ func parseID3v2(tag []byte, m *parsedMeta) {
 			break
 		}
 		fid := string(body[pos : pos+4])
-		var fsize int
+		var fsize uint64
 		if ver == 4 {
-			fsize = synchsafe32(body[pos+4 : pos+8])
+			fsize = uint64(synchsafe32(body[pos+4 : pos+8]))
 		} else {
-			fsize = int(binary.BigEndian.Uint32(body[pos+4 : pos+8]))
+			fsize = uint64(binary.BigEndian.Uint32(body[pos+4 : pos+8]))
 		}
 		flag2 := body[pos+9]
 		pos += 10
-		if fsize <= 0 || pos+fsize > len(body) {
+		if fsize == 0 || fsize > uint64(len(body)-pos) {
 			break
 		}
-		fdata := body[pos : pos+fsize]
-		pos += fsize
+		fdata := body[pos : pos+int(fsize)]
+		pos += int(fsize)
 
 		if ver == 4 {
 			if flag2&0x02 != 0 {
@@ -1905,9 +1998,9 @@ func parseOGG(f *os.File, fileSize int64, m *parsedMeta) error {
 		tail = tail[:n]
 		for i := len(tail) - 27; i >= 0; i-- {
 			if tail[i] == 'O' && tail[i+1] == 'g' && tail[i+2] == 'g' && tail[i+3] == 'S' {
-				granule := int64(binary.LittleEndian.Uint64(tail[i+6 : i+14]))
-				if granule > 0 {
-					m.durationMs = granule * 1000 / int64(m.spec.SampleRate)
+				granule := binary.LittleEndian.Uint64(tail[i+6 : i+14])
+				if granule > 0 && granule != math.MaxUint64 {
+					m.durationMs = mulDiv1000(granule, uint64(m.spec.SampleRate))
 					break
 				}
 			}
@@ -1918,8 +2011,11 @@ func parseOGG(f *os.File, fileSize int64, m *parsedMeta) error {
 
 func handleOggHeaderPacket(pkt []byte, m *parsedMeta) {
 	if len(pkt) >= 30 && pkt[0] == 0x01 && string(pkt[1:7]) == "vorbis" {
-		m.spec.Channels = int(pkt[11])
-		m.spec.SampleRate = int(binary.LittleEndian.Uint32(pkt[12:16]))
+		srU := binary.LittleEndian.Uint32(pkt[12:16])
+		if srU > 0 && srU <= 768000 {
+			m.spec.Channels = int(pkt[11])
+			m.spec.SampleRate = int(srU)
+		}
 		brNom := int(int32(binary.LittleEndian.Uint32(pkt[20:24])))
 		if brNom > 0 {
 			m.spec.BitrateKbps = (brNom + 500) / 1000
@@ -1941,8 +2037,14 @@ func parseWavPack(f *os.File, fileSize int64, m *parsedMeta) error {
 	var head [10]byte
 	if _, err := f.ReadAt(head[:], 0); err == nil && string(head[0:3]) == "ID3" {
 		off = int64(10 + synchsafe32(head[6:10]))
+		if off > fileSize {
+			return errors.New("localmusic: invalid WavPack header")
+		}
 	}
 
+	if fileSize-off < 32 {
+		return errors.New("localmusic: invalid WavPack header")
+	}
 	var wvh [32]byte
 	if _, err := f.ReadAt(wvh[:], off); err != nil || string(wvh[0:4]) != "wvpk" {
 		return errors.New("localmusic: invalid WavPack header")
@@ -1966,8 +2068,8 @@ func parseWavPack(f *os.File, fileSize int64, m *parsedMeta) error {
 		sr = wvSampleRates[srIdx]
 	} else if ckSize > 24 {
 		// Scan WavPack metadata sub-blocks in first block for ID_SAMPLE_RATE (0x27).
-		subLen := min(ckSize-24, int64(4096))
-		if off+32+subLen <= fileSize {
+		subLen := min(ckSize-24, int64(4096), fileSize-(off+32))
+		if subLen > 0 {
 			sub := make([]byte, subLen)
 			if _, err := f.ReadAt(sub, off+32); err == nil {
 				sr = findWavPackCustomRate(sub)
@@ -1990,7 +2092,7 @@ func parseWavPack(f *os.File, fileSize int64, m *parsedMeta) error {
 		m.spec.IsHiRes = true
 	}
 	if sr > 0 && totalSamples > 0 {
-		m.durationMs = totalSamples * 1000 / int64(sr)
+		m.durationMs = mulDiv1000(uint64(totalSamples), uint64(sr))
 	}
 
 	id3Tail := parseID3v1(f, fileSize, m)
@@ -2018,7 +2120,7 @@ func findWavPackCustomRate(b []byte) int {
 			pos++
 		}
 		byteLen := wordSize * 2
-		if pos+byteLen > len(b) {
+		if byteLen > len(b)-pos {
 			break
 		}
 		payload := b[pos : pos+byteLen]
@@ -2026,11 +2128,14 @@ func findWavPackCustomRate(b []byte) int {
 			payload = payload[:len(payload)-1]
 		}
 		if fnID == 0x27 && len(payload) >= 3 {
-			sr := int(payload[0]) | int(payload[1])<<8 | int(payload[2])<<16
+			srU := uint32(payload[0]) | uint32(payload[1])<<8 | uint32(payload[2])<<16
 			if len(payload) >= 4 {
-				sr |= int(payload[3]) << 24
+				srU |= uint32(payload[3]) << 24
 			}
-			return sr
+			if srU <= 45158400 {
+				return int(srU)
+			}
+			return 0
 		}
 		pos += byteLen
 	}
@@ -2046,7 +2151,7 @@ func parseAPEv2Tail(f io.ReaderAt, endOff int64, m *parsedMeta) int64 {
 		return 0
 	}
 	tagSize := int64(binary.LittleEndian.Uint32(footer[12:16]))
-	itemCount := int(binary.LittleEndian.Uint32(footer[16:20]))
+	itemCount := binary.LittleEndian.Uint32(footer[16:20])
 	flags := binary.LittleEndian.Uint32(footer[20:24])
 	if tagSize < 32 || tagSize > endOff || tagSize > maxMetaChunkBytes {
 		return 0
@@ -2062,8 +2167,8 @@ func parseAPEv2Tail(f io.ReaderAt, endOff int64, m *parsedMeta) int64 {
 	}
 
 	pos := 0
-	for i := 0; i < itemCount && pos+9 <= len(buf); i++ {
-		valLen := int(binary.LittleEndian.Uint32(buf[pos : pos+4]))
+	for i := uint32(0); i < itemCount && pos+9 <= len(buf); i++ {
+		valLen := uint64(binary.LittleEndian.Uint32(buf[pos : pos+4]))
 		itemFlags := binary.LittleEndian.Uint32(buf[pos+4 : pos+8])
 		pos += 8
 		nulIdx := bytes.IndexByte(buf[pos:], 0)
@@ -2072,11 +2177,11 @@ func parseAPEv2Tail(f io.ReaderAt, endOff int64, m *parsedMeta) int64 {
 		}
 		key := strings.ToUpper(strings.TrimSpace(string(buf[pos : pos+nulIdx])))
 		pos += nulIdx + 1
-		if valLen < 0 || pos+valLen > len(buf) {
+		if valLen > uint64(len(buf)-pos) {
 			break
 		}
-		val := buf[pos : pos+valLen]
-		pos += valLen
+		val := buf[pos : pos+int(valLen)]
+		pos += int(valLen)
 
 		itemType := (itemFlags >> 1) & 0x03
 		if itemType == 1 { // binary (e.g. Cover Art)

@@ -157,9 +157,7 @@ func (a *app) searchPage(c *ui.Context) {
 			tracks = append(slices.Clone(d.localSongs), tracks...)
 		}
 		a.trackRows(c, tracks, true, header, func(c *ui.Context) {
-			if !hasLocalSongs || d.page.err == "" {
-				a.pageFoot(c, &d.page, more)
-			}
+			a.pageFoot(c, &d.page, more)
 			a.searchEmpty(c, d)
 		})
 		return
@@ -220,9 +218,7 @@ func (a *app) searchPage(c *ui.Context) {
 			a.playlistCardsSkeleton(c, a.pageShimmer(c), a.columns(c, 156), 156, false)
 			return
 		}
-		if !hasLocal || d.page.err == "" {
-			a.pageFoot(c, &d.page, more)
-		}
+		a.pageFoot(c, &d.page, more)
 		a.searchEmpty(c, d)
 	})
 }

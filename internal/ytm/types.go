@@ -297,16 +297,20 @@ func (s *Stream) SpecBadge() string {
 		}
 		return c
 	}
-	if c == "" || c == "AAC" {
-		if s.Level == "exhigh" || s.Bitrate >= 192 {
+	codec := c
+	if codec == "" {
+		codec = "AAC"
+	}
+	if s.Bitrate > 0 {
+		return fmt.Sprintf("%s %dk", codec, s.Bitrate)
+	}
+	if codec == "AAC" {
+		if s.Level == "exhigh" {
 			return "AAC 256k"
 		}
 		return "AAC 128k"
 	}
-	if s.Bitrate > 0 {
-		return fmt.Sprintf("%s %dk", c, s.Bitrate)
-	}
-	return c
+	return codec
 }
 
 // SpecDetail returns a single-line technical readout with bitrate and sample rate for the player bar.

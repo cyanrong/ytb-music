@@ -112,6 +112,7 @@ type HQPSignalInfo struct {
 	SourceBits    int
 	SourceBitrate int // bps from <metadata bitrate="..."/>
 	SourceSDM     bool
+	Transport     string // "file", "wav-file", or "wav-http"
 }
 
 func formatHQPKHz(hz int) string {
@@ -226,9 +227,10 @@ type HQPlayerBackend struct {
 	addr    string
 	onState func(connected bool, detail string)
 
-	sigMu    sync.RWMutex
-	signal   HQPSignalInfo
-	onSignal func(HQPSignalInfo)
+	sigMu     sync.RWMutex
+	signal    HQPSignalInfo
+	transport string
+	onSignal  func(HQPSignalInfo)
 
 	retired atomic.Bool
 	cmdMu   sync.Mutex
@@ -290,6 +292,7 @@ func (b *HQPlayerBackend) Disconnect() {
 		hc.closed.Store(true)
 		_ = hc.conn.Close()
 	}
+	b.clearTransport()
 	b.updateSignal(HQPSignalInfo{})
 	b.emitState(false, "未连接")
 }
@@ -318,6 +321,7 @@ func (b *HQPlayerBackend) DisconnectAsync(sendStop bool) {
 			_ = hc.conn.Close()
 		}
 		b.cmdMu.Unlock()
+		b.clearTransport()
 		b.updateSignal(HQPSignalInfo{})
 		b.emitState(false, "未连接")
 	}()
@@ -335,6 +339,34 @@ func (b *HQPlayerBackend) Signal() HQPSignalInfo {
 	b.sigMu.RLock()
 	defer b.sigMu.RUnlock()
 	return b.signal
+}
+
+func (b *HQPlayerBackend) setTransport(tr string) {
+	b.sigMu.Lock()
+	b.transport = tr
+	var fn func(HQPSignalInfo)
+	var next HQPSignalInfo
+	if b.signal.Active && b.signal.Transport != tr {
+		b.signal.Transport = tr
+		next = b.signal
+		fn = b.onSignal
+	}
+	b.sigMu.Unlock()
+	if fn != nil {
+		fn(next)
+	}
+}
+
+func (b *HQPlayerBackend) clearTransport() {
+	b.sigMu.Lock()
+	b.transport = ""
+	b.sigMu.Unlock()
+}
+
+func (b *HQPlayerBackend) currentTransport() string {
+	b.sigMu.RLock()
+	defer b.sigMu.RUnlock()
+	return b.transport
 }
 
 func (b *HQPlayerBackend) updateSignal(next HQPSignalInfo) {
@@ -639,22 +671,23 @@ func buildHQPPlaylistAdd(uri string, src player.TrackSource, coverURL string, du
 	)
 }
 
-func (b *HQPlayerBackend) newActiveSink(epoch, seq uint64, src player.TrackSource, targetURI, wavURL, coverURL string, actualDur time.Duration) *hqpSink {
+func (b *HQPlayerBackend) newActiveSink(epoch, seq uint64, src player.TrackSource, transport, targetURI, wavURL, coverURL string, actualDur time.Duration) *hqpSink {
 	sinkCtx, sinkCancel := context.WithCancel(context.Background())
 	sink := &hqpSink{
-		backend:  b,
-		epoch:    epoch,
-		seq:      seq,
-		src:      src,
-		uri:      targetURI,
-		wavURL:   wavURL,
-		coverURL: coverURL,
-		duration: actualDur,
-		posAt:    b.nowTime(),
-		ctx:      sinkCtx,
-		cancel:   sinkCancel,
-		wakeCh:   make(chan struct{}, 1),
-		stopCh:   make(chan struct{}),
+		backend:   b,
+		epoch:     epoch,
+		seq:       seq,
+		src:       src,
+		transport: transport,
+		uri:       targetURI,
+		wavURL:    wavURL,
+		coverURL:  coverURL,
+		duration:  actualDur,
+		posAt:     b.nowTime(),
+		ctx:       sinkCtx,
+		cancel:    sinkCancel,
+		wakeCh:    make(chan struct{}, 1),
+		stopCh:    make(chan struct{}),
 	}
 	go sink.transportWorker()
 	sink.SetSinkVolume(src.Gain)
@@ -673,11 +706,19 @@ func (b *HQPlayerBackend) Open(ctx context.Context, src player.TrackSource) (pla
 			}
 			targetURI := LocalFileURI(src.LocalPath)
 			actualDur := src.Duration
-			addCmd := buildHQPPlaylistAdd(targetURI, src, "", actualDur)
+			var (
+				seq      uint64
+				coverURL string
+			)
+			if b.srv != nil && (len(src.CoverBytes) > 0 || isHTTPURL(src.Track.Album.PicURL)) {
+				seq, coverURL = b.srv.RegisterHQPCover(src, addr)
+			}
+			b.setTransport("file")
+			addCmd := buildHQPPlaylistAdd(targetURI, src, coverURL, actualDur)
 			if _, err := b.execForEpoch(ctx, epoch, "PlaylistAdd", addCmd, 25*time.Second); err != nil {
 				return nil, fmt.Errorf("HQPlayer 加载音轨失败: %w", err)
 			}
-			return b.newActiveSink(epoch, 0, src, targetURI, "", "", actualDur), nil
+			return b.newActiveSink(epoch, seq, src, "file", targetURI, "", coverURL, actualDur), nil
 		} else if src.OpenPCM == nil {
 			return nil, serr
 		}
@@ -697,16 +738,19 @@ func (b *HQPlayerBackend) Open(ctx context.Context, src player.TrackSource) (pla
 	}
 
 	targetURI := wavURL
+	transport := "wav-http"
 	if !b.ForceHTTP && isLocalHQPPeer(addr) && fileURI != "" {
 		targetURI = fileURI
+		transport = "wav-file"
 	}
+	b.setTransport(transport)
 
 	addCmd := buildHQPPlaylistAdd(targetURI, src, coverURL, actualDur)
 	if _, err := b.execForEpoch(ctx, epoch, "PlaylistAdd", addCmd, 25*time.Second); err != nil {
 		return nil, fmt.Errorf("HQPlayer 加载音轨失败: %w", err)
 	}
 
-	return b.newActiveSink(epoch, seq, src, targetURI, wavURL, coverURL, actualDur), nil
+	return b.newActiveSink(epoch, seq, src, transport, targetURI, wavURL, coverURL, actualDur), nil
 }
 
 func firstNonEmptyAttr(attrs map[string]string, keys ...string) string {
@@ -819,6 +863,7 @@ func parseHQPSignal(attrs map[string]string, state int, prev HQPSignalInfo) HQPS
 		SourceBits:    srcBits,
 		SourceBitrate: srcBitrate,
 		SourceSDM:     srcSDM,
+		Transport:     prev.Transport,
 	}
 }
 
@@ -831,8 +876,13 @@ func (b *HQPlayerBackend) onStatusFrame(attrs map[string]string) {
 
 	b.sigMu.RLock()
 	prevSig := b.signal
+	tr := b.transport
 	b.sigMu.RUnlock()
-	b.updateSignal(parseHQPSignal(attrs, state, prevSig))
+	next := parseHQPSignal(attrs, state, prevSig)
+	if next.Active && tr != "" {
+		next.Transport = tr
+	}
+	b.updateSignal(next)
 
 	b.sinkMu.Lock()
 	sink := b.active
@@ -843,16 +893,17 @@ func (b *HQPlayerBackend) onStatusFrame(attrs map[string]string) {
 }
 
 type hqpSink struct {
-	backend  *HQPlayerBackend
-	epoch    uint64
-	seq      uint64
-	src      player.TrackSource
-	uri      string
-	wavURL   string
-	coverURL string
-	duration time.Duration
-	ctx      context.Context
-	cancel   context.CancelFunc
+	backend   *HQPlayerBackend
+	epoch     uint64
+	seq       uint64
+	src       player.TrackSource
+	transport string
+	uri       string
+	wavURL    string
+	coverURL  string
+	duration  time.Duration
+	ctx       context.Context
+	cancel    context.CancelFunc
 
 	mu              sync.Mutex
 	closed          bool
@@ -890,6 +941,9 @@ func (s *hqpSink) Activate() {
 	s.backend.sinkMu.Lock()
 	s.backend.active = s
 	s.backend.sinkMu.Unlock()
+	if s.transport != "" && s.isCurrent() {
+		s.backend.setTransport(s.transport)
+	}
 }
 
 func (s *hqpSink) DirectTransport() bool { return true }

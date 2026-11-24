@@ -4,12 +4,15 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"math"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -811,6 +814,896 @@ func TestALACWavPackAndMP3XingParsing(t *testing.T) {
 	// 1000 frames * 1152 samples / 44100 Hz = 26122 ms
 	if mp3Tracks[0].DurationMs != 26122 {
 		t.Fatalf("expected Xing VBR MP3 duration 26122ms, got %d", mp3Tracks[0].DurationMs)
+	}
+}
+
+// TestSaveSerializesConcurrentMutationsAndPreservesIndexOnRenameFailure checks that Save serializes snapshots without clobbering newer state and preserves the last good index when atomic rename fails (fixing Save's shared .part race and destructive os.Remove fallback).
+func TestSaveSerializesConcurrentMutationsAndPreservesIndexOnRenameFailure(t *testing.T) {
+	root := t.TempDir()
+	musicDir := filepath.Join(root, "music")
+	if err := os.MkdirAll(musicDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	flacPath := filepath.Join(musicDir, "01 - Blue Train.flac")
+	if err := os.WriteFile(flacPath, buildSyntheticFLAC(96000, 2, 24, 96000*30, []string{
+		"TITLE=Blue Train",
+		"ARTIST=John Coltrane",
+		"ALBUM=Blue Train",
+		"ALBUMARTIST=John Coltrane",
+	}, nil), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	idxDir := filepath.Join(root, "state")
+	idxPath := filepath.Join(idxDir, "local_library.json")
+	covDir := filepath.Join(root, "covers")
+	lib := NewLibrary(idxPath, covDir)
+	lib.AddFolder(musicDir)
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("initial Scan failed: %v", err)
+	}
+	goodBytes, err := os.ReadFile(idxPath)
+	if err != nil || len(goodBytes) == 0 {
+		t.Fatalf("expected valid initial index file, err=%v", err)
+	}
+
+	// Simulate rename failure and verify the previous valid index is untouched and temp files are cleaned up.
+	prevRename := renameIndexFile
+	renameIndexFile = func(_, _ string) error {
+		return errors.New("simulated rename failure")
+	}
+	extraDir := filepath.Join(root, "extra")
+	if err := os.MkdirAll(extraDir, 0o755); err != nil {
+		renameIndexFile = prevRename
+		t.Fatal(err)
+	}
+	lib.AddFolder(extraDir)
+	saveErr := lib.Save()
+	renameIndexFile = prevRename
+	if saveErr == nil {
+		t.Fatal("expected Save to fail when renameIndexFile fails")
+	}
+
+	afterFailBytes, err := os.ReadFile(idxPath)
+	if err != nil {
+		t.Fatalf("expected previous index file to survive rename failure, got err=%v", err)
+	}
+	if !bytes.Equal(afterFailBytes, goodBytes) {
+		t.Fatal("expected previous good index bytes to remain intact on rename failure")
+	}
+	entries, err := os.ReadDir(idxDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, ent := range entries {
+		if strings.HasPrefix(ent.Name(), ".local_library-") {
+			t.Fatalf("leaked temporary index file after failed Save: %s", ent.Name())
+		}
+	}
+
+	// Concurrent Save / AddFolder / RemoveFolder / ApplyRoonGenres must never race or leave stale snapshots on disk.
+	var wg sync.WaitGroup
+	genres := []string{"Hard Bop", "Modal Jazz", "Soul Jazz", "Avant-Garde Jazz"}
+	for i := range 8 {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			sub := filepath.Join(root, fmt.Sprintf("concurrent-%d", worker))
+			lib.AddFolder(sub)
+			lib.ApplyRoonGenres([]RoonAlbumGenre{{
+				Album:  "Blue Train",
+				Artist: "John Coltrane",
+				Genres: []string{genres[worker%len(genres)]},
+			}})
+			if worker%2 == 1 {
+				lib.RemoveFolder(sub)
+			}
+			if err := lib.Save(); err != nil {
+				t.Errorf("concurrent Save failed: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
+
+	wantFolders := lib.Folders()
+	reloaded := NewLibrary(idxPath, covDir)
+	if err := reloaded.Load(); err != nil {
+		t.Fatalf("Load after concurrent saves failed: %v", err)
+	}
+	if !slices.Equal(reloaded.Folders(), wantFolders) {
+		t.Fatalf("persisted folders %v do not match latest in-memory folders %v", reloaded.Folders(), wantFolders)
+	}
+	reloadedAlbums := reloaded.Albums(AlbumFilter{Query: "Blue Train"})
+	if len(reloadedAlbums) != 1 || len(reloadedAlbums[0].Genres) != len(genres) {
+		t.Fatalf("expected all %d concurrent Roon genres persisted, got %+v", len(genres), reloadedAlbums)
+	}
+	entries, _ = os.ReadDir(idxDir)
+	for _, ent := range entries {
+		if strings.HasPrefix(ent.Name(), ".local_library-") {
+			t.Fatalf("leaked temporary index file after concurrent saves: %s", ent.Name())
+		}
+	}
+}
+
+// TestDSFDecoderBoundsPayloadAndRejectsCorruptHeaders checks that newDSFDecoder validates channels, sampleRate, blockSize, and payload bytes before allocating buffers or computing frame length (fixing unbounded DSF header allocations).
+func TestDSFDecoderBoundsPayloadAndRejectsCorruptHeaders(t *testing.T) {
+	dir := t.TempDir()
+	valid := buildSyntheticDSF(2822400, 2, 2, 1000.0, nil)
+
+	writeMutated := func(name string, mut func([]byte) []byte) string {
+		b := mut(bytes.Clone(valid))
+		p := filepath.Join(dir, name)
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+
+	// 1. Huge blockSize (1 GiB) must be rejected before allocating blockBuf.
+	hugeBlockPath := writeMutated("huge_block.dsf", func(b []byte) []byte {
+		binary.LittleEndian.PutUint32(b[28+44:28+48], 1<<30)
+		return b
+	})
+	if dec, err := OpenTrackDecoder(&LocalTrack{Path: hugeBlockPath}); err == nil {
+		if c, ok := dec.(io.Closer); ok {
+			_ = c.Close()
+		}
+		t.Fatal("expected DSF with 1GiB blockSize to be rejected")
+	}
+
+	// 2. Zero blockSize must be rejected.
+	zeroBlockPath := writeMutated("zero_block.dsf", func(b []byte) []byte {
+		binary.LittleEndian.PutUint32(b[28+44:28+48], 0)
+		return b
+	})
+	if dec, err := OpenTrackDecoder(&LocalTrack{Path: zeroBlockPath}); err == nil {
+		if c, ok := dec.(io.Closer); ok {
+			_ = c.Close()
+		}
+		t.Fatal("expected DSF with zero blockSize to be rejected")
+	}
+
+	// 3. Out-of-range channel count (9) and non-DSD sampleRate (44100) must be rejected.
+	badChanPath := writeMutated("bad_chan.dsf", func(b []byte) []byte {
+		binary.LittleEndian.PutUint32(b[28+24:28+28], 9)
+		return b
+	})
+	if dec, err := OpenTrackDecoder(&LocalTrack{Path: badChanPath}); err == nil {
+		if c, ok := dec.(io.Closer); ok {
+			_ = c.Close()
+		}
+		t.Fatal("expected DSF with 9 channels to be rejected")
+	}
+
+	badRatePath := writeMutated("bad_rate.dsf", func(b []byte) []byte {
+		binary.LittleEndian.PutUint32(b[28+28:28+32], 44100)
+		return b
+	})
+	if dec, err := OpenTrackDecoder(&LocalTrack{Path: badRatePath}); err == nil {
+		if c, ok := dec.(io.Closer); ok {
+			_ = c.Close()
+		}
+		t.Fatal("expected DSF with 44.1kHz PCM rate to be rejected")
+	}
+
+	// 4. Truncated payload (< channels * blockSize) must be rejected.
+	truncPath := writeMutated("trunc_payload.dsf", func(b []byte) []byte {
+		return b[:28+52+12+1024] // less than 2 * 4096 = 8192 bytes
+	})
+	if dec, err := OpenTrackDecoder(&LocalTrack{Path: truncPath}); err == nil {
+		if c, ok := dec.(io.Closer); ok {
+			_ = c.Close()
+		}
+		t.Fatal("expected DSF with truncated audio block to be rejected")
+	}
+
+	// 5. Inflated sampleCount (MaxUint64) on a 2-block DSF must clamp Len() to the actual 2048 PCM frames.
+	inflatedPath := writeMutated("inflated_samples.dsf", func(b []byte) []byte {
+		binary.LittleEndian.PutUint64(b[28+36:28+44], math.MaxUint64)
+		binary.LittleEndian.PutUint64(b[28+52+4:28+52+12], math.MaxUint64)
+		return b
+	})
+	dec, err := OpenTrackDecoder(&LocalTrack{Path: inflatedPath})
+	if err != nil {
+		t.Fatalf("expected DSF with clamped sampleCount to open, got err=%v", err)
+	}
+	defer func() {
+		if c, ok := dec.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}()
+	if dec.Len() != 2048 {
+		t.Fatalf("expected clamped DSF decoder Len=2048 frames, got %d", dec.Len())
+	}
+	buf := make([]float32, 4096*2)
+	n, rerr := dec.Read(buf)
+	if n != 2048*2 || (rerr != nil && rerr != io.EOF) {
+		t.Fatalf("expected 4096 float32 samples from clamped 2-block DSF, got n=%d err=%v", n, rerr)
+	}
+	if n2, err2 := dec.Read(buf[:16]); n2 != 0 || err2 != io.EOF {
+		t.Fatalf("expected EOF after clamped DSF payload, got n=%d err=%v", n2, err2)
+	}
+}
+
+// TestBinaryTagParsersRejectOverflowingSubchunkLengths checks that DFF, RF64 WAV, and MP4 binary parsers validate 64-bit subchunk lengths before int conversion so huge uint64 sizes cannot overflow offsets and panic.
+func TestBinaryTagParsersRejectOverflowingSubchunkLengths(t *testing.T) {
+	dir := t.TempDir()
+
+	for _, badSz := range []uint64{0x7fffffffffffffff, 0xffffffffffffffff} {
+		// Malformed DFF with overflowing subchunks inside both PROP and DIIN.
+		var prop bytes.Buffer
+		prop.WriteString("SND ")
+		prop.WriteString("FS  ")
+		_ = binary.Write(&prop, binary.BigEndian, uint64(4))
+		_ = binary.Write(&prop, binary.BigEndian, uint32(2822400))
+		prop.WriteString("CHNL")
+		_ = binary.Write(&prop, binary.BigEndian, uint64(6))
+		_ = binary.Write(&prop, binary.BigEndian, uint16(1))
+		prop.WriteString("SLFT")
+		prop.WriteString("CMPR")
+		_ = binary.Write(&prop, binary.BigEndian, badSz)
+		prop.WriteString("DSD ")
+
+		var diin bytes.Buffer
+		diin.WriteString("DITI")
+		_ = binary.Write(&diin, binary.BigEndian, badSz)
+		diin.WriteString("boom")
+
+		var frm bytes.Buffer
+		frm.WriteString("DSD ")
+		writeChunk64 := func(id string, body []byte) {
+			frm.WriteString(id)
+			_ = binary.Write(&frm, binary.BigEndian, uint64(len(body)))
+			frm.Write(body)
+			if len(body)%2 != 0 {
+				frm.WriteByte(0)
+			}
+		}
+		writeChunk64("PROP", prop.Bytes())
+		writeChunk64("DIIN", diin.Bytes())
+		frm.WriteString("DSD ")
+		_ = binary.Write(&frm, binary.BigEndian, badSz)
+		frm.Write(bytes.Repeat([]byte{0xAA}, 64))
+
+		var dff bytes.Buffer
+		dff.WriteString("FRM8")
+		_ = binary.Write(&dff, binary.BigEndian, uint64(frm.Len()))
+		dff.Write(frm.Bytes())
+
+		dffPath := filepath.Join(dir, fmt.Sprintf("overflow_%x.dff", badSz))
+		if err := os.WriteFile(dffPath, dff.Bytes(), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		meta, err := parseAudioFile(dffPath, int64(dff.Len()))
+		if err != nil || meta == nil || meta.spec.SampleRate != 2822400 {
+			t.Fatalf("expected malformed DFF subchunk (0x%x) to parse cleanly without panic, err=%v", badSz, err)
+		}
+		dec, err := OpenTrackDecoder(&LocalTrack{Path: dffPath})
+		if err != nil {
+			t.Fatalf("expected malformed DFF subchunk (0x%x) decoder open without panic, err=%v", badSz, err)
+		}
+		if c, ok := dec.(io.Closer); ok {
+			_ = c.Close()
+		}
+
+		// Malformed RF64 WAV with overflowing ds64 data size.
+		var rf64 bytes.Buffer
+		rf64.WriteString("RF64")
+		_ = binary.Write(&rf64, binary.LittleEndian, uint32(0xFFFFFFFF))
+		rf64.WriteString("WAVE")
+		rf64.WriteString("ds64")
+		_ = binary.Write(&rf64, binary.LittleEndian, uint32(28))
+		var ds64 [28]byte
+		binary.LittleEndian.PutUint64(ds64[0:8], badSz)
+		binary.LittleEndian.PutUint64(ds64[8:16], badSz)
+		rf64.Write(ds64[:])
+		rf64.WriteString("fmt ")
+		_ = binary.Write(&rf64, binary.LittleEndian, uint32(16))
+		var fmt16 [16]byte
+		binary.LittleEndian.PutUint16(fmt16[0:2], 1)
+		binary.LittleEndian.PutUint16(fmt16[2:4], 2)
+		binary.LittleEndian.PutUint32(fmt16[4:8], 44100)
+		binary.LittleEndian.PutUint32(fmt16[8:12], 176400)
+		binary.LittleEndian.PutUint16(fmt16[12:14], 4)
+		binary.LittleEndian.PutUint16(fmt16[14:16], 16)
+		rf64.Write(fmt16[:])
+		rf64.WriteString("data")
+		_ = binary.Write(&rf64, binary.LittleEndian, uint32(0xFFFFFFFF))
+		rf64.Write(make([]byte, 64))
+
+		wavPath := filepath.Join(dir, fmt.Sprintf("overflow_%x.wav", badSz))
+		if err := os.WriteFile(wavPath, rf64.Bytes(), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := parseAudioFile(wavPath, int64(rf64.Len())); err != nil {
+			t.Fatalf("expected malformed RF64 WAV (0x%x) to clamp cleanly without panic, err=%v", badSz, err)
+		}
+
+		// Malformed MP4 with 64-bit extended box size overflow.
+		var mp4 bytes.Buffer
+		mp4.Write(mp4Box("ftyp", []byte("M4A \x00\x00\x00\x00")))
+		_ = binary.Write(&mp4, binary.BigEndian, uint32(1))
+		mp4.WriteString("mdat")
+		_ = binary.Write(&mp4, binary.BigEndian, badSz)
+		mp4Path := filepath.Join(dir, fmt.Sprintf("overflow_%x.m4a", badSz))
+		if err := os.WriteFile(mp4Path, mp4.Bytes(), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		_, _ = parseAudioFile(mp4Path, int64(mp4.Len()))
+	}
+
+	// Also verify 32-bit max-length fields (0x7fffffff / 0xffffffff) in FLAC Vorbis/PICTURE, ID3v2, and WavPack APEv2.
+	for _, bad32 := range []uint32{0x7fffffff, 0xffffffff} {
+		var badVC [12]byte
+		binary.LittleEndian.PutUint32(badVC[0:4], 0)
+		binary.LittleEndian.PutUint32(badVC[4:8], 1)
+		binary.LittleEndian.PutUint32(badVC[8:12], bad32)
+		parseVorbisComment(badVC[:], &parsedMeta{})
+
+		var badPic [36]byte
+		binary.BigEndian.PutUint32(badPic[0:4], 3)
+		binary.BigEndian.PutUint32(badPic[4:8], bad32)
+		parseFLACPicture(badPic[:], &parsedMeta{})
+
+		var badID3 bytes.Buffer
+		badID3.Write([]byte{'I', 'D', '3', 3, 0, 0x40, 0, 0, 0, 20})
+		_ = binary.Write(&badID3, binary.BigEndian, bad32)
+		badID3.WriteString("TIT2")
+		_ = binary.Write(&badID3, binary.BigEndian, bad32)
+		badID3.Write([]byte{0, 0, 3, 'X', 0, 0})
+		parseID3v2(badID3.Bytes(), &parsedMeta{})
+
+		var badAPE bytes.Buffer
+		_ = binary.Write(&badAPE, binary.LittleEndian, bad32)
+		_ = binary.Write(&badAPE, binary.LittleEndian, uint32(0))
+		badAPE.WriteString("Title\x00val")
+		var footer [32]byte
+		copy(footer[0:8], "APETAGEX")
+		binary.LittleEndian.PutUint32(footer[12:16], uint32(badAPE.Len()+32))
+		binary.LittleEndian.PutUint32(footer[16:20], bad32)
+		badAPE.Write(footer[:])
+		parseAPEv2Tail(bytes.NewReader(badAPE.Bytes()), int64(badAPE.Len()), &parsedMeta{})
+	}
+}
+
+// TestInFlightScanDoesNotRestoreConcurrentlyRemovedFolder checks that removing a watched folder while Scan is in flight prevents its files and CUEs from being committed or persisted (fixing Scan overwriting RemoveFolder).
+func TestInFlightScanDoesNotRestoreConcurrentlyRemovedFolder(t *testing.T) {
+	root := t.TempDir()
+	keepDir := filepath.Join(root, "keep")
+	dropDir := filepath.Join(root, "drop")
+	if err := os.MkdirAll(keepDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(dropDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(keepDir, "01 - Keep.flac"), buildSyntheticFLAC(44100, 2, 16, 44100*10, []string{
+		"TITLE=Keep Song",
+		"ARTIST=Keep Artist",
+		"ALBUM=Keep Album",
+	}, nil), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dropDir, "01 - Drop.flac"), buildSyntheticFLAC(44100, 2, 16, 44100*10, []string{
+		"TITLE=Drop Song",
+		"ARTIST=Drop Artist",
+		"ALBUM=Drop Album",
+	}, nil), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dropPCM := make([]byte, 44100*2*4)
+	if err := os.WriteFile(filepath.Join(dropDir, "disc.wav"), buildPCM16WAV(44100, 2, dropPCM), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dropCue := "PERFORMER \"Drop Artist\"\nTITLE \"Drop Cue Album\"\nFILE \"disc.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Drop Cue Track\"\n    INDEX 01 00:00:00\n"
+	if err := os.WriteFile(filepath.Join(dropDir, "disc.cue"), []byte(dropCue), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	idxPath := filepath.Join(root, "index.json")
+	covDir := filepath.Join(root, "covers")
+	lib := NewLibrary(idxPath, covDir)
+	lib.AddFolders(keepDir, dropDir)
+
+	var removedOnce sync.Once
+	prevHook := onFileParsedHook
+	onFileParsedHook = func(string) {
+		removedOnce.Do(func() {
+			lib.RemoveFolder(dropDir)
+		})
+	}
+	defer func() { onFileParsedHook = prevHook }()
+
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	tracks := lib.Tracks("", "", "")
+	if len(tracks) != 1 || tracks[0].Title != "Keep Song" {
+		t.Fatalf("expected only Keep Song after concurrent RemoveFolder, got %+v", tracks)
+	}
+
+	reloaded := NewLibrary(idxPath, covDir)
+	if err := reloaded.Load(); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	reloadedTracks := reloaded.Tracks("", "", "")
+	if len(reloadedTracks) != 1 || reloadedTracks[0].Title != "Keep Song" {
+		t.Fatalf("expected persisted index to exclude concurrently removed folder, got %+v", reloadedTracks)
+	}
+}
+
+// TestUnreadableMusicRootPreservesCachedEntriesUnlikeEmptyRoot checks that an unavailable music root returns an error from Scan while preserving its cached tracks, whereas a readable empty root removes deleted tracks.
+func TestUnreadableMusicRootPreservesCachedEntriesUnlikeEmptyRoot(t *testing.T) {
+	root := t.TempDir()
+	localRoot := filepath.Join(root, "local")
+	nasRoot := filepath.Join(root, "nas")
+	if err := os.MkdirAll(localRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(nasRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := os.WriteFile(filepath.Join(localRoot, "01 - Local1.flac"), buildSyntheticFLAC(44100, 2, 16, 44100*15, []string{
+		"TITLE=Local One",
+		"ARTIST=Artist A",
+		"ALBUM=Local Album",
+	}, nil), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nasRoot, "01 - NAS.flac"), buildSyntheticFLAC(96000, 2, 24, 96000*20, []string{
+		"TITLE=NAS Master",
+		"ARTIST=Artist B",
+		"ALBUM=NAS Album",
+	}, nil), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	nasPCM := make([]byte, 44100*2*4)
+	if err := os.WriteFile(filepath.Join(nasRoot, "nasdisc.wav"), buildPCM16WAV(44100, 2, nasPCM), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(nasRoot, "nasdisc.cue"), []byte("PERFORMER \"Artist B\"\nTITLE \"NAS Cue\"\nFILE \"nasdisc.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"NAS Cue Track\"\n    INDEX 01 00:00:00\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	idxPath := filepath.Join(root, "index.json")
+	covDir := filepath.Join(root, "covers")
+	lib := NewLibrary(idxPath, covDir)
+	lib.AddFolders(localRoot, nasRoot)
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("initial Scan failed: %v", err)
+	}
+	if got := len(lib.Tracks("", "", "")); got != 3 {
+		t.Fatalf("expected 3 initial tracks across local + NAS roots, got %d", got)
+	}
+
+	// Take nasRoot offline while adding a second track to readable localRoot.
+	if err := os.RemoveAll(nasRoot); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(localRoot, "02 - Local2.flac"), buildSyntheticFLAC(44100, 2, 16, 44100*15, []string{
+		"TITLE=Local Two",
+		"ARTIST=Artist A",
+		"ALBUM=Local Album",
+	}, nil), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	scanErr := lib.Scan(context.Background(), nil)
+	if scanErr == nil || !strings.Contains(scanErr.Error(), nasRoot) {
+		t.Fatalf("expected Scan to return descriptive error mentioning offline root %q, got %v", nasRoot, scanErr)
+	}
+	if got := len(lib.Tracks("", "", "")); got != 4 {
+		t.Fatalf("expected 2 local tracks + 2 preserved NAS tracks (total 4), got %d", got)
+	}
+	if len(lib.Tracks("NAS Master", "", "")) != 1 || len(lib.Tracks("NAS Cue Track", "", "cue")) != 1 {
+		t.Fatal("expected both standalone and CUE tracks under offline NAS root to be preserved")
+	}
+
+	// Recreate nasRoot as a genuinely empty readable folder -> Scan should succeed and prune NAS tracks.
+	if err := os.MkdirAll(nasRoot, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("expected Scan on empty readable folder to succeed, got %v", err)
+	}
+	if got := len(lib.Tracks("", "", "")); got != 2 {
+		t.Fatalf("expected empty readable nasRoot to prune deleted NAS tracks leaving 2 local tracks, got %d", got)
+	}
+}
+
+// TestIncrementalScanInvalidatesChangedFolderSidecarCovers checks that adding, replacing, or deleting folder cover artwork updates cached standalone and CUE tracks without re-parsing unchanged audio files, while preserving embedded covers.
+func TestIncrementalScanInvalidatesChangedFolderSidecarCovers(t *testing.T) {
+	root := t.TempDir()
+	flacDir := filepath.Join(root, "music", "SidecarFLAC")
+	cueDir := filepath.Join(root, "music", "SidecarCUE")
+	embDir := filepath.Join(root, "music", "EmbeddedFLAC")
+	for _, d := range []string{flacDir, cueDir, embDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := os.WriteFile(filepath.Join(flacDir, "01 - Track.flac"), buildSyntheticFLAC(44100, 2, 16, 44100*10, []string{
+		"TITLE=Sidecar Song",
+		"ARTIST=Trio",
+		"ALBUM=Sidecar Album",
+	}, nil), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	pcm := make([]byte, 44100*2*4)
+	if err := os.WriteFile(filepath.Join(cueDir, "disc.wav"), buildPCM16WAV(44100, 2, pcm), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(cueDir, "disc.cue"), []byte("PERFORMER \"Trio\"\nTITLE \"Sidecar CUE Album\"\nFILE \"disc.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Sidecar CUE Song\"\n    INDEX 01 00:00:00\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	embBytes := []byte{0x89, 'P', 'N', 'G', 'E', 'M', 'B', 'E', 'D'}
+	if err := os.WriteFile(filepath.Join(embDir, "01 - Embedded.flac"), buildSyntheticFLAC(44100, 2, 16, 44100*10, []string{
+		"TITLE=Embedded Song",
+		"ARTIST=Trio",
+		"ALBUM=Embedded Album",
+	}, []flacPicSpec{{picType: 3, mime: "image/png", data: embBytes}}), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var parsedCount atomic.Int32
+	prevHook := onFileParsedHook
+	onFileParsedHook = func(string) { parsedCount.Add(1) }
+	defer func() { onFileParsedHook = prevHook }()
+
+	lib := NewLibrary(filepath.Join(root, "index.json"), filepath.Join(root, "covers"))
+	lib.AddFolder(filepath.Join(root, "music"))
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("initial Scan failed: %v", err)
+	}
+	if tr := lib.Tracks("Sidecar Song", "", "")[0]; tr.CoverID != "" {
+		t.Fatalf("expected initially empty CoverID, got %q", tr.CoverID)
+	}
+	if tr := lib.Tracks("Sidecar CUE Song", "", "cue")[0]; tr.CoverID != "" {
+		t.Fatalf("expected initially empty CUE CoverID, got %q", tr.CoverID)
+	}
+
+	// 1. Add cover.jpg in all three folders -> standalone & CUE tracks gain coverA without re-parsing FLACs; embedded track keeps embBytes.
+	coverA := []byte{0xFF, 0xD8, 0xFF, 0xE0, 'C', 'O', 'V', 'A', 0xFF, 0xD9}
+	for _, d := range []string{flacDir, cueDir, embDir} {
+		if err := os.WriteFile(filepath.Join(d, "cover.jpg"), coverA, 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	parsedCount.Store(0)
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("Scan after adding cover.jpg failed: %v", err)
+	}
+	if got := parsedCount.Load(); got != 0 {
+		t.Fatalf("expected 0 audio files re-parsed when only sidecar cover changed, got %d", got)
+	}
+	for _, q := range []string{"Sidecar Song", "Sidecar CUE Song"} {
+		tr := lib.Tracks(q, "", "")[0]
+		gotBytes, err := lib.CoverBytes(tr.CoverID)
+		if err != nil || !bytes.Equal(gotBytes, coverA) {
+			t.Fatalf("expected %s to pick up newly added coverA, err=%v", q, err)
+		}
+	}
+	embTr := lib.Tracks("Embedded Song", "", "")[0]
+	if gotEmb, err := lib.CoverBytes(embTr.CoverID); err != nil || !bytes.Equal(gotEmb, embBytes) {
+		t.Fatalf("expected embedded cover to take precedence over folder cover, err=%v", err)
+	}
+
+	// 2. Replace cover.jpg with coverB (and bump mtime) -> standalone & CUE tracks switch to coverB.
+	coverB := []byte{0xFF, 0xD8, 0xFF, 0xE0, 'C', 'O', 'V', 'E', 'R', '_', 'B', 0xFF, 0xD9}
+	t2 := time.Unix(1_760_000_000, 0)
+	for _, d := range []string{flacDir, cueDir} {
+		cp := filepath.Join(d, "cover.jpg")
+		if err := os.WriteFile(cp, coverB, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chtimes(cp, t2, t2); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("Scan after replacing cover.jpg failed: %v", err)
+	}
+	for _, q := range []string{"Sidecar Song", "Sidecar CUE Song"} {
+		tr := lib.Tracks(q, "", "")[0]
+		gotBytes, err := lib.CoverBytes(tr.CoverID)
+		if err != nil || !bytes.Equal(gotBytes, coverB) {
+			t.Fatalf("expected %s to update to replaced coverB, err=%v", q, err)
+		}
+	}
+
+	// 3. Remove cover.jpg -> standalone & CUE tracks clear CoverID, while embedded cover remains intact.
+	for _, d := range []string{flacDir, cueDir, embDir} {
+		if err := os.Remove(filepath.Join(d, "cover.jpg")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("Scan after deleting cover.jpg failed: %v", err)
+	}
+	if tr := lib.Tracks("Sidecar Song", "", "")[0]; tr.CoverID != "" {
+		t.Fatalf("expected Sidecar Song CoverID cleared after deleting cover.jpg, got %q", tr.CoverID)
+	}
+	if tr := lib.Tracks("Sidecar CUE Song", "", "cue")[0]; tr.CoverID != "" {
+		t.Fatalf("expected Sidecar CUE Song CoverID cleared after deleting cover.jpg, got %q", tr.CoverID)
+	}
+	embTr = lib.Tracks("Embedded Song", "", "")[0]
+	if gotEmb, err := lib.CoverBytes(embTr.CoverID); err != nil || !bytes.Equal(gotEmb, embBytes) {
+		t.Fatalf("expected embedded cover to survive deleting folder cover.jpg, err=%v", err)
+	}
+}
+
+// TestIncrementalCueScanRevisitsUnresolvedFileReferences checks that incremental CUE scans re-evaluate previously missing FILE entries when their audio arrives later and suppress the newly resolved whole-side audio file.
+func TestIncrementalCueScanRevisitsUnresolvedFileReferences(t *testing.T) {
+	root := t.TempDir()
+	discDir := filepath.Join(root, "vinyl")
+	if err := os.MkdirAll(discDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	pcm := make([]byte, 44100*4*4) // 4 seconds
+	sideAPath := filepath.Join(discDir, "SideA.wav")
+	sideBPath := filepath.Join(discDir, "SideB.wav")
+	if err := os.WriteFile(sideAPath, buildPCM16WAV(44100, 2, pcm), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cueText := strings.Join([]string{
+		`PERFORMER "Keith Jarrett"`,
+		`TITLE "The Köln Concert"`,
+		`FILE "SideA.wav" WAVE`,
+		`  TRACK 01 AUDIO`,
+		`    TITLE "Part I"`,
+		`    INDEX 01 00:00:00`,
+		`FILE "SideB.wav" WAVE`,
+		`  TRACK 02 AUDIO`,
+		`    TITLE "Part IIa"`,
+		`    INDEX 01 00:00:00`,
+		`  TRACK 03 AUDIO`,
+		`    TITLE "Part IIb"`,
+		`    INDEX 01 00:02:00`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(discDir, "concert.cue"), []byte(cueText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	lib := NewLibrary(filepath.Join(root, "index.json"), filepath.Join(root, "covers"))
+	lib.AddFolder(discDir)
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("initial Scan failed: %v", err)
+	}
+	if got := len(lib.Tracks("", "", "")); got != 1 {
+		t.Fatalf("expected 1 CUE track when only SideA.wav exists, got %d", got)
+	}
+
+	// Copy SideB.wav into place without modifying concert.cue or SideA.wav.
+	if err := os.WriteFile(sideBPath, buildPCM16WAV(44100, 2, pcm), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("incremental Scan after SideB.wav arrived failed: %v", err)
+	}
+
+	allTracks := lib.Tracks("", "", "")
+	if len(allTracks) != 3 {
+		t.Fatalf("expected 3 sliced CUE tracks (and SideB.wav suppressed as standalone), got %d: %+v", len(allTracks), allTracks)
+	}
+	for _, tr := range allTracks {
+		if !tr.Spec.IsCUE {
+			t.Fatalf("expected newly arrived SideB.wav to be suppressed by CUE, found standalone track %+v", tr)
+		}
+	}
+}
+
+// TestCueFrameExactSlicingAndScopedWholeDiscLyrics checks 1/75s CD-frame sample accuracy (00:00:01 -> sample 588 at 44.1kHz) and ensures CUE whole-disc lyrics never leak across sibling .cue files in the same directory.
+func TestCueFrameExactSlicingAndScopedWholeDiscLyrics(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "multi_cue")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	// Synthesize Disc1.wav (44.1kHz stereo, 2 CD frames = 1176 samples):
+	// Frames [0, 588) = +0.25 (+8192); frames [588, 1176) = -0.50 (-16384).
+	// If truncated to 13ms (573 samples), Track 2 would erroneously read 15 samples of +0.25!
+	const (
+		sr       = 44100
+		cdFrame1 = 588 // exact 44100 / 75
+		total    = 1176
+	)
+	disc1PCM := make([]byte, total*4)
+	for i := range total {
+		v := int16(8192)
+		if i >= cdFrame1 {
+			v = -16384
+		}
+		binary.LittleEndian.PutUint16(disc1PCM[i*4:], uint16(v))
+		binary.LittleEndian.PutUint16(disc1PCM[i*4+2:], uint16(v))
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Disc1.wav"), buildPCM16WAV(sr, 2, disc1PCM), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	disc1Cue := strings.Join([]string{
+		`PERFORMER "Glenn Gould"`,
+		`TITLE "Disc One"`,
+		`FILE "Disc1.wav" WAVE`,
+		`  TRACK 01 AUDIO`,
+		`    TITLE "Prelude One"`,
+		`    INDEX 01 00:00:00`,
+		`  TRACK 02 AUDIO`,
+		`    TITLE "Fugue One"`,
+		`    INDEX 01 00:00:01`,
+		"",
+	}, "\n")
+	disc1CuePath := filepath.Join(dir, "Disc1.cue")
+	if err := os.WriteFile(disc1CuePath, []byte(disc1Cue), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "Disc1.lrc"), []byte("[00:00.00]Disc one opening lyric\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sibling Disc2.cue + Disc2.wav in the SAME folder WITHOUT Disc2.lrc.
+	disc2PCM := make([]byte, sr*2*4)
+	if err := os.WriteFile(filepath.Join(dir, "Disc2.wav"), buildPCM16WAV(sr, 2, disc2PCM), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	disc2CuePath := filepath.Join(dir, "Disc2.cue")
+	if err := os.WriteFile(disc2CuePath, []byte("PERFORMER \"Glenn Gould\"\nTITLE \"Disc Two\"\nFILE \"Disc2.wav\" WAVE\n  TRACK 01 AUDIO\n    TITLE \"Sonata Two\"\n    INDEX 01 00:00:00\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	lib := NewLibrary(filepath.Join(root, "index.json"), filepath.Join(root, "covers"))
+	lib.AddFolder(dir)
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+
+	tr1 := lib.Tracks("Prelude One", "", "cue")[0]
+	tr2 := lib.Tracks("Fugue One", "", "cue")[0]
+	if !tr1.Spec.HasCueFrames || tr1.Spec.ClipEndFrames != 1 || !tr2.Spec.HasCueFrames || tr2.Spec.ClipStartFrames != 1 {
+		t.Fatalf("unexpected CUE frame specs: tr1=%+v tr2=%+v", tr1.Spec, tr2.Spec)
+	}
+	if tr1.CuePath != filepath.Clean(disc1CuePath) {
+		t.Fatalf("expected CuePath=%q, got %q", filepath.Clean(disc1CuePath), tr1.CuePath)
+	}
+
+	dec1, _, err := lib.OpenDecoder(tr1.ID)
+	if err != nil {
+		t.Fatalf("OpenDecoder tr1 failed: %v", err)
+	}
+	defer func() {
+		if c, ok := dec1.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}()
+	if dec1.Len() != cdFrame1 {
+		t.Fatalf("expected Track 1 exact 1-CD-frame length %d, got %d", cdFrame1, dec1.Len())
+	}
+
+	dec2, _, err := lib.OpenDecoder(tr2.ID)
+	if err != nil {
+		t.Fatalf("OpenDecoder tr2 failed: %v", err)
+	}
+	defer func() {
+		if c, ok := dec2.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}()
+	if dec2.Len() != total-cdFrame1 {
+		t.Fatalf("expected Track 2 exact length %d starting at sample 588, got %d", total-cdFrame1, dec2.Len())
+	}
+	firstPair := make([]float32, 2)
+	if n, err := dec2.Read(firstPair); err != nil || n != 2 {
+		t.Fatalf("Track 2 Read failed: n=%d err=%v", n, err)
+	}
+	if math.Abs(float64(firstPair[0])+0.5) > 1e-4 {
+		t.Fatalf("expected Track 2 sample 0 at exact frame 588 to be -0.50 (not pre-boundary +0.25), got %f", firstPair[0])
+	}
+
+	// Verify Disc1 track reads Disc1.lrc while Disc2 track in the same directory does NOT read Disc1.lrc.
+	lrc1, _ := lib.Lyrics(tr1.ID)
+	if !strings.Contains(lrc1, "Disc one opening lyric") {
+		t.Fatalf("expected Disc1 track to resolve Disc1.lrc, got %q", lrc1)
+	}
+	disc2Tr := lib.Tracks("Sonata Two", "", "cue")[0]
+	if disc2Tr.CuePath != filepath.Clean(disc2CuePath) {
+		t.Fatalf("expected Disc2 CuePath=%q, got %q", filepath.Clean(disc2CuePath), disc2Tr.CuePath)
+	}
+	lrc2, trans2 := lib.Lyrics(disc2Tr.ID)
+	if lrc2 != "" || trans2 != "" {
+		t.Fatalf("expected Disc2 track without Disc2.lrc to return empty lyrics instead of sibling Disc1.lrc, got (%q, %q)", lrc2, trans2)
+	}
+}
+
+// TestLibraryRevisionAndTrackByIDWithoutDecoder checks monotonic Revision increments across library mutations and verifies TrackByID returns cloned metadata for native HQPlayer formats (.wv) without opening a PCM decoder.
+func TestLibraryRevisionAndTrackByIDWithoutDecoder(t *testing.T) {
+	root := t.TempDir()
+	musicDir := filepath.Join(root, "wv")
+	if err := os.MkdirAll(musicDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wvCover := []byte{0x89, 'P', 'N', 'G', 'H', 'Q', 'P', 'W', 'V'}
+	wvPath := filepath.Join(musicDir, "01 - Goldberg.wv")
+	if err := os.WriteFile(wvPath, buildSyntheticWavPack(96000, 24, 2, 96000*60, "Aria", "Glenn Gould", "Goldberg Variations", wvCover), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	idxPath := filepath.Join(root, "index.json")
+	covDir := filepath.Join(root, "covers")
+	lib := NewLibrary(idxPath, covDir)
+	if rev := lib.Revision(); rev != 0 {
+		t.Fatalf("expected initial Revision 0, got %d", rev)
+	}
+
+	if !lib.AddFolder(musicDir) {
+		t.Fatal("expected AddFolder to return true")
+	}
+	revAfterAdd := lib.Revision()
+	if revAfterAdd <= 0 {
+		t.Fatalf("expected Revision > 0 after AddFolder, got %d", revAfterAdd)
+	}
+	// Duplicate AddFolder is a no-op and must not bump Revision.
+	if lib.AddFolder(musicDir) || lib.Revision() != revAfterAdd {
+		t.Fatalf("expected duplicate AddFolder not to bump Revision (got %d, want %d)", lib.Revision(), revAfterAdd)
+	}
+
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("Scan failed: %v", err)
+	}
+	revAfterScan := lib.Revision()
+	if revAfterScan <= revAfterAdd {
+		t.Fatalf("expected Scan to increment Revision (%d -> %d)", revAfterAdd, revAfterScan)
+	}
+
+	// TrackByID must succeed on .wv without opening a Go PCM decoder, and return an isolated clone.
+	all := lib.Tracks("", "", "")
+	if len(all) != 1 {
+		t.Fatalf("expected 1 WavPack track, got %d", len(all))
+	}
+	tr, ok := lib.TrackByID(all[0].ID)
+	if !ok || tr == nil {
+		t.Fatal("expected TrackByID to find WavPack track")
+	}
+	if !tr.NativeHQP() || tr.Spec.Codec != "WV" || tr.CoverID == "" {
+		t.Fatalf("unexpected WavPack TrackByID metadata: %+v", tr)
+	}
+	tr.Artists[0] = "Mutated Caller Copy"
+	trAgain, ok := lib.TrackByID(all[0].ID)
+	if !ok || trAgain.Artists[0] != "Glenn Gould" {
+		t.Fatalf("expected TrackByID to return a deep clone, got %+v", trAgain)
+	}
+
+	// ApplyRoonGenres bumps Revision only when matching at least one album.
+	if matched := lib.ApplyRoonGenres([]RoonAlbumGenre{{Album: "Unmatched", Artist: "Nobody", Genres: []string{"Pop"}}}); matched != 0 || lib.Revision() != revAfterScan {
+		t.Fatalf("expected unmatched ApplyRoonGenres not to bump Revision")
+	}
+	if matched := lib.ApplyRoonGenres([]RoonAlbumGenre{{Album: "Goldberg Variations", Artist: "Glenn Gould", Genres: []string{"Classical", "Baroque"}}}); matched != 1 {
+		t.Fatalf("expected ApplyRoonGenres to match 1 album, matched %d", matched)
+	}
+	revAfterRoon := lib.Revision()
+	if revAfterRoon <= revAfterScan {
+		t.Fatalf("expected matched ApplyRoonGenres to bump Revision (%d -> %d)", revAfterScan, revAfterRoon)
+	}
+
+	// Reloading into a fresh Library increments its Revision from 0 -> 1.
+	reloaded := NewLibrary(idxPath, covDir)
+	if err := reloaded.Load(); err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if reloaded.Revision() == 0 {
+		t.Fatal("expected Load on persisted index to increment Revision")
+	}
+
+	// RemoveFolder bumps Revision.
+	if !lib.RemoveFolder(musicDir) || lib.Revision() <= revAfterRoon {
+		t.Fatalf("expected RemoveFolder to bump Revision above %d, got %d", revAfterRoon, lib.Revision())
 	}
 }
 

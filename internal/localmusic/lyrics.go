@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 const maxCoverFileBytes = 32 << 20 // 32 MiB cap on external folder artwork
@@ -30,9 +31,19 @@ func saveCoverBytes(coverDir string, data []byte) (string, error) {
 	if err := os.MkdirAll(coverDir, 0o755); err != nil {
 		return "", err
 	}
-	tmp := dst + ".part"
-	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+	f, err := os.CreateTemp(coverDir, ".cover-*.tmp")
+	if err != nil {
 		return "", err
+	}
+	tmp := f.Name()
+	_, werr := f.Write(data)
+	cerr := f.Close()
+	if werr != nil || cerr != nil {
+		_ = os.Remove(tmp)
+		if werr != nil {
+			return "", werr
+		}
+		return "", cerr
 	}
 	if err := os.Rename(tmp, dst); err != nil {
 		// On Windows, another worker hashing the identical cover concurrently may win the rename.
@@ -50,17 +61,95 @@ func isDiscSubfolder(name string) bool {
 	return strings.HasPrefix(lower, "disc") || strings.HasPrefix(lower, "cd")
 }
 
-// findFolderCover searches dir (and parent dir when dir matches disc*/cd*) for
-// cover.*, folder.*, front.*, album.*, or <albumTitle>.* (.jpg/.jpeg/.png/.webp).
-func findFolderCover(dir, albumTitle, coverDir string, cache map[string]string) string {
-	if coverDir == "" || dir == "" {
-		return ""
+type sidecarCoverInfo struct {
+	path      string
+	size      int64
+	modTimeNs int64
+}
+
+func sameSidecarPath(a, b string) bool {
+	if a == "" || b == "" {
+		return a == b
+	}
+	return canonicalPathKey(a) == canonicalPathKey(b)
+}
+
+type dirCoverEntry struct {
+	name      string
+	size      int64
+	modTimeNs int64
+}
+
+type folderCoverResolver struct {
+	coverDir  string
+	mu        sync.Mutex
+	dirFiles  map[string][]dirCoverEntry
+	candCache map[string]sidecarCoverInfo
+	idCache   map[string]string
+}
+
+func newFolderCoverResolver(coverDir string) *folderCoverResolver {
+	return &folderCoverResolver{
+		coverDir:  coverDir,
+		dirFiles:  map[string][]dirCoverEntry{},
+		candCache: map[string]sidecarCoverInfo{},
+		idCache:   map[string]string{},
+	}
+}
+
+func (r *folderCoverResolver) listDirCoversLocked(dir string) []dirCoverEntry {
+	dk := canonicalPathKey(dir)
+	if cached, ok := r.dirFiles[dk]; ok {
+		return cached
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		r.dirFiles[dk] = nil
+		return nil
+	}
+	var out []dirCoverEntry
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(ent.Name()))
+		isImg := false
+		for _, ce := range coverExts {
+			if ext == ce {
+				isImg = true
+				break
+			}
+		}
+		if !isImg {
+			continue
+		}
+		info, err := ent.Info()
+		if err != nil || info.Size() <= 0 || info.Size() > maxCoverFileBytes {
+			continue
+		}
+		out = append(out, dirCoverEntry{
+			name:      ent.Name(),
+			size:      info.Size(),
+			modTimeNs: info.ModTime().UnixNano(),
+		})
+	}
+	r.dirFiles[dk] = out
+	return out
+}
+
+// candidate resolves the external cover image candidate (cover.*, folder.*,
+// front.*, album.*, or <albumTitle>.*) for dir (and parent dir when dir matches
+// disc*/cd*).
+func (r *folderCoverResolver) candidate(dir, albumTitle string) sidecarCoverInfo {
+	if r == nil || r.coverDir == "" || dir == "" {
+		return sidecarCoverInfo{}
 	}
 	cacheKey := canonicalPathKey(dir) + "|" + strings.ToLower(strings.TrimSpace(albumTitle))
-	if cache != nil {
-		if cid, ok := cache[cacheKey]; ok {
-			return cid
-		}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if cand, ok := r.candCache[cacheKey]; ok {
+		return cand
 	}
 
 	searchDirs := []string{dir}
@@ -77,49 +166,63 @@ func findFolderCover(dir, albumTitle, coverDir string, cache map[string]string) 
 		candidates = append(candidates, cleanAlb)
 	}
 
-	var foundID string
+	var found sidecarCoverInfo
 	for _, sdir := range searchDirs {
-		if id := findFolderCoverInDir(sdir, candidates, coverDir); id != "" {
-			foundID = id
-			break
+		files := r.listDirCoversLocked(sdir)
+		if len(files) == 0 {
+			continue
 		}
-	}
-	if cache != nil {
-		cache[cacheKey] = foundID
-	}
-	return foundID
-}
-
-func findFolderCoverInDir(dir string, baseNames []string, coverDir string) string {
-	entries, err := os.ReadDir(dir)
-	if err != nil {
-		return ""
-	}
-	for _, base := range baseNames {
-		for _, ext := range coverExts {
-			want := base + ext
-			for _, ent := range entries {
-				if ent.IsDir() {
-					continue
-				}
-				if !strings.EqualFold(ent.Name(), want) {
-					continue
-				}
-				info, err := ent.Info()
-				if err != nil || info.Size() <= 0 || info.Size() > maxCoverFileBytes {
-					continue
-				}
-				data, err := os.ReadFile(filepath.Join(dir, ent.Name()))
-				if err != nil || len(data) == 0 {
-					continue
-				}
-				if id, err := saveCoverBytes(coverDir, data); err == nil && id != "" {
-					return id
+		for _, base := range candidates {
+			for _, ext := range coverExts {
+				want := base + ext
+				for _, ent := range files {
+					if strings.EqualFold(ent.name, want) {
+						found = sidecarCoverInfo{
+							path:      filepath.Clean(filepath.Join(sdir, ent.name)),
+							size:      ent.size,
+							modTimeNs: ent.modTimeNs,
+						}
+						r.candCache[cacheKey] = found
+						return found
+					}
 				}
 			}
 		}
 	}
-	return ""
+	r.candCache[cacheKey] = found
+	return found
+}
+
+func (r *folderCoverResolver) ingest(cand sidecarCoverInfo) string {
+	if r == nil || r.coverDir == "" || cand.path == "" {
+		return ""
+	}
+	pk := canonicalPathKey(cand.path)
+	r.mu.Lock()
+	if id, ok := r.idCache[pk]; ok {
+		r.mu.Unlock()
+		return id
+	}
+	r.mu.Unlock()
+
+	data, err := os.ReadFile(cand.path)
+	var id string
+	if err == nil && len(data) > 0 && len(data) <= maxCoverFileBytes {
+		id, _ = saveCoverBytes(r.coverDir, data)
+	}
+
+	r.mu.Lock()
+	r.idCache[pk] = id
+	r.mu.Unlock()
+	return id
+}
+
+func (r *folderCoverResolver) resolveAndIngest(dir, albumTitle string) (string, sidecarCoverInfo) {
+	cand := r.candidate(dir, albumTitle)
+	if cand.path == "" {
+		return "", sidecarCoverInfo{}
+	}
+	return r.ingest(cand), cand
 }
 
 var (
@@ -174,12 +277,42 @@ func resolveTrackLyrics(tr *LocalTrack) (lrc, trans string) {
 		}
 
 		// 2. Whole-disc .lrc (<cueBase>.lrc or <audioBase>.lrc), shifted & clipped.
-		wholeDiscBases := findCueBasesInDir(dir)
-		if audioBase != "" && !containsFold(wholeDiscBases, audioBase) {
-			wholeDiscBases = append(wholeDiscBases, audioBase)
+		type lrcCandidate struct {
+			dir  string
+			base string
 		}
-		for _, b := range wholeDiscBases {
-			if raw, ok := readLRCByBase(dir, b); ok {
+		var wholeDiscCands []lrcCandidate
+		addCand := func(cdir, cbase string) {
+			if cdir == "" || cbase == "" {
+				return
+			}
+			for _, ex := range wholeDiscCands {
+				if canonicalPathKey(ex.dir) == canonicalPathKey(cdir) && strings.EqualFold(ex.base, cbase) {
+					return
+				}
+			}
+			wholeDiscCands = append(wholeDiscCands, lrcCandidate{dir: cdir, base: cbase})
+		}
+
+		if tr.CuePath != "" {
+			cueDir := filepath.Dir(tr.CuePath)
+			if cueDir == "" || cueDir == "." {
+				cueDir = dir
+			}
+			cueBase := strings.TrimSuffix(filepath.Base(tr.CuePath), filepath.Ext(tr.CuePath))
+			addCand(cueDir, cueBase)
+			if tr.Path != "" {
+				addCand(filepath.Dir(tr.Path), audioBase)
+			}
+			addCand(dir, audioBase)
+		} else {
+			for _, cb := range findCueBasesInDir(dir) {
+				addCand(dir, cb)
+			}
+			addCand(dir, audioBase)
+		}
+		for _, cand := range wholeDiscCands {
+			if raw, ok := readLRCByBase(cand.dir, cand.base); ok {
 				lrc, trans = processLRCText(raw, true, tr.Spec.ClipStartMs, tr.Spec.ClipEndMs)
 				if lrc != "" {
 					return lrc, trans

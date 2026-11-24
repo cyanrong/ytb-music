@@ -74,8 +74,8 @@ func OpenTrackDecoder(tr *LocalTrack) (audio.Decoder, error) {
 		return nil, err
 	}
 
-	if tr.Spec.IsCUE || tr.Spec.ClipStartMs > 0 || tr.Spec.ClipEndMs > 0 {
-		clipped, err := newClipDecoder(dec, tr.Spec.ClipStartMs, tr.Spec.ClipEndMs)
+	if tr.Spec.IsCUE || tr.Spec.HasCueFrames || tr.Spec.ClipStartMs > 0 || tr.Spec.ClipEndMs > 0 || tr.Spec.ClipStartFrames > 0 || tr.Spec.ClipEndFrames > 0 {
+		clipped, err := newClipDecoder(dec, tr.Spec)
 		if err != nil {
 			if c, ok := dec.(io.Closer); ok {
 				_ = c.Close()
@@ -144,7 +144,11 @@ func newAIFFDecoder(f *os.File) (*aiffDecoder, error) {
 	}
 
 	d := &aiffDecoder{f: f, enc: aiffPCMBE, length: -1}
-	var haveComm, haveSSND bool
+	var (
+		haveComm bool
+		haveSSND bool
+		ssndEnd  int64
+	)
 	off := int64(12)
 	for off+8 <= fileSize && (!haveComm || !haveSSND) {
 		var chdr [8]byte
@@ -152,11 +156,13 @@ func newAIFFDecoder(f *os.File) (*aiffDecoder, error) {
 			break
 		}
 		cid := string(chdr[0:4])
-		csize := int64(binary.BigEndian.Uint32(chdr[4:8]))
+		csizeU := uint64(binary.BigEndian.Uint32(chdr[4:8]))
 		off += 8
-		if csize < 0 || off+csize > fileSize {
-			csize = max(fileSize-off, 0)
+		rem := uint64(fileSize - off)
+		if csizeU > rem {
+			csizeU = rem
 		}
+		csize := int64(csizeU)
 
 		switch cid {
 		case "COMM":
@@ -170,7 +176,10 @@ func newAIFFDecoder(f *os.File) (*aiffDecoder, error) {
 			d.channels = int(int16(binary.BigEndian.Uint16(b[0:2])))
 			d.length = int64(binary.BigEndian.Uint32(b[2:6]))
 			d.sampleBits = int(int16(binary.BigEndian.Uint16(b[6:8])))
-			d.rate = int(math.Round(parseIEEE80(b[8:18])))
+			rateF := parseIEEE80(b[8:18])
+			if !math.IsNaN(rateF) && !math.IsInf(rateF, 0) && rateF >= 1 && rateF <= 45158400 {
+				d.rate = int(math.Round(rateF))
+			}
 			if ft == "AIFC" && len(b) >= 22 {
 				comp := string(b[18:22])
 				switch comp {
@@ -191,7 +200,7 @@ func newAIFFDecoder(f *os.File) (*aiffDecoder, error) {
 				}
 			}
 			d.sampleByte = (d.sampleBits + 7) / 8
-			if d.channels < 1 || d.rate < 1 || (d.sampleByte != 1 && d.sampleByte != 2 && d.sampleByte != 3 && d.sampleByte != 4 && d.sampleByte != 8) {
+			if d.channels < 1 || d.channels > 32 || d.rate < 1 || (d.sampleByte != 1 && d.sampleByte != 2 && d.sampleByte != 3 && d.sampleByte != 4 && d.sampleByte != 8) {
 				return nil, errors.New("localmusic: unsupported AIFF PCM parameters")
 			}
 			haveComm = true
@@ -206,16 +215,25 @@ func newAIFFDecoder(f *os.File) (*aiffDecoder, error) {
 			}
 			dataOffset := int64(binary.BigEndian.Uint32(shdr[0:4]))
 			d.start = off + 8 + dataOffset
+			ssndEnd = off + csize
 			haveSSND = true
 		}
 
-		off += csize + (csize & 1)
+		step := csizeU
+		if step&1 == 1 && step < rem {
+			step++
+		}
+		off += int64(step)
 	}
 
 	if !haveComm || !haveSSND {
 		return nil, errors.New("localmusic: incomplete AIFF chunks")
 	}
-	availFrames := max(fileSize-d.start, 0) / int64(d.frameBytes())
+	if d.start < 0 || d.start > fileSize {
+		return nil, errors.New("localmusic: invalid AIFF SSND offset")
+	}
+	availBytes := max(min(ssndEnd, fileSize)-d.start, 0)
+	availFrames := availBytes / int64(d.frameBytes())
 	if d.length < 0 || d.length > availFrames {
 		d.length = availFrames
 	}
@@ -369,10 +387,12 @@ type dsdPreviewDecoder struct {
 }
 
 func chooseDSDDecimation(dsdRate int) (decimBits, outRate int, err error) {
-	if dsdRate < 256 {
+	if dsdRate < 2822400 || dsdRate > 45158400 {
 		return 0, 0, errors.New("localmusic: invalid DSD sample rate")
 	}
 	switch {
+	case dsdRate >= 45158400:
+		decimBits = 512
 	case dsdRate >= 22579200:
 		decimBits = 256
 	case dsdRate >= 11289600:
@@ -381,6 +401,9 @@ func chooseDSDDecimation(dsdRate int) (decimBits, outRate int, err error) {
 		decimBits = 64
 	default:
 		decimBits = 32
+	}
+	if dsdRate%decimBits != 0 {
+		return 0, 0, errors.New("localmusic: invalid DSD sample rate")
 	}
 	outRate = dsdRate / decimBits
 	if outRate <= 0 {
@@ -395,58 +418,88 @@ func newDSFDecoder(f *os.File) (*dsdPreviewDecoder, error) {
 		return nil, err
 	}
 	fileSize := st.Size()
+	if fileSize < 28+52+12 {
+		return nil, errors.New("localmusic: invalid DSF header")
+	}
 
 	var dsdHdr [28]byte
 	if _, err := f.ReadAt(dsdHdr[:], 0); err != nil || string(dsdHdr[0:4]) != "DSD " {
 		return nil, errors.New("localmusic: invalid DSF header")
 	}
-	dsdChunkSize := int64(binary.LittleEndian.Uint64(dsdHdr[4:12]))
-	if dsdChunkSize < 28 {
-		dsdChunkSize = 28
+	dsdChunkU := binary.LittleEndian.Uint64(dsdHdr[4:12])
+	if dsdChunkU < 28 || dsdChunkU > uint64(fileSize) {
+		return nil, errors.New("localmusic: invalid DSF header")
+	}
+	dsdChunkSize := int64(dsdChunkU)
+	if fileSize-dsdChunkSize < 52 {
+		return nil, errors.New("localmusic: invalid DSF fmt chunk")
 	}
 
 	var fmtHdr [52]byte
 	if _, err := f.ReadAt(fmtHdr[:], dsdChunkSize); err != nil || string(fmtHdr[0:4]) != "fmt " {
 		return nil, errors.New("localmusic: invalid DSF fmt chunk")
 	}
-	fmtChunkSize := int64(binary.LittleEndian.Uint64(fmtHdr[4:12]))
-	if fmtChunkSize < 52 {
-		fmtChunkSize = 52
+	fmtChunkU := binary.LittleEndian.Uint64(fmtHdr[4:12])
+	if fmtChunkU < 52 || fmtChunkU > uint64(fileSize-dsdChunkSize) {
+		return nil, errors.New("localmusic: invalid DSF fmt chunk")
 	}
-	channels := int(binary.LittleEndian.Uint32(fmtHdr[24:28]))
-	dsdRate := int(binary.LittleEndian.Uint32(fmtHdr[28:32]))
+	fmtChunkSize := int64(fmtChunkU)
+
+	channelsU := binary.LittleEndian.Uint32(fmtHdr[24:28])
+	dsdRateU := binary.LittleEndian.Uint32(fmtHdr[28:32])
 	sampleCount := binary.LittleEndian.Uint64(fmtHdr[36:44])
-	blockSize := int(binary.LittleEndian.Uint32(fmtHdr[44:48]))
-	if blockSize <= 0 {
-		blockSize = 4096
-	}
-	if channels < 1 || channels > 8 {
+	blockSizeU := binary.LittleEndian.Uint32(fmtHdr[44:48])
+
+	if channelsU < 1 || channelsU > 8 {
 		return nil, errors.New("localmusic: invalid DSF channel count")
 	}
+	if dsdRateU < 2822400 || dsdRateU > 45158400 {
+		return nil, errors.New("localmusic: invalid DSD sample rate")
+	}
+	channels := int(channelsU)
+	dsdRate := int(dsdRateU)
 	decimBits, outRate, err := chooseDSDDecimation(dsdRate)
 	if err != nil {
 		return nil, err
 	}
 	bytesPerStep := decimBits / 8
+	if blockSizeU < 1 || blockSizeU > 65536 {
+		return nil, errors.New("localmusic: incompatible DSF block size")
+	}
+	blockSize := int(blockSizeU)
 	if blockSize < bytesPerStep || blockSize%bytesPerStep != 0 {
 		return nil, errors.New("localmusic: incompatible DSF block size")
 	}
 
 	dataHdrOff := dsdChunkSize + fmtChunkSize
+	if fileSize-dataHdrOff < 12 {
+		return nil, errors.New("localmusic: DSF missing data chunk")
+	}
 	var dataHdr [12]byte
 	if _, err := f.ReadAt(dataHdr[:], dataHdrOff); err != nil || string(dataHdr[0:4]) != "data" {
 		return nil, errors.New("localmusic: DSF missing data chunk")
 	}
-	dataChunkSize := int64(binary.LittleEndian.Uint64(dataHdr[4:12]))
-	dataStart := dataHdrOff + 12
-	dataBytes := max(min(dataChunkSize-12, fileSize-dataStart), 0)
+	dataChunkU := binary.LittleEndian.Uint64(dataHdr[4:12])
+	if dataChunkU < 12 {
+		return nil, errors.New("localmusic: invalid DSF data chunk")
+	}
+	dataPayloadBytes := dataChunkU - 12
+	dataOffset := dataHdrOff + 12
+	fileRem := uint64(fileSize - dataOffset)
+	availU := min(dataPayloadBytes, fileRem)
+	avail := int64(availU)
+	groupBytes := int64(channels * blockSize)
+	if avail < groupBytes {
+		return nil, errors.New("localmusic: truncated DSF audio payload")
+	}
 
-	var totalFrames int64
-	if sampleCount > 0 {
-		totalFrames = int64(sampleCount / uint64(decimBits))
-	} else {
-		totalBlocks := dataBytes / int64(blockSize*channels)
-		totalFrames = totalBlocks * int64(blockSize/bytesPerStep)
+	maxSamples := uint64(avail/groupBytes) * uint64(blockSize) * 8
+	if sampleCount == 0 || sampleCount > maxSamples {
+		sampleCount = maxSamples
+	}
+	totalFrames := int64(sampleCount / uint64(decimBits))
+	if totalFrames <= 0 {
+		return nil, errors.New("localmusic: empty DSF audio payload")
 	}
 
 	d := &dsdPreviewDecoder{
@@ -457,11 +510,11 @@ func newDSFDecoder(f *os.File) (*dsdPreviewDecoder, error) {
 		outRate:        outRate,
 		decimBits:      decimBits,
 		bytesPerStep:   bytesPerStep,
-		dataStart:      dataStart,
-		dataBytes:      dataBytes,
+		dataStart:      dataOffset,
+		dataBytes:      avail,
 		blockSizePerCh: blockSize,
 		curBlockIdx:    -1,
-		blockBuf:       make([]byte, blockSize*channels),
+		blockBuf:       make([]byte, channels*blockSize),
 		totalFrames:    totalFrames,
 	}
 	return d, nil
@@ -492,11 +545,13 @@ func newDFFDecoder(f *os.File) (*dsdPreviewDecoder, error) {
 			break
 		}
 		cid := string(chdr[0:4])
-		csize := int64(binary.BigEndian.Uint64(chdr[4:12]))
+		csizeU := binary.BigEndian.Uint64(chdr[4:12])
 		off += 12
-		if csize < 0 || off+csize > fileSize {
-			csize = max(fileSize-off, 0)
+		rem := uint64(fileSize - off)
+		if csizeU > rem {
+			csizeU = rem
 		}
+		csize := int64(csizeU)
 		switch cid {
 		case "PROP":
 			if csize >= 4 && csize <= maxMetaChunkBytes {
@@ -510,7 +565,11 @@ func newDFFDecoder(f *os.File) (*dsdPreviewDecoder, error) {
 			dataStart = off
 			dataBytes = csize
 		}
-		off += csize + (csize & 1)
+		step := csizeU
+		if step&1 == 1 && step < rem {
+			step++
+		}
+		off += int64(step)
 	}
 	if compType != "" && compType != "DSD " {
 		return nil, errors.New("localmusic: compressed DST DSDIFF is not supported for local preview")
@@ -523,7 +582,11 @@ func newDFFDecoder(f *os.File) (*dsdPreviewDecoder, error) {
 		return nil, err
 	}
 	bytesPerStep := decimBits / 8
+	dataBytes = min(dataBytes, max(fileSize-dataStart, 0))
 	totalFrames := dataBytes / int64(meta.spec.Channels*bytesPerStep)
+	if totalFrames <= 0 {
+		return nil, errors.New("localmusic: truncated DSDIFF audio payload")
+	}
 	if _, err := f.Seek(dataStart, io.SeekStart); err != nil {
 		return nil, err
 	}
@@ -547,15 +610,20 @@ func findDFFCompression(b []byte) string {
 	pos := 0
 	for pos+12 <= len(b) {
 		id := string(b[pos : pos+4])
-		sz := int(binary.BigEndian.Uint64(b[pos+4 : pos+12]))
+		sz := binary.BigEndian.Uint64(b[pos+4 : pos+12])
 		pos += 12
-		if sz < 0 || pos+sz > len(b) {
+		rem := uint64(len(b) - pos)
+		if sz > rem {
 			break
 		}
 		if id == "CMPR" && sz >= 4 {
 			return string(b[pos : pos+4])
 		}
-		pos += sz + (sz & 1)
+		step := sz
+		if step&1 == 1 && step < rem {
+			step++
+		}
+		pos += int(step)
 	}
 	return "DSD "
 }
@@ -707,20 +775,37 @@ type clipDecoder struct {
 	pos        int64 // relative to startFrame
 }
 
-func newClipDecoder(dec audio.Decoder, clipStartMs, clipEndMs int64) (*clipDecoder, error) {
+func newClipDecoder(dec audio.Decoder, spec AudioSpec) (*clipDecoder, error) {
 	sr := dec.SampleRate()
 	if sr <= 0 {
 		return nil, errors.New("localmusic: decoder has invalid sample rate")
 	}
 	total := dec.Len()
-	startFrame := max(clipStartMs*int64(sr)/1000, 0)
+	var startFrame int64
+	if spec.HasCueFrames {
+		startFrame = max((spec.ClipStartFrames*int64(sr))/75, 0)
+	} else {
+		startFrame = max((spec.ClipStartMs*int64(sr))/1000, 0)
+	}
 	if total >= 0 && startFrame > total {
 		startFrame = total
 	}
 
 	endFrame := int64(-1)
-	if clipEndMs > 0 {
-		endFrame = clipEndMs * int64(sr) / 1000
+	if spec.HasCueFrames {
+		if spec.ClipEndFrames > 0 {
+			endFrame = (spec.ClipEndFrames * int64(sr)) / 75
+			if total >= 0 && endFrame > total {
+				endFrame = total
+			}
+			if endFrame < startFrame {
+				endFrame = startFrame
+			}
+		} else if total >= 0 {
+			endFrame = total
+		}
+	} else if spec.ClipEndMs > 0 {
+		endFrame = (spec.ClipEndMs * int64(sr)) / 1000
 		if total >= 0 && endFrame > total {
 			endFrame = total
 		}

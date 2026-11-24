@@ -49,17 +49,20 @@ func CoverURL(coverID string) string {
 // AudioSpec describes the codec, resolution, bitrate and CUE slice bounds of a
 // local track or album.
 type AudioSpec struct {
-	Codec       string `json:"codec"`
-	SampleRate  int    `json:"sampleRate"`
-	BitDepth    int    `json:"bitDepth"`
-	Channels    int    `json:"channels"`
-	BitrateKbps int    `json:"bitrateKbps"`
-	IsLossless  bool   `json:"isLossless"`
-	IsHiRes     bool   `json:"isHiRes"`
-	IsDSD       bool   `json:"isDsd"`
-	IsCUE       bool   `json:"isCue,omitempty"`
-	ClipStartMs int64  `json:"clipStartMs,omitempty"`
-	ClipEndMs   int64  `json:"clipEndMs,omitempty"`
+	Codec           string `json:"codec"`
+	SampleRate      int    `json:"sampleRate"`
+	BitDepth        int    `json:"bitDepth"`
+	Channels        int    `json:"channels"`
+	BitrateKbps     int    `json:"bitrateKbps"`
+	IsLossless      bool   `json:"isLossless"`
+	IsHiRes         bool   `json:"isHiRes"`
+	IsDSD           bool   `json:"isDsd"`
+	IsCUE           bool   `json:"isCue,omitempty"`
+	ClipStartMs     int64  `json:"clipStartMs,omitempty"`
+	ClipEndMs       int64  `json:"clipEndMs,omitempty"`
+	ClipStartFrames int64  `json:"clipStartFrames,omitempty"`
+	ClipEndFrames   int64  `json:"clipEndFrames,omitempty"`
+	HasCueFrames    bool   `json:"hasCueFrames,omitempty"`
 }
 
 func (s *AudioSpec) computeFlags() {
@@ -171,6 +174,8 @@ func (s AudioSpec) Detail() string {
 
 func dsdCodecName(sampleRate int) string {
 	switch {
+	case sampleRate >= 45158400:
+		return "DSD1024"
 	case sampleRate >= 22579200:
 		return "DSD512"
 	case sampleRate >= 11289600:
@@ -202,6 +207,7 @@ type LocalTrack struct {
 	ID             string    `json:"id"`
 	Path           string    `json:"path"`
 	Dir            string    `json:"dir"`
+	CuePath        string    `json:"cuePath,omitempty"`
 	Title          string    `json:"title"`
 	Artists        []string  `json:"artists,omitempty"`
 	Album          string    `json:"album,omitempty"`
@@ -280,7 +286,7 @@ func (t *LocalTrack) ToYTMStream() *ytm.Stream {
 // NativeHQP reports whether HQPlayer can play this file directly by URI
 // without PCM transcoding or CUE slicing.
 func (t *LocalTrack) NativeHQP() bool {
-	if t == nil || t.Spec.IsCUE || t.Spec.ClipStartMs != 0 || t.Spec.ClipEndMs != 0 {
+	if t == nil || t.Spec.IsCUE || t.Spec.HasCueFrames || t.Spec.ClipStartMs != 0 || t.Spec.ClipEndMs != 0 || t.Spec.ClipStartFrames != 0 || t.Spec.ClipEndFrames != 0 {
 		return false
 	}
 	switch strings.ToLower(filepath.Ext(t.Path)) {
