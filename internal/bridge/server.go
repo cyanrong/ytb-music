@@ -87,9 +87,28 @@ func NewServer(listenAddr string) (*Server, error) {
 	return s, nil
 }
 
+func isWildcardIP(host string) bool {
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsUnspecified()
+}
+
+func hostsOverlap(h1, h2 string) bool {
+	if isWildcardIP(h1) || isWildcardIP(h2) || strings.EqualFold(h1, h2) {
+		return true
+	}
+	ip1, ip2 := net.ParseIP(h1), net.ParseIP(h2)
+	if ip1 != nil && ip2 != nil {
+		return ip1.Equal(ip2)
+	}
+	return false
+}
+
 // Rebind restarts the HTTP listener on a new host:port if changed, handling
-// overlapping same-port loopback <-> wildcard transitions and restoring the
-// previous listener if binding the replacement fails.
+// overlapping same-port loopback <-> wildcard transitions and preserving active
+// streams when a non-overlapping rebind fails.
 func (s *Server) Rebind(listenAddr string) error {
 	listenAddr = strings.TrimSpace(listenAddr)
 	if listenAddr == "" {
@@ -102,7 +121,6 @@ func (s *Server) Rebind(listenAddr string) error {
 	if _, err := net.ResolveTCPAddr("tcp", listenAddr); err != nil {
 		return fmt.Errorf("无效的桥接监听地址 %q: %w", listenAddr, err)
 	}
-	_ = newHost
 
 	s.mu.Lock()
 	if s.ln != nil && s.listenAddr == listenAddr {
@@ -112,8 +130,8 @@ func (s *Server) Rebind(listenAddr string) error {
 	oldAddr := s.listenAddr
 	oldSrv := s.httpSrv
 	oldLn := s.ln
-	_, oldPort, _ := net.SplitHostPort(oldAddr)
-	overlapSamePort := oldLn != nil && newPort != "0" && oldPort == newPort
+	oldHost, oldPort, _ := net.SplitHostPort(oldAddr)
+	overlapSamePort := oldLn != nil && newPort != "0" && oldPort == newPort && hostsOverlap(oldHost, newHost)
 	if overlapSamePort {
 		s.httpSrv = nil
 		s.ln = nil
@@ -121,10 +139,11 @@ func (s *Server) Rebind(listenAddr string) error {
 	s.mu.Unlock()
 
 	if overlapSamePort {
+		if oldLn != nil {
+			_ = oldLn.Close()
+		}
 		if oldSrv != nil {
 			_ = oldSrv.Close()
-		} else if oldLn != nil {
-			_ = oldLn.Close()
 		}
 	}
 
@@ -139,10 +158,11 @@ func (s *Server) Rebind(listenAddr string) error {
 	}
 
 	if !overlapSamePort {
-		if oldSrv != nil {
-			_ = oldSrv.Close()
-		} else if oldLn != nil {
+		if oldLn != nil {
 			_ = oldLn.Close()
+		}
+		if oldSrv != nil {
+			go func() { _ = oldSrv.Close() }()
 		}
 	}
 	s.installListener(ln)
@@ -174,16 +194,28 @@ func (s *Server) installListener(ln net.Listener) {
 	}()
 }
 
-func (s *Server) Close() error {
+// ReleasePort synchronously closes the listening TCP socket so the port can be
+// rebound immediately, while active HTTP handlers finish shutting down in Close.
+func (s *Server) ReleasePort() {
 	select {
 	case <-s.stopClock:
 	default:
 		close(s.stopClock)
 	}
 	s.mu.Lock()
+	ln := s.ln
+	s.ln = nil
+	s.mu.Unlock()
+	if ln != nil {
+		_ = ln.Close()
+	}
+}
+
+func (s *Server) Close() error {
+	s.ReleasePort()
+	s.mu.Lock()
 	srv := s.httpSrv
 	s.httpSrv = nil
-	s.ln = nil
 	s.mu.Unlock()
 	if srv != nil {
 		return srv.Close()
@@ -696,9 +728,11 @@ func (s *Server) runRoonClock() {
 
 			var aacFrames [][]byte
 			aacRate := roonTargetRate
+			silentFrame := silentADTSFrame44kStereo
 			if rs != nil {
-				if sr := rs.aacSampleRate(); sr > 0 {
+				if sr, sf := rs.aacFormat(); sr > 0 {
 					aacRate = sr
+					silentFrame = sf
 				}
 			}
 			frameDurNs := int64(1024*1e9) / int64(aacRate)
@@ -707,15 +741,21 @@ func (s *Server) runRoonClock() {
 				if rs != nil && hasAAC {
 					if pkt := rs.pullADTS(!hasWAV); len(pkt) > 0 {
 						aacFrames = append(aacFrames, pkt)
-						if sr := rs.aacSampleRate(); sr > 0 && sr != aacRate {
+						if sr, sf := rs.aacFormat(); sr > 0 && sr != aacRate {
 							aacRate = sr
+							silentFrame = sf
 							frameDurNs = int64(1024*1e9) / int64(aacRate)
 						}
 						continue
 					}
+					if sr, sf := rs.aacFormat(); sr > 0 {
+						aacRate = sr
+						silentFrame = sf
+						frameDurNs = int64(1024*1e9) / int64(aacRate)
+					}
 				}
 				if hasAAC {
-					aacFrames = append(aacFrames, silentADTSFrame44kStereo)
+					aacFrames = append(aacFrames, silentFrame)
 				}
 			}
 

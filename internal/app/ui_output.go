@@ -30,7 +30,8 @@ type roonTokenStore struct {
 }
 
 type audioChainState struct {
-	open bool
+	open        bool
+	desiredMode string // tracks intended mode when bridge port binding failed so Settings shows the port editor
 
 	srv       *bridge.Server
 	hqp       *bridge.HQPlayerBackend
@@ -102,7 +103,7 @@ func (a *app) stopUnusedServices(keepMode string) {
 	if keepMode != outputHQPlayer && a.audio.hqp != nil {
 		hqp := a.audio.hqp
 		a.audio.hqp = nil
-		hqp.DisconnectAsync(false)
+		hqp.Shutdown(false)
 	}
 	if keepMode != outputRoon && a.audio.roonMgr != nil {
 		mgr := a.audio.roonMgr
@@ -113,6 +114,9 @@ func (a *app) stopUnusedServices(keepMode string) {
 	if keepMode == outputLocal && a.audio.srv != nil {
 		srv := a.audio.srv
 		a.audio.srv = nil
+		// Release the listening TCP port synchronously before returning so immediate
+		// subsequent mode switches never race with our own previous listener.
+		srv.ReleasePort()
 		go func() { _ = srv.Close() }()
 	}
 }
@@ -242,13 +246,21 @@ func (a *app) selectRoonZone(id, name string) {
 
 func (a *app) setOutputMode(mode string) {
 	mode = normalizeOutputMode(mode)
-	if a.settings.OutputMode == mode && ((mode == outputLocal && a.pl.Backend() == nil) || (mode != outputLocal && a.pl.Backend() != nil && a.pl.Backend().Name() == mode)) {
+	a.audio.desiredMode = mode
+	if a.settings.OutputMode == mode && a.audio.bridgeErr == "" && ((mode == outputLocal && a.pl.Backend() == nil) || (mode != outputLocal && a.pl.Backend() != nil && a.pl.Backend().Name() == mode)) {
 		return
 	}
 	if err := a.applyOutputMode(mode); err != nil {
+		// Keep active & persisted mode aligned with actual local playback while
+		// desiredMode keeps the port editor visible in Settings for recovery.
+		a.pl.SetBackend(nil)
+		a.stopUnusedServices(outputLocal)
+		a.settings.OutputMode = outputLocal
 		a.toast = err.Error()
+		a.changed()
 		return
 	}
+	a.audio.bridgeErr = ""
 	a.settings.OutputMode = mode
 	a.changed()
 }
@@ -295,11 +307,10 @@ func (a *app) applyHQPlayerAddr() {
 		a.audio.hqp = nil
 		if a.settings.OutputMode == outputHQPlayer {
 			if newHQP, err := a.ensureHQPlayerBackend(); err == nil {
-				// Reopen any active track on the new HQPlayer endpoint before stopping the old one.
 				a.pl.SetBackend(newHQP)
 			}
 		}
-		oldHQP.DisconnectAsync(true)
+		oldHQP.Shutdown(true)
 	}
 	a.changed()
 	a.testHQPlayerConn()
@@ -320,6 +331,11 @@ func (a *app) applyBridgeListen() {
 	a.audio.bridgeErr = ""
 	a.audio.listenInput = addr
 	a.settings.BridgeListen = addr
+	if a.settings.OutputMode == outputLocal && a.audio.desiredMode != "" && a.audio.desiredMode != outputLocal {
+		// Automatically retry the external mode that previously failed on a port conflict.
+		a.setOutputMode(a.audio.desiredMode)
+		return
+	}
 	a.changed()
 	a.toast = "已更新音频桥接监听地址：" + addr
 }
@@ -606,7 +622,7 @@ func (a *app) audioChainSettings(c *ui.Context, group func(string, func()), row 
 			})
 		}
 
-		if modes[modeIdx] != outputLocal {
+		if modes[modeIdx] != outputLocal || a.audio.bridgeErr != "" {
 			ui.Column(c.Key("bridge-listen-row")).Padding(12, 16).Gap(6).Children(func() {
 				ui.Text(c, "本地 HTTP 音频桥接监听地址（Roon / HQPlayer 在同机保持 127.0.0.1:17890；跨局域网主机可改为 0.0.0.0:17890）").
 					FontSize(11.5).TextColor(p.muted).LineHeight(1.4)

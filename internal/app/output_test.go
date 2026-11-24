@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"image/png"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -49,6 +50,10 @@ func TestPlayerBarOutputPopoverSwitchesBackends(t *testing.T) {
 	if a.settings.OutputMode != outputRoon || a.pl.Backend() == nil || a.pl.Backend().Name() != "roon" {
 		t.Fatalf("mode=%q backend=%v, want roon", a.settings.OutputMode, a.pl.Backend())
 	}
+	boundAddr := a.audio.srv.Addr()
+	if boundAddr == "" {
+		t.Fatal("bridge server did not report a bound address")
+	}
 
 	if err := tt.Click("本机输出"); err != nil {
 		t.Fatal(err)
@@ -57,9 +62,12 @@ func TestPlayerBarOutputPopoverSwitchesBackends(t *testing.T) {
 	if a.settings.OutputMode != outputLocal || a.pl.Backend() != nil {
 		t.Fatalf("mode=%q backend=%v, want local nil backend", a.settings.OutputMode, a.pl.Backend())
 	}
-	if a.audio.srv != nil || a.audio.roonMgr != nil || a.audio.hqp != nil {
-		t.Fatalf("switching back to local left external services running: srv=%v roon=%v hqp=%v", a.audio.srv, a.audio.roonMgr, a.audio.hqp)
+	// Verify the bridge listening port was synchronously released when returning to local output.
+	ln, err := net.Listen("tcp", boundAddr)
+	if err != nil {
+		t.Fatalf("bridge port %s remained occupied after switching to local output: %v", boundAddr, err)
 	}
+	_ = ln.Close()
 }
 
 // Probing HQPlayer and copying the Roon Live Radio stream URL in Settings update status and clipboard off the UI thread.

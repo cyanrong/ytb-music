@@ -253,6 +253,12 @@ func (a *app) deleteChosen() {
 	if i < 0 || a.mine[i].SpecialType == 5 {
 		return
 	}
+	if isLocalPlaylist(id) {
+		if err := a.deleteLocalPlaylist(id); err != nil {
+			a.toast = "删除失败，请检查磁盘权限"
+			return
+		}
+	}
 	pl := a.mine[i]
 	a.mine = slices.Delete(slices.Clone(a.mine), i, i+1)
 	// Leave no way back to its page, and leave it for the page before.
@@ -267,11 +273,6 @@ func (a *app) deleteChosen() {
 		a.show(r)
 	}
 	if isLocalPlaylist(id) {
-		if err := a.deleteLocalPlaylist(id); err != nil {
-			a.mine = slices.Insert(a.mine, min(i, len(a.mine)), pl)
-			a.toast = "删除失败，请检查磁盘权限"
-			return
-		}
 		a.toast = "已删除歌单"
 		return
 	}

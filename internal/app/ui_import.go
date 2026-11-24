@@ -114,15 +114,24 @@ func (a *app) resolveImportCookie() (string, error) {
 	}
 	if d.rememberCookie && clean != "" {
 		sealed, serr := sealSecret(clean)
-		if serr == nil && a.settings.NetEaseMusicU != sealed {
-			a.settings.NetEaseMusicU = sealed
-			_ = a.settings.save()
+		if serr != nil {
+			return "", fmt.Errorf("无法安全加密 Cookie: %w", serr)
+		}
+		prev := a.settings.NetEaseMusicU
+		a.settings.NetEaseMusicU = sealed
+		if saveErr := a.settings.save(); saveErr != nil {
+			a.settings.NetEaseMusicU = prev
+			return "", fmt.Errorf("无法保存 Cookie: %w", saveErr)
 		}
 		d.musicUInput = maskedCookiePlaceholder
 		d.musicUMasked = true
 	} else if !d.rememberCookie && a.settings.NetEaseMusicU != "" {
+		prev := a.settings.NetEaseMusicU
 		a.settings.NetEaseMusicU = ""
-		_ = a.settings.save()
+		if saveErr := a.settings.save(); saveErr != nil {
+			a.settings.NetEaseMusicU = prev
+			return "", fmt.Errorf("无法清除已存 Cookie: %w", saveErr)
+		}
 	}
 	return clean, nil
 }
@@ -148,7 +157,11 @@ func (a *app) startImport() {
 
 	musicU, err := a.resolveImportCookie()
 	if err != nil {
-		d.err = "MUSIC_U Cookie 格式不正确，请检查是否包含非法字符"
+		if strings.Contains(err.Error(), "Cookie:") {
+			d.err = err.Error()
+		} else {
+			d.err = "MUSIC_U Cookie 格式不正确，请检查是否包含非法字符"
+		}
 		return
 	}
 	customName := strings.TrimSpace(d.customName)

@@ -225,12 +225,14 @@ func TestImportNetEaseToCloudPlaylistBatches(t *testing.T) {
 	}
 }
 
-// A NetEase fetch failure clears busy state and surfaces the error message in the dialog instead of hanging on deferred context cancellation.
+// A NetEase fetch failure clears busy state and surfaces the error message even after the worker's deferred context cancel runs.
 func TestImportNetEaseFailureClearsBusy(t *testing.T) {
 	realFetch := fetchNetEasePlaylist
 	defer func() { fetchNetEasePlaylist = realFetch }()
 
-	fetchNetEasePlaylist = func(_ context.Context, _, _ string) (*netease.Playlist, error) {
+	ctxCaptured := make(chan context.Context, 1)
+	fetchNetEasePlaylist = func(ctx context.Context, _, _ string) (*netease.Playlist, error) {
+		ctxCaptured <- ctx
 		return nil, netease.ErrNeedMusicU
 	}
 
@@ -251,6 +253,19 @@ func TestImportNetEaseFailureClearsBusy(t *testing.T) {
 	tt.Frame()
 	if err := tt.Click("开始导入"); err != nil {
 		t.Fatal(err)
+	}
+
+	// Wait until the worker's deferred cancel() has actually cancelled fetchCtx BEFORE running the queued UI callback.
+	var workerCtx context.Context
+	select {
+	case workerCtx = <-ctxCaptured:
+	case <-time.After(2 * time.Second):
+		t.Fatal("fetchNetEasePlaylist was not called")
+	}
+	select {
+	case <-workerCtx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not cancel its context on exit")
 	}
 	drainPosts(t, posts, func() bool { return !a.imp.busy })
 	tt.Frame()

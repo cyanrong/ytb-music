@@ -98,11 +98,13 @@ type hqpConn struct {
 // HQPlayer Desktop / Embedded via its TCP 4321 XML control protocol.
 type HQPlayerBackend struct {
 	srv *Server
+	now func() time.Time
 
 	cfgMu   sync.RWMutex
 	addr    string
 	onState func(connected bool, detail string)
 
+	retired atomic.Bool
 	cmdMu   sync.Mutex
 	connPtr atomic.Pointer[hqpConn]
 
@@ -114,9 +116,17 @@ type HQPlayerBackend struct {
 func NewHQPlayerBackend(srv *Server, addr string, onState func(bool, string)) *HQPlayerBackend {
 	return &HQPlayerBackend{
 		srv:     srv,
+		now:     time.Now,
 		addr:    normalizeHostPort(addr, DefaultHQPlayerAddr),
 		onState: onState,
 	}
+}
+
+func (b *HQPlayerBackend) nowTime() time.Time {
+	if b.now != nil {
+		return b.now()
+	}
+	return time.Now()
 }
 
 func (b *HQPlayerBackend) Name() string { return "hqplayer" }
@@ -138,6 +148,14 @@ func (b *HQPlayerBackend) SetAddr(addr string) {
 	}
 }
 
+// Shutdown permanently retires this backend instance so no queued sink command
+// can dial a new connection, optionally sending <Stop/> on the existing socket.
+func (b *HQPlayerBackend) Shutdown(sendStop bool) {
+	b.retired.Store(true)
+	b.epoch.Add(1)
+	b.DisconnectAsync(sendStop)
+}
+
 // Disconnect closes any active TCP control socket immediately without waiting
 // on cmdMu so callers never block behind an in-flight <PlaylistAdd>.
 func (b *HQPlayerBackend) Disconnect() {
@@ -149,7 +167,7 @@ func (b *HQPlayerBackend) Disconnect() {
 	b.emitState(false, "未连接")
 }
 
-// DisconnectAsync stops playback if requested and tears down the control socket off the UI thread.
+// DisconnectAsync stops playback if requested on the existing socket and tears it down off the UI thread.
 func (b *HQPlayerBackend) DisconnectAsync(sendStop bool) {
 	hc := b.connPtr.Swap(nil)
 	if hc == nil {
@@ -157,8 +175,12 @@ func (b *HQPlayerBackend) DisconnectAsync(sendStop bool) {
 	}
 	go func() {
 		if sendStop && !hc.closed.Load() {
-			_ = hc.conn.SetWriteDeadline(time.Now().Add(800 * time.Millisecond))
-			_, _ = hc.conn.Write([]byte(xmlDecl + `<Stop/>`))
+			b.cmdMu.Lock()
+			if !hc.closed.Load() {
+				_ = hc.conn.SetWriteDeadline(time.Now().Add(800 * time.Millisecond))
+				_, _ = hc.conn.Write([]byte(xmlDecl + `<Stop/>`))
+			}
+			b.cmdMu.Unlock()
 		}
 		hc.closed.Store(true)
 		_ = hc.conn.Close()
@@ -178,6 +200,9 @@ func (b *HQPlayerBackend) emitState(ok bool, detail string) {
 // ensureConnLocked establishes and initializes the persistent TCP 4321 session.
 // Caller must hold b.cmdMu.
 func (b *HQPlayerBackend) ensureConnLocked(ctx context.Context) (*hqpConn, error) {
+	if b.retired.Load() {
+		return nil, errors.New("hqplayer: backend retired")
+	}
 	if cur := b.connPtr.Load(); cur != nil && !cur.closed.Load() {
 		return cur, nil
 	}
@@ -337,18 +362,21 @@ func (b *HQPlayerBackend) sendLocked(ctx context.Context, hc *hqpConn, expectTag
 	}
 }
 
-func (b *HQPlayerBackend) execWithReconnect(ctx context.Context, expectTag, xmlBody string, timeout time.Duration) (xmlReply, error) {
+func (b *HQPlayerBackend) execForEpoch(ctx context.Context, epoch uint64, expectTag, xmlBody string, timeout time.Duration) (xmlReply, error) {
 	b.cmdMu.Lock()
 	defer b.cmdMu.Unlock()
 	if ctx.Err() != nil {
 		return xmlReply{}, ctx.Err()
+	}
+	if b.retired.Load() || (epoch != 0 && b.epoch.Load() != epoch) {
+		return xmlReply{}, errors.New("hqplayer: stale sink command")
 	}
 	hc, err := b.ensureConnLocked(ctx)
 	if err != nil {
 		return xmlReply{}, err
 	}
 	rep, err := b.sendLocked(ctx, hc, expectTag, xmlBody, timeout)
-	if err != nil && ctx.Err() == nil && hc.closed.Load() {
+	if err != nil && ctx.Err() == nil && !b.retired.Load() && (epoch == 0 || b.epoch.Load() == epoch) && hc.closed.Load() {
 		b.connPtr.CompareAndSwap(hc, nil)
 		hc, err = b.ensureConnLocked(ctx)
 		if err != nil {
@@ -359,12 +387,28 @@ func (b *HQPlayerBackend) execWithReconnect(ctx context.Context, expectTag, xmlB
 	return rep, err
 }
 
+// sendStopExisting sends <Stop/> only if an open connection already exists for epoch, never dialing anew.
+func (b *HQPlayerBackend) sendStopExisting(epoch uint64) {
+	b.cmdMu.Lock()
+	defer b.cmdMu.Unlock()
+	if b.retired.Load() || b.epoch.Load() != epoch {
+		return
+	}
+	hc := b.connPtr.Load()
+	if hc == nil || hc.closed.Load() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	_, _ = b.sendLocked(ctx, hc, "Stop", `<Stop/>`, 1500*time.Millisecond)
+}
+
 func (b *HQPlayerBackend) Open(ctx context.Context, src player.TrackSource) (player.OutputSink, error) {
 	epoch := b.epoch.Add(1)
 	addr := b.Addr()
 	_, wavURL, coverURL := b.srv.RegisterHQPTrack(src, addr)
 
-	if _, err := b.execWithReconnect(ctx, "PlaylistClear", `<PlaylistClear/>`, 5*time.Second); err != nil {
+	if _, err := b.execForEpoch(ctx, epoch, "PlaylistClear", `<PlaylistClear/>`, 5*time.Second); err != nil {
 		return nil, err
 	}
 
@@ -392,15 +436,18 @@ func (b *HQPlayerBackend) Open(ctx context.Context, src player.TrackSource) (pla
 		xmlEscapeAttr(wavURL),
 		meta.String(),
 	)
-	if _, err := b.execWithReconnect(ctx, "PlaylistAdd", addCmd, 25*time.Second); err != nil {
+	if _, err := b.execForEpoch(ctx, epoch, "PlaylistAdd", addCmd, 25*time.Second); err != nil {
 		return nil, fmt.Errorf("HQPlayer 加载音轨失败: %w", err)
 	}
 
+	sinkCtx, sinkCancel := context.WithCancel(context.Background())
 	sink := &hqpSink{
 		backend:  b,
 		epoch:    epoch,
 		duration: src.Duration,
-		posAt:    time.Now(),
+		posAt:    b.nowTime(),
+		ctx:      sinkCtx,
+		cancel:   sinkCancel,
 		wakeCh:   make(chan struct{}, 1),
 		stopCh:   make(chan struct{}),
 	}
@@ -428,6 +475,8 @@ type hqpSink struct {
 	backend  *HQPlayerBackend
 	epoch    uint64
 	duration time.Duration
+	ctx      context.Context
+	cancel   context.CancelFunc
 
 	mu              sync.Mutex
 	closed          bool
@@ -455,7 +504,7 @@ type hqpSink struct {
 }
 
 func (s *hqpSink) isCurrent() bool {
-	return s.backend.epoch.Load() == s.epoch
+	return !s.backend.retired.Load() && s.backend.epoch.Load() == s.epoch
 }
 
 func (s *hqpSink) Activate() {
@@ -482,7 +531,7 @@ func (s *hqpSink) Position() time.Duration {
 	}
 	p := s.pos
 	if s.playing && s.hqState == 2 && !s.posAt.IsZero() {
-		p += time.Since(s.posAt)
+		p += s.backend.nowTime().Sub(s.posAt)
 	}
 	if s.duration > 0 && p > s.duration {
 		p = s.duration
@@ -512,11 +561,12 @@ func (s *hqpSink) Play() {
 		s.mu.Unlock()
 		return
 	}
+	now := s.backend.nowTime()
 	s.playing = true
 	s.endedOnce = false
 	s.sawPlaying = false
-	s.playRequestedAt = time.Now()
-	s.posAt = time.Now()
+	s.playRequestedAt = now
+	s.posAt = now
 	s.playDirty = true
 	s.wantPlay = true
 	if s.hasPendingSeek {
@@ -535,7 +585,13 @@ func (s *hqpSink) Pause() {
 		return
 	}
 	if s.playing && s.hqState == 2 && !s.posAt.IsZero() {
-		s.pos += time.Since(s.posAt)
+		s.pos += s.backend.nowTime().Sub(s.posAt)
+	}
+	if s.seekDirty {
+		// Preserve queued seek for next Play() when Pause supersedes dispatch.
+		s.pendingSeek = s.seekTarget
+		s.hasPendingSeek = true
+		s.seekDirty = false
 	}
 	s.playing = false
 	s.hqState = 1
@@ -555,16 +611,17 @@ func (s *hqpSink) Seek(t time.Duration) {
 		return
 	}
 	s.pos = t
-	s.posAt = time.Now()
+	s.posAt = s.backend.nowTime()
 	s.endedOnce = false
-	s.sawPlaying = false
 	if !s.playing {
+		s.sawPlaying = false
 		s.pendingSeek = t
 		s.hasPendingSeek = true
 		s.seekDirty = false
 		s.mu.Unlock()
 		return
 	}
+	// Preserve sawPlaying while already playing so seeking near track end still catches state=0 EOF.
 	s.hasPendingSeek = false
 	s.seekDirty = true
 	s.seekTarget = t
@@ -605,6 +662,11 @@ func (s *hqpSink) transportWorker() {
 			s.playDirty = false
 			doSeek, seekTo := s.seekDirty, s.seekTarget
 			s.seekDirty = false
+			if doSeek && doPlay && !wantPlay {
+				s.pendingSeek = seekTo
+				s.hasPendingSeek = true
+				doSeek = false
+			}
 			s.mu.Unlock()
 
 			if !doVol && !doPlay && !doSeek {
@@ -614,18 +676,18 @@ func (s *hqpSink) transportWorker() {
 				s.sendVolume(vol)
 			}
 			if doPlay {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 				if wantPlay {
-					_, _ = s.backend.execWithReconnect(ctx, "Play", `<Play/>`, 4*time.Second)
+					_, _ = s.backend.execForEpoch(ctx, s.epoch, "Play", `<Play/>`, 4*time.Second)
 				} else {
-					_, _ = s.backend.execWithReconnect(ctx, "Pause", `<Pause/>`, 3*time.Second)
+					_, _ = s.backend.execForEpoch(ctx, s.epoch, "Pause", `<Pause/>`, 3*time.Second)
 				}
 				cancel()
 			}
-			if doSeek && (!doPlay || wantPlay) {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			if doSeek {
+				ctx, cancel := context.WithTimeout(s.ctx, 5*time.Second)
 				cmd := fmt.Sprintf(`<Seek position="%.2f"/>`, seekTo.Seconds())
-				_, _ = s.backend.execWithReconnect(ctx, "Seek", cmd, 4*time.Second)
+				_, _ = s.backend.execForEpoch(ctx, s.epoch, "Seek", cmd, 4*time.Second)
 				cancel()
 			}
 		}
@@ -635,8 +697,11 @@ func (s *hqpSink) transportWorker() {
 func (s *hqpSink) sendVolume(gain float64) {
 	s.backend.cmdMu.Lock()
 	defer s.backend.cmdMu.Unlock()
+	if s.ctx.Err() != nil || !s.isCurrent() {
+		return
+	}
 	hc := s.backend.connPtr.Load()
-	if hc == nil || hc.closed.Load() || !s.isCurrent() {
+	if hc == nil || hc.closed.Load() {
 		return
 	}
 	db := hc.volMinDB
@@ -644,7 +709,7 @@ func (s *hqpSink) sendVolume(gain float64) {
 		db = 20.0 * math.Log10(gain)
 		db = max(hc.volMinDB, min(hc.volMaxDB, db))
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	ctx, cancel := context.WithTimeout(s.ctx, 3*time.Second)
 	defer cancel()
 	cmd := fmt.Sprintf(`<Volume value="%.2f"/>`, db)
 	_, _ = s.backend.sendLocked(ctx, hc, "Volume", cmd, 2*time.Second)
@@ -652,6 +717,7 @@ func (s *hqpSink) sendVolume(gain float64) {
 
 func (s *hqpSink) updateFromHQP(state int, posSec float64) {
 	var fireEnd func()
+	now := s.backend.nowTime()
 	s.mu.Lock()
 	if !s.closed && s.isCurrent() {
 		s.hqState = state
@@ -660,9 +726,9 @@ func (s *hqpSink) updateFromHQP(state int, posSec float64) {
 		}
 		if !s.hasPendingSeek && !s.seekDirty && (state == 2 || state == 1) {
 			s.pos = time.Duration(posSec * float64(time.Second))
-			s.posAt = time.Now()
+			s.posAt = now
 		}
-		if state == 0 && s.sawPlaying && s.playing && !s.endedOnce && time.Since(s.playRequestedAt) > 500*time.Millisecond {
+		if state == 0 && s.sawPlaying && s.playing && !s.endedOnce && now.Sub(s.playRequestedAt) > 500*time.Millisecond {
 			s.endedOnce = true
 			s.playing = false
 			s.pos = s.duration
@@ -684,6 +750,7 @@ func (s *hqpSink) Close() {
 	s.closed = true
 	wasPlaying := s.playing
 	s.playing = false
+	s.cancel()
 	close(s.stopCh)
 	s.mu.Unlock()
 
@@ -694,13 +761,7 @@ func (s *hqpSink) Close() {
 	s.backend.sinkMu.Unlock()
 
 	if wasPlaying && s.isCurrent() {
-		go func() {
-			if !s.isCurrent() {
-				return
-			}
-			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-			defer cancel()
-			_, _ = s.backend.execWithReconnect(ctx, "Stop", `<Stop/>`, 2*time.Second)
-		}()
+		epoch := s.epoch
+		go s.backend.sendStopExisting(epoch)
 	}
 }

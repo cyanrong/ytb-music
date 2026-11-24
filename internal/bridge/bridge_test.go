@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -75,6 +76,7 @@ func TestHQPlayerBackendAndRangeWAV(t *testing.T) {
 		hqpConn  net.Conn
 	)
 	playEvents := make(chan struct{}, 4)
+	seekPositions := make(chan string, 4)
 
 	go func() {
 		conn, aerr := ln.Accept()
@@ -121,6 +123,7 @@ func TestHQPlayerBackendAndRangeWAV(t *testing.T) {
 				_, _ = conn.Write([]byte(xmlDecl + `<Play result="OK"/>` + xmlDecl + `<Status state="2" position="1.25"/>`))
 				playEvents <- struct{}{}
 			case "Seek":
+				seekPositions <- attrs["position"]
 				_, _ = conn.Write([]byte(xmlDecl + `<Seek result="OK"/>`))
 			case "Pause":
 				_, _ = conn.Write([]byte(xmlDecl + `<Pause result="OK"/>`))
@@ -130,7 +133,19 @@ func TestHQPlayerBackendAndRangeWAV(t *testing.T) {
 		}
 	}()
 
+	var clockMu sync.Mutex
+	fakeNow := time.Date(2026, 11, 24, 12, 0, 0, 0, time.UTC)
 	backend := NewHQPlayerBackend(srv, ln.Addr().String(), nil)
+	backend.now = func() time.Time {
+		clockMu.Lock()
+		defer clockMu.Unlock()
+		return fakeNow
+	}
+	advanceClock := func(d time.Duration) {
+		clockMu.Lock()
+		fakeNow = fakeNow.Add(d)
+		clockMu.Unlock()
+	}
 	defer backend.Disconnect()
 
 	const totalFrames = 44100 * 4
@@ -193,10 +208,14 @@ func TestHQPlayerBackendAndRangeWAV(t *testing.T) {
 	sink.Activate()
 	sink.OnSinkEnd(func() { ended <- struct{}{} })
 	sink.Play()
-	<-playEvents
+	select {
+	case <-playEvents:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for first <Play/>")
+	}
 
-	// Wait past the 500ms start grace window, then push natural end-of-track Status state=0.
-	time.Sleep(550 * time.Millisecond)
+	// Deterministically advance controllable clock past the 500ms start grace window (zero wall-clock sleep).
+	advanceClock(600 * time.Millisecond)
 	mu.Lock()
 	conn := hqpConn
 	mu.Unlock()
@@ -211,26 +230,27 @@ func TestHQPlayerBackendAndRangeWAV(t *testing.T) {
 	// Verify RepeatOne replay: Seek(0) while paused followed by Play() sends <Seek position="0.00"/> and rearms OnSinkEnd.
 	sink.Seek(0)
 	sink.Play()
-	<-playEvents
-	time.Sleep(550 * time.Millisecond)
+	select {
+	case <-playEvents:
+	case <-time.After(2 * time.Second):
+		t.Fatal("timed out waiting for RepeatOne <Play/>")
+	}
+	select {
+	case pos := <-seekPositions:
+		if pos != "0.00" {
+			t.Fatalf("RepeatOne Seek position = %q, want 0.00", pos)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("paused Seek(0) followed by Play() did not send <Seek position=\"0.00\"/>")
+	}
+	advanceClock(600 * time.Millisecond)
 	_, _ = conn.Write([]byte(xmlDecl + `<Status state="0" position="0.0"/>`))
 	select {
 	case <-ended:
 	case <-time.After(2 * time.Second):
 		t.Fatal("HQPlayer RepeatOne second pass did not re-trigger OnSinkEnd")
 	}
-	mu.Lock()
-	hasSeekCmd := false
-	for _, cmd := range received {
-		if cmd == "Seek" {
-			hasSeekCmd = true
-			break
-		}
-	}
-	mu.Unlock()
-	if !hasSeekCmd {
-		t.Fatal("paused Seek(0) followed by Play() did not send <Seek/> to HQPlayer")
-	}
+	_ = received
 }
 
 // RoonManager completes MOO/1 extension pairing, discovers HQPlayer zones, triggers My Live Radio playback, and streams 24-bit WAV with ICY StreamTitle metadata.
@@ -253,8 +273,9 @@ func TestRoonMOOExtensionAndICYStream(t *testing.T) {
 	defer srv.Close()
 
 	var (
-		savedToken string
-		playedZone = make(chan string, 4)
+		savedToken  string
+		playedZone  = make(chan string, 4)
+		stoppedZone = make(chan string, 4)
 	)
 
 	// Spin up a mock Roon Core MOO/1 WebSocket server with realistic station -> action_list drill-down.
@@ -306,6 +327,16 @@ func TestRoonMOOExtensionAndICYStream(t *testing.T) {
 						{ZoneID: "z-desk", DisplayName: "Desktop DAC", State: "stopped"},
 					},
 				})
+			case "com.roonlabs.transport:2/control":
+				var req struct {
+					ZoneID  string `json:"zone_or_output_id"`
+					Control string `json:"control"`
+				}
+				_ = json.Unmarshal(msg.Body, &req)
+				if req.Control == "stop" {
+					stoppedZone <- req.ZoneID
+				}
+				send("COMPLETE", "Success", nil)
 			case "com.roonlabs.browse:1/browse":
 				var req struct {
 					PopAll  bool   `json:"pop_all"`
@@ -368,14 +399,16 @@ func TestRoonMOOExtensionAndICYStream(t *testing.T) {
 
 	select {
 	case st := <-pairedCh:
-		if savedToken != "tok-abc-999" || st.Zones[0].ZoneID != "z-hqp" {
+		hasHQP := slices.ContainsFunc(st.Zones, func(z RoonZone) bool { return z.ZoneID == "z-hqp" })
+		hasDesk := slices.ContainsFunc(st.Zones, func(z RoonZone) bool { return z.ZoneID == "z-desk" })
+		if savedToken != "tok-abc-999" || !hasHQP || !hasDesk {
 			t.Fatalf("unexpected Roon status: token=%q zones=%+v", savedToken, st.Zones)
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for Roon MOO pairing and zones")
 	}
 
-	// Open a track on RoonBackend and trigger Play() before any HTTP listener connects so EnsureStationPlaying fires.
+	// Directly verify that a single 882-frame WAV pull accumulates across 142-frame decoder reads.
 	rb := NewRoonBackend(srv, mgr, "z-hqp")
 	sink, err := rb.Open(context.Background(), player.TrackSource{
 		Track: ytm.Track{
@@ -398,6 +431,21 @@ func TestRoonMOOExtensionAndICYStream(t *testing.T) {
 	sink.Activate()
 	sink.Play()
 
+	rs := sink.(*roonSink)
+	oneTick := rs.pullPCM24(882)
+	if len(oneTick) != 882*6 {
+		t.Fatalf("pullPCM24(882) returned %d bytes, want %d", len(oneTick), 882*6)
+	}
+	lastOff := 881 * 6
+	lastLeft := int32(uint32(oneTick[lastOff]) | uint32(oneTick[lastOff+1])<<8 | uint32(oneTick[lastOff+2])<<16)
+	if lastLeft&0x800000 != 0 {
+		lastLeft |= ^0xffffff
+	}
+	// Frame 881 has value (881%1000 + 1)/2000 = 882/2000 = 0.441 -> ~3699376 in 24-bit signed PCM.
+	if lastLeft < 3699370 || lastLeft > 3699382 {
+		t.Fatalf("frame 881 sample = %d, want ~3699376", lastLeft)
+	}
+
 	// Verify Roon station startup actually invoked Play Now ("act-play") on z-hqp BEFORE any HTTP listener connected.
 	select {
 	case z := <-playedZone:
@@ -418,7 +466,7 @@ func TestRoonMOOExtensionAndICYStream(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	// Switching zones while an HTTP listener is already connected must still route station playback to the new zone!
+	// Switching zones while an HTTP listener is already connected must stop the previous zone and start the new one!
 	rb.SetZoneID("z-desk")
 	select {
 	case z := <-playedZone:
@@ -427,6 +475,14 @@ func TestRoonMOOExtensionAndICYStream(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("switching Roon zone did not start playback on z-desk")
+	}
+	select {
+	case stopped := <-stoppedZone:
+		if stopped != "z-hqp" {
+			t.Fatalf("stopped zone = %q, want z-hqp", stopped)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("switching Roon zone did not stop previous zone z-hqp")
 	}
 
 	if resp.Header.Get("icy-metaint") != "16384" {
