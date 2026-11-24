@@ -1375,61 +1375,44 @@ func (b *RoonBackend) Open(ctx context.Context, src player.TrackSource) (player.
 	if ctx.Err() != nil {
 		return nil, ctx.Err()
 	}
-	needAAC := b.StreamFormat() == "aac" || (b.srv != nil && b.srv.HasOnlyAACListeners())
+	wantAAC := b.StreamFormat() == "aac" || (b.srv != nil && b.srv.HasOnlyAACListeners())
 
 	var (
-		dec player.PCMDecoder
-		err error
-	)
-	if src.OpenPCM != nil {
-		dec, err = src.OpenPCM()
-	} else {
-		err = errors.New("bridge: missing PCM decoder")
-	}
-	if err != nil {
-		if needAAC && src.OpenRaw == nil && ctx.Err() == nil {
-			return nil, errRoonAACUnsupported
-		}
-		return nil, err
-	}
-	if ctx.Err() != nil {
-		_ = dec.Close()
-		return nil, ctx.Err()
-	}
-
-	var (
+		dec       player.PCMDecoder
 		raw       player.RawStream
 		adts      *aacADTSReader
 		adtsTried bool
 		aacRate   = roonTargetRate
 		aacSilent = silentADTSFrame44kStereo
 	)
-	if needAAC {
+	if wantAAC {
 		if src.OpenRaw == nil {
-			_ = dec.Close()
 			return nil, errRoonAACUnsupported
 		}
 		r, rerr := src.OpenRaw()
 		if rerr != nil {
-			_ = dec.Close()
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
+			}
+			if strings.Contains(rerr.Error(), "403") {
+				return nil, rerr
 			}
 			return nil, errRoonAACUnsupported
 		}
 		sz, serr := r.Size()
 		if serr != nil || sz <= 0 {
 			_ = r.Close()
-			_ = dec.Close()
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
+			}
+			if serr != nil && strings.Contains(serr.Error(), "403") {
+				return nil, serr
 			}
 			return nil, errRoonAACUnsupported
 		}
 		ar, aerr := openAACADTSReader(r, sz)
 		if aerr != nil {
 			_ = r.Close()
-			_ = dec.Close()
 			if ctx.Err() != nil {
 				return nil, ctx.Err()
 			}
@@ -1438,6 +1421,10 @@ func (b *RoonBackend) Open(ctx context.Context, src player.TrackSource) (player.
 			}
 			return nil, errRoonAACUnsupported
 		}
+		if ctx.Err() != nil {
+			_ = r.Close()
+			return nil, ctx.Err()
+		}
 		raw = r
 		adts = ar
 		adtsTried = true
@@ -1445,7 +1432,36 @@ func (b *RoonBackend) Open(ctx context.Context, src player.TrackSource) (player.
 		aacSilent = ar.SilentFrame()
 	}
 
-	sr := dec.SampleRate()
+	if src.OpenPCM != nil {
+		d, err := src.OpenPCM()
+		if err == nil {
+			dec = d
+		} else if !wantAAC {
+			return nil, err
+		}
+	} else if !wantAAC {
+		return nil, errors.New("bridge: missing PCM decoder")
+	}
+	if ctx.Err() != nil {
+		if dec != nil {
+			_ = dec.Close()
+		}
+		if raw != nil {
+			_ = raw.Close()
+		}
+		return nil, ctx.Err()
+	}
+
+	sr := 0
+	if dec != nil {
+		sr = dec.SampleRate()
+	}
+	if sr <= 0 && adts != nil {
+		sr = adts.SampleRate()
+	}
+	if sr <= 0 && src.Stream != nil && src.Stream.SampleRate > 0 {
+		sr = src.Stream.SampleRate
+	}
 	if sr <= 0 {
 		sr = roonTargetRate
 	}
@@ -1479,20 +1495,21 @@ type roonSink struct {
 
 	// stateMu guards lightweight playback state accessed on the UI thread;
 	// it is NEVER held across blocking decoder or network reads.
-	stateMu   sync.Mutex
-	ownerID   uint64
-	posFrames int64 // in srcRate frames
-	playGen   uint64
-	seekGen   uint64
-	seekTarget int64 // in srcRate frames
-	playing   bool
-	closed    bool
-	gain      float64
-	aacRate   int
-	aacSilent []byte
-	title     string
-	onEnd     func()
-	endedOnce bool
+	stateMu     sync.Mutex
+	ownerID     uint64
+	posFrames   int64 // in srcRate frames
+	playGen     uint64
+	seekGen     uint64
+	seekTarget  int64 // in srcRate frames
+	adtsAligned bool
+	playing     bool
+	closed      bool
+	gain        float64
+	aacRate     int
+	aacSilent   []byte
+	title       string
+	onEnd       func()
+	endedOnce   bool
 
 	// ioMu guards dec, raw, adts, and decode buffers on the background clock goroutine.
 	ioMu           sync.Mutex
@@ -1637,11 +1654,15 @@ func (s *roonSink) pullPCM24(outFrames int) []byte {
 	}
 	if dec == nil {
 		s.ioMu.Unlock()
+		aacActive := s.backend != nil && s.backend.srv != nil && s.backend.srv.activeRoonSinkHasAAC(s)
 		var fireEnd func()
 		var clearOwner uint64
 		s.stateMu.Lock()
 		if !s.closed && s.playing && s.playGen == wantPlayGen && s.seekGen == wantSeekGen {
 			s.posFrames += int64(needSrc)
+			if !aacActive {
+				s.adtsAligned = false
+			}
 			reachedEnd := s.duration <= 0 || (s.srcRate > 0 && time.Duration(float64(s.posFrames)/float64(s.srcRate)*float64(time.Second)) >= s.duration)
 			if reachedEnd && !s.endedOnce {
 				s.endedOnce = true
@@ -1701,6 +1722,7 @@ func (s *roonSink) pullPCM24(outFrames int) []byte {
 	}
 	s.ioMu.Unlock()
 
+	aacActive := s.backend != nil && s.backend.srv != nil && s.backend.srv.activeRoonSinkHasAAC(s)
 	var fireEnd func()
 	var clearOwner uint64
 	s.stateMu.Lock()
@@ -1714,6 +1736,9 @@ func (s *roonSink) pullPCM24(outFrames int) []byte {
 		}
 	} else {
 		s.posFrames += int64(gotSrcFrames)
+		if gotSrcFrames > 0 && !aacActive {
+			s.adtsAligned = false
+		}
 		if errors.Is(readErr, io.EOF) && !s.endedOnce {
 			s.endedOnce = true
 			s.playing = false
@@ -1732,24 +1757,24 @@ func (s *roonSink) pullPCM24(outFrames int) []byte {
 	return out
 }
 
-func (s *roonSink) ensureADTSLocked(curFrames int64, wantSeekGen uint64) {
+func (s *roonSink) ensureADTSLocked(curFrames int64, wantSeekGen uint64) bool {
 	if s.adtsTried || s.src.OpenRaw == nil {
-		return
+		return false
 	}
 	s.adtsTried = true
 	raw, err := s.src.OpenRaw()
 	if err != nil {
-		return
+		return false
 	}
 	sz, serr := raw.Size()
 	if serr != nil || sz <= 0 {
 		_ = raw.Close()
-		return
+		return false
 	}
 	ar, aerr := openAACADTSReader(raw, sz)
 	if aerr != nil {
 		_ = raw.Close()
-		return
+		return false
 	}
 	initSample := curFrames
 	if s.srcRate > 0 && ar.SampleRate() != s.srcRate {
@@ -1763,7 +1788,9 @@ func (s *roonSink) ensureADTSLocked(curFrames int64, wantSeekGen uint64) {
 	s.stateMu.Lock()
 	s.aacRate = ar.SampleRate()
 	s.aacSilent = sf
+	s.adtsAligned = true
 	s.stateMu.Unlock()
+	return true
 }
 
 func (s *roonSink) hasADTS() bool {
@@ -1792,20 +1819,35 @@ func (s *roonSink) pullADTS(advancePos bool) []byte {
 	wantSeekGen := s.seekGen
 	seekTarget := s.seekTarget
 	curFrames := s.posFrames
+	aligned := s.adtsAligned
 	gain := s.gain
 	s.stateMu.Unlock()
 
 	s.ioMu.Lock()
-	s.ensureADTSLocked(curFrames, wantSeekGen)
+	if s.ensureADTSLocked(curFrames, wantSeekGen) {
+		aligned = true
+	}
 	ar := s.adts
 	if ar == nil {
 		s.ioMu.Unlock()
 		return nil
 	}
-	if s.appliedAACSeek != wantSeekGen {
-		sample := seekTarget
+	curSample := curFrames
+	if s.srcRate > 0 && ar.SampleRate() != s.srcRate {
+		curSample = curFrames * int64(ar.SampleRate()) / int64(s.srcRate)
+	}
+	drift := curSample - int64(ar.pktCursor)*1024
+	if drift < 0 {
+		drift = -drift
+	}
+	if !aligned || s.appliedAACSeek != wantSeekGen || drift >= 4096 {
+		targetFrames := seekTarget
+		if !aligned || drift >= 4096 {
+			targetFrames = curFrames
+		}
+		sample := targetFrames
 		if s.srcRate > 0 && ar.SampleRate() != s.srcRate {
-			sample = seekTarget * int64(ar.SampleRate()) / int64(s.srcRate)
+			sample = targetFrames * int64(ar.SampleRate()) / int64(s.srcRate)
 		}
 		_ = ar.SeekToSample(sample)
 		s.appliedAACSeek = wantSeekGen
@@ -1824,11 +1866,15 @@ func (s *roonSink) pullADTS(advancePos bool) []byte {
 	valid := !s.closed && s.playing && s.playGen == wantPlayGen && s.seekGen == wantSeekGen
 	if !valid {
 		pkt = nil
+		s.adtsAligned = false
 		if !s.closed && s.seekGen == wantSeekGen {
 			s.seekTarget = s.posFrames
 			s.seekGen++
 		}
 	} else {
+		if s.posFrames == curFrames {
+			s.adtsAligned = true
+		}
 		if len(pkt) > 0 && advancePos {
 			step := int64(1024)
 			if arRate > 0 && s.srcRate != arRate {

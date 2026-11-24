@@ -15,6 +15,7 @@ import (
 	"slices"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -433,9 +434,22 @@ func TestLocalLibraryBrowseFilterAndPlayback(t *testing.T) {
 	showInFolder = func(p string) { revealedPath = p }
 	defer func() { showInFolder = origReveal }()
 
+	var searchCalls atomic.Int32
 	origSearch := searchResults
 	searchResults = func(string, ytm.SearchType, int, int) (ytm.SearchResult, error) {
-		return ytm.SearchResult{}, errors.New("offline")
+		if searchCalls.Add(1) == 1 {
+			return ytm.SearchResult{}, errors.New("offline")
+		}
+		return ytm.SearchResult{
+			Total: 1,
+			Songs: []ytm.Track{{
+				ID:        "online1",
+				Name:      "Waltz for Debby (Live)",
+				Artists:   []ytm.Artist{{Name: "Bill Evans"}},
+				Duration:  420000,
+				VideoType: ytm.VideoATV,
+			}},
+		}, nil
 	}
 	defer func() { searchResults = origSearch }()
 
@@ -544,14 +558,27 @@ func TestLocalLibraryBrowseFilterAndPlayback(t *testing.T) {
 		t.Fatalf("expected .lrc lyrics loaded via Player.Local, got (%+v, %v)", lines, ok)
 	}
 
-	// Global search surfaces local matches while keeping the online retry button available on failure.
+	// Global search surfaces local matches on initial network failure, and clicking 重试 loads online results alongside them.
 	a.search("Waltz for Debby")
 	drainLocalPosts(t, posts, tt, func() bool {
 		d := a.searches[a.route]
 		return d != nil && !d.page.loading
 	})
-	if !tt.HasText("本地曲库匹配") || !tt.HasText("Waltz for Debby") || !tt.HasText("重试") {
-		t.Fatalf("expected global search to surface local match alongside online retry action: %v", tt.Texts())
+	if !tt.HasText("本地曲库匹配") || !tt.HasText("Waltz for Debby") {
+		t.Fatalf("expected global search to surface local match while offline: %v", tt.Texts())
+	}
+	if err := tt.Click("重试"); err != nil {
+		t.Fatalf("click 重试 on search page: %v", err)
+	}
+	drainLocalPosts(t, posts, tt, func() bool {
+		d := a.searches[a.route]
+		return d != nil && !d.page.loading && d.page.loaded
+	})
+	if got := searchCalls.Load(); got != 2 {
+		t.Fatalf("expected 2 search calls after clicking 重试, got %d", got)
+	}
+	if !tt.HasText("Waltz for Debby") || !tt.HasText("Waltz for Debby (Live)") {
+		t.Fatalf("expected both local and online tracks rendered after retry: %v", tt.Texts())
 	}
 }
 
@@ -719,6 +746,65 @@ func TestLocalRoonGenreSync(t *testing.T) {
 	}
 }
 
+func makeTestMP4Box(typ string, body []byte) []byte {
+	var b bytes.Buffer
+	_ = binary.Write(&b, binary.BigEndian, uint32(8+len(body)))
+	b.WriteString(typ[:4])
+	b.Write(body)
+	return b.Bytes()
+}
+
+func makeMinimalAACM4A() []byte {
+	var mvhd bytes.Buffer
+	mvhd.Write(make([]byte, 12)) // version/flags + creation/mod
+	_ = binary.Write(&mvhd, binary.BigEndian, uint32(44100))
+	_ = binary.Write(&mvhd, binary.BigEndian, uint32(44100*2))
+	mvhd.Write(make([]byte, 80))
+
+	var hdlr bytes.Buffer
+	hdlr.Write(make([]byte, 8))
+	hdlr.WriteString("soun")
+	hdlr.Write(make([]byte, 12))
+
+	// ES_Descriptor (0x03) -> DecoderConfigDescriptor (0x04) -> AudioSpecificConfig (0x05: AAC-LC 44.1kHz stereo = 0x12 0x10).
+	asc := []byte{0x05, 0x02, 0x12, 0x10}
+	decCfgBody := append([]byte{
+		0x40, 0x15, 0x00, 0x00, 0x00,
+		0x00, 0x03, 0xE8, 0x00, // maxBitrate 256kbps
+		0x00, 0x03, 0xE8, 0x00, // avgBitrate 256kbps
+	}, asc...)
+	decCfg := append([]byte{0x04, byte(len(decCfgBody))}, decCfgBody...)
+	esBody := append([]byte{0x00, 0x01, 0x00}, decCfg...)
+	esdsBody := append([]byte{0, 0, 0, 0, 0x03, byte(len(esBody))}, esBody...)
+
+	var mp4aEntry bytes.Buffer
+	mp4aEntry.Write(make([]byte, 6))
+	_ = binary.Write(&mp4aEntry, binary.BigEndian, uint16(1))
+	mp4aEntry.Write(make([]byte, 8))
+	_ = binary.Write(&mp4aEntry, binary.BigEndian, uint16(2))  // stereo
+	_ = binary.Write(&mp4aEntry, binary.BigEndian, uint16(16)) // sampleSize
+	mp4aEntry.Write(make([]byte, 4))
+	_ = binary.Write(&mp4aEntry, binary.BigEndian, uint32(44100)<<16)
+	mp4aEntry.Write(makeTestMP4Box("esds", esdsBody))
+
+	var stsd bytes.Buffer
+	stsd.Write(make([]byte, 4))
+	_ = binary.Write(&stsd, binary.BigEndian, uint32(1))
+	stsd.Write(makeTestMP4Box("mp4a", mp4aEntry.Bytes()))
+
+	stbl := makeTestMP4Box("stbl", makeTestMP4Box("stsd", stsd.Bytes()))
+	minf := makeTestMP4Box("minf", stbl)
+	mdia := makeTestMP4Box("mdia", append(makeTestMP4Box("hdlr", hdlr.Bytes()), minf...))
+	trak := makeTestMP4Box("trak", mdia)
+	moov := makeTestMP4Box("moov", append(makeTestMP4Box("mvhd", mvhd.Bytes()), trak...))
+
+	var out bytes.Buffer
+	out.Write(makeTestMP4Box("ftyp", []byte("M4A \x00\x00\x00\x00M4A mp42")))
+	out.Write(moov)
+	out.Write(makeTestMP4Box("mdat", []byte{0x21, 0x10, 0x04, 0x60, 0x8C, 0x1C}))
+	return out.Bytes()
+}
+
 // localPlayerProvider opens native HQPlayer tracks lazily without requiring a Go PCM decoder and exposes OpenRaw for non-CUE local AAC M4A files.
 func TestLocalPlayerProviderLazyPCMAndRawAAC(t *testing.T) {
 	dir := t.TempDir()
@@ -734,22 +820,120 @@ func TestLocalPlayerProviderLazyPCMAndRawAAC(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	m4aBytes := makeMinimalAACM4A()
+	m4aPath := filepath.Join(dir, "02 - Stream.m4a")
+	if err := os.WriteFile(m4aPath, m4aBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
 	lib := localmusic.NewLibrary(filepath.Join(dir, "lib.json"), filepath.Join(dir, "covers"))
 	lib.AddFolders(dir)
 	if err := lib.Scan(context.Background(), nil); err != nil {
 		t.Fatal(err)
 	}
-	tracks := lib.Tracks("", "", "")
-	if len(tracks) != 1 {
-		t.Fatalf("expected 1 indexed WavPack track, got %d", len(tracks))
+
+	wvTracks := lib.Tracks("Native", "", "")
+	if len(wvTracks) != 1 {
+		t.Fatalf("expected 1 indexed WavPack track, got %d", len(wvTracks))
 	}
 	prov := localPlayerProvider{lib: lib}
-	opened, err := prov.OpenLocalTrack(tracks[0].ID)
+	opened, err := prov.OpenLocalTrack(wvTracks[0].ID)
 	if err != nil {
 		t.Fatalf("OpenLocalTrack(.wv) failed eagerly: %v", err)
 	}
 	if !opened.NativeHQP || opened.OpenPCM == nil || opened.OpenRaw != nil {
 		t.Fatalf("unexpected WavPack LocalOpenedTrack: NativeHQP=%v OpenPCM=%v OpenRaw=%v", opened.NativeHQP, opened.OpenPCM != nil, opened.OpenRaw != nil)
+	}
+
+	aacTracks := lib.Tracks("Stream", "", "")
+	if len(aacTracks) != 1 || aacTracks[0].Spec.Codec != "AAC" || aacTracks[0].Spec.SampleRate != 44100 {
+		t.Fatalf("expected 1 indexed 44.1kHz AAC M4A track, got %+v", aacTracks)
+	}
+	aacOpened, err := prov.OpenLocalTrack(aacTracks[0].ID)
+	if err != nil {
+		t.Fatalf("OpenLocalTrack(.m4a) failed: %v", err)
+	}
+	if aacOpened.NativeHQP || aacOpened.OpenRaw == nil {
+		t.Fatalf("expected non-CUE AAC M4A to expose OpenRaw without NativeHQP, got NativeHQP=%v OpenRaw=%v", aacOpened.NativeHQP, aacOpened.OpenRaw != nil)
+	}
+	raw, err := aacOpened.OpenRaw()
+	if err != nil {
+		t.Fatalf("aacOpened.OpenRaw() failed: %v", err)
+	}
+	defer raw.Close()
+
+	gotSize, err := raw.Size()
+	if err != nil || gotSize != int64(len(m4aBytes)) {
+		t.Fatalf("raw.Size() = (%d, %v), want (%d, nil)", gotSize, err, len(m4aBytes))
+	}
+	var hdr [16]byte
+	n, err := raw.ReadAt(hdr[:], 0)
+	if err != nil || n != len(hdr) || !bytes.Equal(hdr[:], m4aBytes[:len(hdr)]) {
+		t.Fatalf("raw.ReadAt header = (%x, %d, %v), want %x", hdr[:], n, err, m4aBytes[:len(hdr)])
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("raw.Close() failed: %v", err)
+	}
+}
+
+// Rescanning when one watched root is offline still invalidates and refreshes an open local album page from a readable root while surfacing the error toast (fixing rescanLocalLibrary skipping invalidateLocalPages on partial failure).
+func TestLocalPartialRescanInvalidatesOpenAlbumPage(t *testing.T) {
+	root := t.TempDir()
+	localRoot := filepath.Join(root, "local")
+	nasRoot := filepath.Join(root, "nas")
+	albumDir := filepath.Join(localRoot, "Chamber Suite")
+	for _, d := range []string{albumDir, nasRoot} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	id3Tr1 := makeID3v23("Opening", "Quartet", "Chamber Suite", "2020", "Classical")
+	if err := os.WriteFile(filepath.Join(albumDir, "01 - Opening.wav"), makeWAV24(96000, 2400, id3Tr1), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	id3NAS := makeID3v23("Remote Movement", "Orchestra", "NAS Symphony", "2019", "Classical")
+	if err := os.WriteFile(filepath.Join(nasRoot, "01 - Remote.wav"), makeWAV24(96000, 2400, id3NAS), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a, posts, _ := newLocalTestApp(t)
+	a.local.lib.AddFolders(localRoot, nasRoot)
+	if err := a.local.lib.Scan(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+
+	albums := a.local.lib.Albums(localmusic.AlbumFilter{Query: "Chamber Suite"})
+	if len(albums) != 1 {
+		t.Fatalf("expected Chamber Suite album, got %+v", albums)
+	}
+	a.open(route{page: pageAlbum, id: albums[0].ID})
+	tt := ui.NewTester(a.view, 1180, 780)
+	tt.SetDark(true)
+	tt.Frame()
+	if !tt.HasText("Opening") || tt.HasText("Finale") {
+		t.Fatalf("unexpected initial local album page texts: %v", tt.Texts())
+	}
+
+	// Make nasRoot unavailable while adding a second track to the readable Chamber Suite folder.
+	if err := os.RemoveAll(nasRoot); err != nil {
+		t.Fatal(err)
+	}
+	id3Tr2 := makeID3v23("Finale", "Quartet", "Chamber Suite", "2020", "Classical")
+	if err := os.WriteFile(filepath.Join(albumDir, "02 - Finale.wav"), makeWAV24(96000, 2400, id3Tr2), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	a.rescanLocalLibrary()
+	drainLocalPosts(t, posts, nil, func() bool {
+		return !a.local.scanning
+	})
+	if !strings.Contains(a.toast, "扫描本地曲库失败") {
+		t.Fatalf("expected partial scan error surfaced in toast, got %q", a.toast)
+	}
+	tt.Frame()
+	if !tt.HasText("Opening") || !tt.HasText("Finale") {
+		t.Fatalf("expected open local album page refreshed with new track Finale after partial scan: %v", tt.Texts())
 	}
 }
 

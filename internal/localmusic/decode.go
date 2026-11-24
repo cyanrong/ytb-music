@@ -177,7 +177,7 @@ func newAIFFDecoder(f *os.File) (*aiffDecoder, error) {
 			d.length = int64(binary.BigEndian.Uint32(b[2:6]))
 			d.sampleBits = int(int16(binary.BigEndian.Uint16(b[6:8])))
 			rateF := parseIEEE80(b[8:18])
-			if !math.IsNaN(rateF) && !math.IsInf(rateF, 0) && rateF >= 1 && rateF <= 45158400 {
+			if !math.IsNaN(rateF) && !math.IsInf(rateF, 0) && rateF >= 1 && rateF <= maxDSDSampleRate {
 				d.rate = int(math.Round(rateF))
 			}
 			if ft == "AIFC" && len(b) >= 22 {
@@ -387,10 +387,12 @@ type dsdPreviewDecoder struct {
 }
 
 func chooseDSDDecimation(dsdRate int) (decimBits, outRate int, err error) {
-	if dsdRate < 2822400 || dsdRate > 45158400 {
+	if dsdRate < 2822400 || dsdRate > maxDSDSampleRate {
 		return 0, 0, errors.New("localmusic: invalid DSD sample rate")
 	}
 	switch {
+	case dsdRate >= 90316800:
+		decimBits = 1024
 	case dsdRate >= 45158400:
 		decimBits = 512
 	case dsdRate >= 22579200:
@@ -453,7 +455,7 @@ func newDSFDecoder(f *os.File) (*dsdPreviewDecoder, error) {
 	if channelsU < 1 || channelsU > 8 {
 		return nil, errors.New("localmusic: invalid DSF channel count")
 	}
-	if dsdRateU < 2822400 || dsdRateU > 45158400 {
+	if dsdRateU < 2822400 || dsdRateU > maxDSDSampleRate {
 		return nil, errors.New("localmusic: invalid DSD sample rate")
 	}
 	channels := int(channelsU)

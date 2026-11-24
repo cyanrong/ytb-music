@@ -263,14 +263,14 @@ func (a *app) rescanLocalLibrary() {
 	a.local.scanning = true
 	a.local.scanProgress = localmusic.ScanProgress{Scanning: true}
 
+	beforeRev := lib.Revision()
 	go func() {
 		err := lib.Scan(ctx, func(sp localmusic.ScanProgress) {
 			a.post(func() {
-				if a.local.scanGen != gen {
+				if a.local.scanGen != gen || !a.local.scanning {
 					return
 				}
 				a.local.scanProgress = sp
-				a.local.scanning = sp.Scanning
 			})
 		})
 		a.post(func() {
@@ -278,12 +278,14 @@ func (a *app) rescanLocalLibrary() {
 				return
 			}
 			a.local.scanning = false
+			a.local.scanProgress.Scanning = false
 			a.local.scanCancel = nil
+			if err == nil || lib.Revision() != beforeRev {
+				a.invalidateLocalPages()
+			}
 			if err != nil && !errors.Is(err, context.Canceled) {
 				a.toast = "扫描本地曲库失败：" + err.Error()
-				return
 			}
-			a.invalidateLocalPages()
 		})
 	}()
 }

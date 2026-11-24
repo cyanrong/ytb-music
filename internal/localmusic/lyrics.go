@@ -17,6 +17,9 @@ const maxCoverFileBytes = 32 << 20 // 32 MiB cap on external folder artwork
 
 var coverExts = []string{".jpg", ".jpeg", ".png", ".webp"}
 
+// readCoverFile is swapped in tests to verify concurrent deduplication and unreadable-sidecar fallback.
+var readCoverFile = os.ReadFile
+
 // saveCoverBytes deduplicates image data by SHA-1 into coverDir and returns its coverID.
 func saveCoverBytes(coverDir string, data []byte) (string, error) {
 	if len(data) == 0 || coverDir == "" {
@@ -80,21 +83,51 @@ type dirCoverEntry struct {
 	modTimeNs int64
 }
 
+type coverIngestResult struct {
+	id string
+	ok bool
+}
+
+type coverIngestCall struct {
+	done chan struct{}
+	res  coverIngestResult
+}
+
+type coverResolved struct {
+	id   string
+	cand sidecarCoverInfo
+}
+
+type coverResolveCall struct {
+	done chan struct{}
+	res  coverResolved
+}
+
 type folderCoverResolver struct {
-	coverDir  string
-	mu        sync.Mutex
-	dirFiles  map[string][]dirCoverEntry
-	candCache map[string]sidecarCoverInfo
-	idCache   map[string]string
+	coverDir        string
+	mu              sync.Mutex
+	dirFiles        map[string][]dirCoverEntry
+	candsCache      map[string][]sidecarCoverInfo
+	resolvedCache   map[string]coverResolved
+	resolveInflight map[string]*coverResolveCall
+	idCache         map[string]coverIngestResult
+	ingestInflight  map[string]*coverIngestCall
 }
 
 func newFolderCoverResolver(coverDir string) *folderCoverResolver {
 	return &folderCoverResolver{
-		coverDir:  coverDir,
-		dirFiles:  map[string][]dirCoverEntry{},
-		candCache: map[string]sidecarCoverInfo{},
-		idCache:   map[string]string{},
+		coverDir:        coverDir,
+		dirFiles:        map[string][]dirCoverEntry{},
+		candsCache:      map[string][]sidecarCoverInfo{},
+		resolvedCache:   map[string]coverResolved{},
+		resolveInflight: map[string]*coverResolveCall{},
+		idCache:         map[string]coverIngestResult{},
+		ingestInflight:  map[string]*coverIngestCall{},
 	}
+}
+
+func coverResolverCacheKey(dir, albumTitle string) string {
+	return canonicalPathKey(dir) + "|" + strings.ToLower(strings.TrimSpace(albumTitle))
 }
 
 func (r *folderCoverResolver) listDirCoversLocked(dir string) []dirCoverEntry {
@@ -137,19 +170,13 @@ func (r *folderCoverResolver) listDirCoversLocked(dir string) []dirCoverEntry {
 	return out
 }
 
-// candidate resolves the external cover image candidate (cover.*, folder.*,
-// front.*, album.*, or <albumTitle>.*) for dir (and parent dir when dir matches
-// disc*/cd*).
-func (r *folderCoverResolver) candidate(dir, albumTitle string) sidecarCoverInfo {
-	if r == nil || r.coverDir == "" || dir == "" {
-		return sidecarCoverInfo{}
-	}
-	cacheKey := canonicalPathKey(dir) + "|" + strings.ToLower(strings.TrimSpace(albumTitle))
-
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if cand, ok := r.candCache[cacheKey]; ok {
-		return cand
+// candidatesLocked returns all external cover image candidates (cover.*,
+// folder.*, front.*, album.*, or <albumTitle>.*) in priority order for dir
+// (and parent dir when dir matches disc*/cd*). Caller must hold r.mu.
+func (r *folderCoverResolver) candidatesLocked(dir, albumTitle string) []sidecarCoverInfo {
+	cacheKey := coverResolverCacheKey(dir, albumTitle)
+	if cands, ok := r.candsCache[cacheKey]; ok {
+		return cands
 	}
 
 	searchDirs := []string{dir}
@@ -160,69 +187,164 @@ func (r *folderCoverResolver) candidate(dir, albumTitle string) sidecarCoverInfo
 		}
 	}
 
-	candidates := []string{"cover", "folder", "front", "album"}
+	names := []string{"cover", "folder", "front", "album"}
 	cleanAlb := strings.TrimSpace(albumTitle)
-	if cleanAlb != "" && !containsFold(candidates, cleanAlb) {
-		candidates = append(candidates, cleanAlb)
+	if cleanAlb != "" && !containsFold(names, cleanAlb) {
+		names = append(names, cleanAlb)
 	}
 
-	var found sidecarCoverInfo
+	var out []sidecarCoverInfo
+	seen := map[string]bool{}
 	for _, sdir := range searchDirs {
 		files := r.listDirCoversLocked(sdir)
 		if len(files) == 0 {
 			continue
 		}
-		for _, base := range candidates {
+		for _, base := range names {
 			for _, ext := range coverExts {
 				want := base + ext
 				for _, ent := range files {
 					if strings.EqualFold(ent.name, want) {
-						found = sidecarCoverInfo{
-							path:      filepath.Clean(filepath.Join(sdir, ent.name)),
-							size:      ent.size,
-							modTimeNs: ent.modTimeNs,
+						full := filepath.Clean(filepath.Join(sdir, ent.name))
+						pk := canonicalPathKey(full)
+						if !seen[pk] {
+							seen[pk] = true
+							out = append(out, sidecarCoverInfo{
+								path:      full,
+								size:      ent.size,
+								modTimeNs: ent.modTimeNs,
+							})
 						}
-						r.candCache[cacheKey] = found
-						return found
 					}
 				}
 			}
 		}
 	}
-	r.candCache[cacheKey] = found
-	return found
+	r.candsCache[cacheKey] = out
+	return out
 }
 
-func (r *folderCoverResolver) ingest(cand sidecarCoverInfo) string {
+func (r *folderCoverResolver) ingest(cand sidecarCoverInfo) (string, bool) {
 	if r == nil || r.coverDir == "" || cand.path == "" {
-		return ""
+		return "", false
 	}
 	pk := canonicalPathKey(cand.path)
+
 	r.mu.Lock()
-	if id, ok := r.idCache[pk]; ok {
+	if res, ok := r.idCache[pk]; ok {
 		r.mu.Unlock()
-		return id
+		return res.id, res.ok
 	}
+	if call, inflight := r.ingestInflight[pk]; inflight {
+		r.mu.Unlock()
+		<-call.done
+		return call.res.id, call.res.ok
+	}
+	call := &coverIngestCall{done: make(chan struct{})}
+	r.ingestInflight[pk] = call
 	r.mu.Unlock()
 
-	data, err := os.ReadFile(cand.path)
-	var id string
-	if err == nil && len(data) > 0 && len(data) <= maxCoverFileBytes {
-		id, _ = saveCoverBytes(r.coverDir, data)
+	var res coverIngestResult
+	if data, err := readCoverFile(cand.path); err == nil && len(data) > 0 && len(data) <= maxCoverFileBytes {
+		if id, saveErr := saveCoverBytes(r.coverDir, data); saveErr == nil && id != "" {
+			res = coverIngestResult{id: id, ok: true}
+		}
 	}
 
 	r.mu.Lock()
-	r.idCache[pk] = id
+	call.res = res
+	r.idCache[pk] = res
+	delete(r.ingestInflight, pk)
+	close(call.done)
 	r.mu.Unlock()
-	return id
+	return res.id, res.ok
 }
 
+// resolveAndIngest tries external cover candidates in priority order, sharing
+// in-flight reads across scan workers and only caching the first candidate
+// whose bytes can be read and ingested cleanly.
 func (r *folderCoverResolver) resolveAndIngest(dir, albumTitle string) (string, sidecarCoverInfo) {
-	cand := r.candidate(dir, albumTitle)
-	if cand.path == "" {
+	if r == nil || r.coverDir == "" || dir == "" {
 		return "", sidecarCoverInfo{}
 	}
-	return r.ingest(cand), cand
+	cacheKey := coverResolverCacheKey(dir, albumTitle)
+
+	r.mu.Lock()
+	if res, ok := r.resolvedCache[cacheKey]; ok {
+		r.mu.Unlock()
+		return res.id, res.cand
+	}
+	if call, inflight := r.resolveInflight[cacheKey]; inflight {
+		r.mu.Unlock()
+		<-call.done
+		return call.res.id, call.res.cand
+	}
+	cands := r.candidatesLocked(dir, albumTitle)
+	call := &coverResolveCall{done: make(chan struct{})}
+	r.resolveInflight[cacheKey] = call
+	r.mu.Unlock()
+
+	var resolved coverResolved
+	for _, cand := range cands {
+		if id, ok := r.ingest(cand); ok {
+			resolved = coverResolved{id: id, cand: cand}
+			break
+		}
+	}
+
+	r.mu.Lock()
+	call.res = resolved
+	r.resolvedCache[cacheKey] = resolved
+	delete(r.resolveInflight, cacheKey)
+	close(call.done)
+	r.mu.Unlock()
+	return resolved.id, resolved.cand
+}
+
+func (r *folderCoverResolver) checkCachedOrResolve(
+	dir, albumTitle string,
+	prevPath string, prevModNs, prevSize int64, prevCoverID string,
+	coverPresent func(string) bool,
+) (string, sidecarCoverInfo, bool) {
+	if r == nil || r.coverDir == "" || dir == "" {
+		return "", sidecarCoverInfo{}, prevPath == "" && prevCoverID == ""
+	}
+	wasPresent := prevCoverID != "" && coverPresent(prevCoverID)
+	cacheKey := coverResolverCacheKey(dir, albumTitle)
+
+	r.mu.Lock()
+	if res, ok := r.resolvedCache[cacheKey]; ok {
+		r.mu.Unlock()
+		same := sameSidecarPath(res.cand.path, prevPath) &&
+			res.cand.modTimeNs == prevModNs &&
+			res.cand.size == prevSize &&
+			res.id == prevCoverID &&
+			(res.cand.path == "" || wasPresent)
+		return res.id, res.cand, same
+	}
+	cands := r.candidatesLocked(dir, albumTitle)
+	r.mu.Unlock()
+
+	if len(cands) == 0 {
+		if prevPath == "" && prevCoverID == "" {
+			return "", sidecarCoverInfo{}, true
+		}
+		return "", sidecarCoverInfo{}, false
+	}
+	top := cands[0]
+	if sameSidecarPath(top.path, prevPath) &&
+		top.modTimeNs == prevModNs &&
+		top.size == prevSize &&
+		wasPresent {
+		return prevCoverID, top, true
+	}
+	id, chosen := r.resolveAndIngest(dir, albumTitle)
+	same := sameSidecarPath(chosen.path, prevPath) &&
+		chosen.modTimeNs == prevModNs &&
+		chosen.size == prevSize &&
+		id == prevCoverID &&
+		(chosen.path == "" || wasPresent)
+	return id, chosen, same
 }
 
 var (

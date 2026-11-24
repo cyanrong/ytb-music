@@ -512,7 +512,7 @@ func parseWAV(f *os.File, fileSize int64, m *parsedMeta) error {
 							bps = validBits
 						}
 					}
-					if sr > 0 && sr <= 45158400 && ch > 0 {
+					if sr > 0 && sr <= maxDSDSampleRate && ch > 0 {
 						m.spec.Channels = ch
 						m.spec.SampleRate = int(sr)
 						m.spec.BitDepth = bps
@@ -642,7 +642,7 @@ func parseAIFF(f *os.File, fileSize int64, m *parsedMeta) error {
 					frames := uint64(binary.BigEndian.Uint32(b[2:6]))
 					sampleSize := int(int16(binary.BigEndian.Uint16(b[6:8])))
 					rateF := parseIEEE80(b[8:18])
-					if ch > 0 && sampleSize > 0 && !math.IsNaN(rateF) && !math.IsInf(rateF, 0) && rateF >= 1 && rateF <= 45158400 {
+					if ch > 0 && sampleSize > 0 && !math.IsNaN(rateF) && !math.IsInf(rateF, 0) && rateF >= 1 && rateF <= maxDSDSampleRate {
 						sr := int(math.Round(rateF))
 						m.spec.Channels = ch
 						m.spec.BitDepth = sampleSize
@@ -745,7 +745,7 @@ func parseDSF(f *os.File, fileSize int64, m *parsedMeta) error {
 	sampleRateU := binary.LittleEndian.Uint32(fmtHdr[28:32])
 	sampleCount := binary.LittleEndian.Uint64(fmtHdr[36:44])
 	blockSizeU := binary.LittleEndian.Uint32(fmtHdr[44:48])
-	if channelsU < 1 || channelsU > 64 || sampleRateU < 1 || sampleRateU > 45158400 {
+	if channelsU < 1 || channelsU > 64 || sampleRateU < 1 || sampleRateU > maxDSDSampleRate {
 		return errors.New("localmusic: invalid DSF format parameters")
 	}
 	channels := int(channelsU)
@@ -900,7 +900,7 @@ func parseDFFProp(b []byte, m *parsedMeta) {
 		case "FS  ":
 			if len(sub) >= 4 {
 				sr := binary.BigEndian.Uint32(sub[0:4])
-				if sr <= 45158400 {
+				if sr <= maxDSDSampleRate {
 					m.spec.SampleRate = int(sr)
 				}
 			}
@@ -2132,7 +2132,7 @@ func findWavPackCustomRate(b []byte) int {
 			if len(payload) >= 4 {
 				srU |= uint32(payload[3]) << 24
 			}
-			if srU <= 45158400 {
+			if srU <= maxDSDSampleRate {
 				return int(srU)
 			}
 			return 0

@@ -339,6 +339,23 @@ func (s *Server) HasOnlyAACListeners() bool {
 	return hasAAC && !hasWAV
 }
 
+func (s *Server) activeRoonSinkHasAAC(rs *roonSink) bool {
+	if s == nil || rs == nil {
+		return false
+	}
+	s.hubMu.Lock()
+	defer s.hubMu.Unlock()
+	if s.activeSink != rs {
+		return false
+	}
+	for sub := range s.subs {
+		if sub.aac {
+			return true
+		}
+	}
+	return false
+}
+
 func (s *Server) SetOnListeners(fn func(int)) {
 	s.hubMu.Lock()
 	s.onListeners = fn
@@ -655,6 +672,16 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 	if err != nil {
 		return 0, "", "", "", 0, err
 	}
+	var closeDecOnce sync.Once
+	closeDec := func() {
+		closeDecOnce.Do(func() {
+			_ = dec.Close()
+		})
+	}
+	stopPrepCancel := func() bool { return false }
+	if src.Downloading {
+		stopPrepCancel = context.AfterFunc(ctx, closeDec)
+	}
 
 	sr := dec.SampleRate()
 	if sr <= 0 {
@@ -677,12 +704,18 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 	hitEOF := false
 	for len(preBuf) < prebufTarget {
 		if cerr := ctx.Err(); cerr != nil {
-			_ = dec.Close()
+			stopPrepCancel()
+			closeDec()
 			return 0, "", "", "", 0, cerr
 		}
 		remFrames := (prebufTarget - len(preBuf)) / blockAlign
 		readFrames := min(chunkFrames, max(1, remFrames))
 		nFloats, derr := dec.Read(floatBuf[:readFrames*channels])
+		if cerr := ctx.Err(); cerr != nil {
+			stopPrepCancel()
+			closeDec()
+			return 0, "", "", "", 0, cerr
+		}
 		nFrames := nFloats / channels
 		if nFrames > 0 {
 			nBytes := encodePCM24LE(pcmBuf, floatBuf[:nFrames*channels], 1.0)
@@ -693,7 +726,8 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 				hitEOF = true
 				break
 			}
-			_ = dec.Close()
+			stopPrepCancel()
+			closeDec()
 			if cerr := ctx.Err(); cerr != nil {
 				return 0, "", "", "", 0, cerr
 			}
@@ -705,7 +739,15 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 		}
 	}
 
-	progressive := src.Downloading && !hitEOF
+	var estimatedFrames int64
+	if frames := dec.Len(); frames > 0 {
+		estimatedFrames = frames
+	} else if src.Duration > 0 {
+		estimatedFrames = int64(math.Round(src.Duration.Seconds() * float64(sr)))
+	}
+	estimatedDataBytes := estimatedFrames * blockAlign
+	prebufferedBytes := int64(len(preBuf))
+	progressive := src.Downloading && !hitEOF && estimatedFrames > 0 && estimatedDataBytes > prebufferedBytes
 	if coverCh != nil {
 		coverWait := 1500 * time.Millisecond
 		if progressive {
@@ -716,7 +758,8 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 		case coverData = <-coverCh:
 		case <-ctx.Done():
 			timer.Stop()
-			_ = dec.Close()
+			stopPrepCancel()
+			closeDec()
 			return 0, "", "", "", 0, ctx.Err()
 		case <-timer.C:
 		}
@@ -729,11 +772,13 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 	wavPath := filepath.Join(hqpDir, fmt.Sprintf("track-%d.wav", seq))
 	f, err := os.OpenFile(wavPath, os.O_CREATE|os.O_RDWR|os.O_TRUNC, 0o600)
 	if err != nil {
-		_ = dec.Close()
+		stopPrepCancel()
+		closeDec()
 		return 0, "", "", "", 0, err
 	}
 	cleanupSyncErr := func(cerr error) (uint64, string, string, string, time.Duration, error) {
-		_ = dec.Close()
+		stopPrepCancel()
+		closeDec()
 		_ = f.Close()
 		_ = os.Remove(wavPath)
 		return 0, "", "", "", 0, cerr
@@ -757,6 +802,9 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 				return cleanupSyncErr(cerr)
 			}
 			nFloats, derr := dec.Read(floatBuf)
+			if cerr := ctx.Err(); cerr != nil {
+				return cleanupSyncErr(cerr)
+			}
 			nFrames := nFloats / channels
 			if nFrames > 0 {
 				nBytes := encodePCM24LE(pcmBuf, floatBuf[:nFrames*channels], 1.0)
@@ -778,7 +826,8 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 				break
 			}
 		}
-		_ = dec.Close()
+		stopPrepCancel()
+		closeDec()
 
 		if pcmBytes == 0 {
 			var silentFrame [blockAlign]byte
@@ -832,15 +881,6 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 
 	// Progressive streaming path: write upfront RIFF/RF64 header for estimatedDataBytes
 	// and continue decoding in a background goroutine while serving HTTP 206 byte ranges.
-	estimatedFrames := dec.Len()
-	if estimatedFrames <= 0 && src.Duration > 0 {
-		estimatedFrames = int64(math.Round(src.Duration.Seconds() * float64(sr)))
-	}
-	preFrames := int64(len(preBuf) / blockAlign)
-	if estimatedFrames <= preFrames {
-		estimatedFrames = preFrames + int64(sr)*30
-	}
-	estimatedDataBytes := estimatedFrames * blockAlign
 	hdr := encodeWAVContainerHeader(sr, channels, 24, id3Chunk, estimatedDataBytes)
 	if _, err := f.Write(hdr); err != nil {
 		return cleanupSyncErr(err)
@@ -850,6 +890,7 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 			return cleanupSyncErr(err)
 		}
 	}
+	stopPrepCancel()
 
 	written := int64(len(hdr)) + int64(len(preBuf))
 	totalSize := int64(len(hdr)) + estimatedDataBytes
@@ -870,9 +911,11 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 	secret := s.registerHQPEntry(seq, entry)
 
 	go func() {
+		stopCancel := context.AfterFunc(bgCtx, closeDec)
 		defer close(prog.doneCh)
 		defer f.Close()
-		defer dec.Close()
+		defer closeDec()
+		defer stopCancel()
 
 		bgFloats := make([]float32, chunkFrames*channels)
 		bgPCM := make([]byte, chunkFrames*blockAlign)
@@ -883,6 +926,10 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 				return
 			}
 			nFloats, derr := dec.Read(bgFloats)
+			if cerr := bgCtx.Err(); cerr != nil {
+				prog.finish(cerr)
+				return
+			}
 			nFrames := nFloats / channels
 			if nFrames > 0 {
 				nBytes := encodePCM24LE(bgPCM, bgFloats[:nFrames*channels], 1.0)
@@ -910,9 +957,19 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 			}
 		}
 
-		// Pad trailing zeros to estimatedDataBytes when EOF arrives slightly early
-		// (e.g. AAC priming/padding trim) so Content-Range never short-reads.
+		// Bound EOF zero-padding strictly to minor codec/priming rounding discrepancies (<= 2s).
 		if cur < totalSize {
+			if cerr := bgCtx.Err(); cerr != nil {
+				prog.finish(cerr)
+				return
+			}
+			writtenPCM := cur - int64(len(hdr))
+			shortfall := estimatedDataBytes - writtenPCM
+			maxPad := int64(sr) * blockAlign * 2
+			if shortfall > maxPad {
+				prog.finish(io.ErrUnexpectedEOF)
+				return
+			}
 			zeroBuf := make([]byte, 64<<10)
 			for cur < totalSize {
 				if cerr := bgCtx.Err(); cerr != nil {
@@ -941,6 +998,19 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 		coverURL = fmt.Sprintf("%s/hqp/%s/%d/cover.jpg", base, secret, seq)
 	}
 	return seq, "", wavURL, coverURL, actualDur, nil
+}
+
+func detectCoverMIME(b []byte) string {
+	switch {
+	case len(b) >= 8 && string(b[:8]) == "\x89PNG\r\n\x1a\n":
+		return "image/png"
+	case len(b) >= 12 && string(b[0:4]) == "RIFF" && string(b[8:12]) == "WEBP":
+		return "image/webp"
+	case len(b) >= 4 && string(b[:4]) == "GIF8":
+		return "image/gif"
+	default:
+		return "image/jpeg"
+	}
 }
 
 func id3Syncsafe(n int) [4]byte {
@@ -974,23 +1044,20 @@ func appendID3v24Text(buf *bytes.Buffer, id, val string) {
 	appendID3v24Frame(buf, id, p.Bytes())
 }
 
-func buildWAVID3Chunk(title, artist, album string, coverJPEG []byte) []byte {
+func buildWAVID3Chunk(title, artist, album string, coverData []byte) []byte {
 	var frames bytes.Buffer
 	appendID3v24Text(&frames, "TIT2", title)
 	appendID3v24Text(&frames, "TPE1", artist)
 	appendID3v24Text(&frames, "TALB", album)
-	if len(coverJPEG) > 0 {
-		mime := "image/jpeg"
-		if len(coverJPEG) >= 8 && string(coverJPEG[:4]) == "\x89PNG" {
-			mime = "image/png"
-		}
+	if len(coverData) > 0 {
+		mime := detectCoverMIME(coverData)
 		var apic bytes.Buffer
 		apic.WriteByte(0) // ISO-8859-1 description
 		apic.WriteString(mime)
 		apic.WriteByte(0)
 		apic.WriteByte(3) // Front cover
 		apic.WriteByte(0) // empty description + NUL
-		apic.Write(coverJPEG)
+		apic.Write(coverData)
 		appendID3v24Frame(&frames, "APIC", apic.Bytes())
 	}
 	if frames.Len() == 0 {
@@ -1093,11 +1160,7 @@ func (s *Server) serveHQPCover(w http.ResponseWriter, r *http.Request, seq uint6
 		http.NotFound(w, r)
 		return
 	}
-	contentType := "image/jpeg"
-	if len(entry.coverData) >= 8 && string(entry.coverData[:4]) == "\x89PNG" {
-		contentType = "image/png"
-	}
-	w.Header().Set("Content-Type", contentType)
+	w.Header().Set("Content-Type", detectCoverMIME(entry.coverData))
 	w.Header().Set("Content-Length", strconv.Itoa(len(entry.coverData)))
 	if r.Method == http.MethodHead {
 		w.WriteHeader(http.StatusOK)

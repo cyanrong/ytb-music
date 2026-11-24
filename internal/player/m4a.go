@@ -22,6 +22,7 @@ import (
 // for the visualizers.
 type m4aStream struct {
 	dl      *download
+	file    *downloadFile
 	dec     audio.Decoder
 	pos     int64 // the frame decoded next
 	spec    *spectrum
@@ -31,12 +32,13 @@ type m4aStream struct {
 }
 
 func openM4AStream(dl *download) (*m4aStream, error) {
-	dec, err := mp4.NewDecoder(&downloadFile{d: dl})
+	df := &downloadFile{d: dl}
+	dec, err := mp4.NewDecoder(df)
 	if err != nil {
 		return nil, err
 	}
 	spec := newSpectrum(dec.SampleRate(), max(dec.Len(), 0))
-	s := &m4aStream{dl: dl, dec: dec, spec: spec, writer: newSpecWriter(spec), drop: dl.Close}
+	s := &m4aStream{dl: dl, file: df, dec: dec, spec: spec, writer: newSpecWriter(spec), drop: dl.Close}
 	return s, nil
 }
 
@@ -64,7 +66,12 @@ func (s *m4aStream) SetPosition(frame int64) error {
 func (s *m4aStream) source() (*download, *spectrum) { return s.dl, s.spec }
 
 func (s *m4aStream) Close() error {
-	s.closeMu.Do(s.drop)
+	s.closeMu.Do(func() {
+		s.file.closeReader()
+		if s.drop != nil {
+			s.drop()
+		}
+	})
 	return nil
 }
 
@@ -72,18 +79,36 @@ func (s *m4aStream) Close() error {
 // the bytes asked of it: the MP4 decoder reads the header, then each
 // fragment as it plays.
 type downloadFile struct {
-	d   *download
-	pos int64
+	d      *download
+	pos    int64
+	closed bool // guarded by d.mu
+}
+
+func (f *downloadFile) closeReader() {
+	if f == nil || f.d == nil {
+		return
+	}
+	d := f.d
+	d.mu.Lock()
+	f.closed = true
+	d.cond.Broadcast()
+	d.mu.Unlock()
 }
 
 func (f *downloadFile) size() (int64, error) {
 	if f.d.size > 0 {
 		return f.d.size, nil
 	}
-	n := f.d.waitFor(1 << 62)
-	f.d.mu.Lock()
-	err := f.d.err
-	f.d.mu.Unlock()
+	d := f.d
+	d.mu.Lock()
+	for !d.done && !f.closed {
+		d.cond.Wait()
+	}
+	n, err, closed := d.n, d.err, f.closed
+	d.mu.Unlock()
+	if closed {
+		return 0, io.ErrClosedPipe
+	}
 	return n, err
 }
 
@@ -98,8 +123,11 @@ func (f *downloadFile) ReadAt(b []byte, off int64) (int, error) {
 	}
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	for d.n < want && !d.done {
+	for d.n < want && !d.done && !f.closed {
 		d.cond.Wait()
+	}
+	if f.closed {
+		return 0, io.ErrClosedPipe
 	}
 	n, err := d.readAt(b, off)
 	if n < len(b) {

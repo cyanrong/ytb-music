@@ -172,8 +172,12 @@ func (s AudioSpec) Detail() string {
 	return strings.Join(parts, " · ")
 }
 
+const maxDSDSampleRate = 98304000 // 48000 * 2048 (DSD2048x48)
+
 func dsdCodecName(sampleRate int) string {
 	switch {
+	case sampleRate >= 90316800:
+		return "DSD2048"
 	case sampleRate >= 45158400:
 		return "DSD1024"
 	case sampleRate >= 22579200:

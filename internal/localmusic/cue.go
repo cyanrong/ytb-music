@@ -363,6 +363,17 @@ func loadCueTracks(cuePath string, addedAt int64, covers *folderCoverResolver) (
 			allRefs = append(allRefs, litRef)
 		}
 
+		hasAudioTrack := false
+		for _, te := range fb.tracks {
+			if te.mode == "AUDIO" {
+				hasAudioTrack = true
+				break
+			}
+		}
+		if !hasAudioTrack {
+			continue
+		}
+
 		audioPath, audioInfo, ok := resolveCueAudioFile(cleanCuePath, fb.rawName)
 		if !ok {
 			continue
@@ -373,11 +384,7 @@ func loadCueTracks(cuePath string, addedAt int64, covers *folderCoverResolver) (
 			continue
 		}
 
-		ckey := canonicalPathKey(audioPath)
-		if !seenCons[ckey] {
-			seenCons[ckey] = true
-			consumed = append(consumed, audioPath)
-		}
+		tracksBefore := len(tracks)
 
 		albumTitle := cs.title
 		if albumTitle == "" {
@@ -537,6 +544,14 @@ func loadCueTracks(cuePath string, addedAt int64, covers *folderCoverResolver) (
 				SidecarModNs:  sidecarInfo.modTimeNs,
 				SidecarSize:   sidecarInfo.size,
 			})
+		}
+
+		if len(tracks) > tracksBefore {
+			ckey := canonicalPathKey(audioPath)
+			if !seenCons[ckey] {
+				seenCons[ckey] = true
+				consumed = append(consumed, audioPath)
+			}
 		}
 	}
 

@@ -77,10 +77,32 @@ type cachedCue struct {
 	ModTimeNs    int64                 `json:"modTimeNs"`
 	AddedAt      int64                 `json:"addedAt"`
 	CoverTracked bool                  `json:"coverTracked,omitempty"`
+	RefTracked   bool                  `json:"refTracked,omitempty"`
 	AllRefs      []string              `json:"allRefs,omitempty"`
+	ResolvedRefs []cachedCueFileRef    `json:"resolvedRefs,omitempty"`
 	Consumed     []cachedCueFileRef    `json:"consumed,omitempty"`
 	TrackCovers  []cachedCueTrackCover `json:"trackCovers,omitempty"`
 	Tracks       []LocalTrack          `json:"tracks,omitempty"`
+}
+
+func cloneCachedFile(cf cachedFile) cachedFile {
+	cf.Track = cloneTrack(cf.Track)
+	return cf
+}
+
+func cloneCachedCue(cc cachedCue) cachedCue {
+	cc.AllRefs = slices.Clone(cc.AllRefs)
+	cc.ResolvedRefs = slices.Clone(cc.ResolvedRefs)
+	cc.Consumed = slices.Clone(cc.Consumed)
+	cc.TrackCovers = slices.Clone(cc.TrackCovers)
+	if cc.Tracks != nil {
+		tracks := make([]LocalTrack, len(cc.Tracks))
+		for i := range cc.Tracks {
+			tracks[i] = cloneTrack(cc.Tracks[i])
+		}
+		cc.Tracks = tracks
+	}
+	return cc
 }
 
 type persistedIndex struct {
@@ -382,16 +404,19 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 	l.scanMu.Lock()
 	defer l.scanMu.Unlock()
 
-	l.mu.Lock()
+	l.mu.RLock()
 	roots := slices.Clone(l.folders)
 	prevFiles := make(map[string]cachedFile, len(l.files))
 	for k, v := range l.files {
-		prevFiles[k] = v
+		prevFiles[k] = cloneCachedFile(v)
 	}
 	prevCues := make(map[string]cachedCue, len(l.cues))
 	for k, v := range l.cues {
-		prevCues[k] = v
+		prevCues[k] = cloneCachedCue(v)
 	}
+	l.mu.RUnlock()
+
+	l.mu.Lock()
 	l.progress = ScanProgress{Scanning: true}
 	l.mu.Unlock()
 
@@ -550,10 +575,14 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 			len(prev.AllRefs) > 0 &&
 			len(prev.TrackCovers) == len(prev.Tracks) {
 
-			refsUnchanged := true
-			prevConsMap := make(map[string]cachedCueFileRef, len(prev.Consumed))
-			for _, ref := range prev.Consumed {
-				prevConsMap[canonicalPathKey(ref.Path)] = ref
+			refsUnchanged := prev.RefTracked || len(prev.Tracks) > 0
+			expectedRefs := prev.ResolvedRefs
+			if !prev.RefTracked {
+				expectedRefs = prev.Consumed
+			}
+			prevRefMap := make(map[string]cachedCueFileRef, len(expectedRefs))
+			for _, ref := range expectedRefs {
+				prevRefMap[canonicalPathKey(ref.Path)] = ref
 			}
 			curResolved := make(map[string]cachedCueFileRef, len(prev.AllRefs))
 			for _, litRef := range prev.AllRefs {
@@ -564,11 +593,11 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 				rk := canonicalPathKey(rPath)
 				curResolved[rk] = cachedCueFileRef{Path: rPath, Size: rSize, ModTimeNs: rModNs}
 			}
-			if len(curResolved) != len(prevConsMap) {
+			if len(curResolved) != len(prevRefMap) {
 				refsUnchanged = false
 			} else {
 				for rk, cur := range curResolved {
-					old, exists := prevConsMap[rk]
+					old, exists := prevRefMap[rk]
 					if !exists || old.Size != cur.Size || old.ModTimeNs != cur.ModTimeNs {
 						refsUnchanged = false
 						break
@@ -589,30 +618,20 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 
 			if refsUnchanged {
 				updatedCue := prev
-				clonedSlices := false
 				for i := range updatedCue.Tracks {
 					tc := updatedCue.TrackCovers[i]
 					if tc.EmbeddedCover {
 						continue
 					}
-					cand := covers.candidate(updatedCue.Tracks[i].Dir, tc.AlbumTitle)
-					sameSidecar := sameSidecarPath(cand.path, tc.SidecarCover) &&
-						cand.modTimeNs == tc.SidecarModNs &&
-						cand.size == tc.SidecarSize
-					coverOK := cand.path == "" || l.coverDir == "" || (updatedCue.Tracks[i].CoverID != "" && coverPresent(updatedCue.Tracks[i].CoverID))
-					if sameSidecar && coverOK {
+					covID, cand, same := covers.checkCachedOrResolve(
+						updatedCue.Tracks[i].Dir, tc.AlbumTitle,
+						tc.SidecarCover, tc.SidecarModNs, tc.SidecarSize, updatedCue.Tracks[i].CoverID,
+						coverPresent,
+					)
+					if same {
 						continue
 					}
-					if !clonedSlices {
-						tracksCp := make([]LocalTrack, len(updatedCue.Tracks))
-						for ti := range updatedCue.Tracks {
-							tracksCp[ti] = cloneTrack(updatedCue.Tracks[ti])
-						}
-						updatedCue.Tracks = tracksCp
-						updatedCue.TrackCovers = slices.Clone(updatedCue.TrackCovers)
-						clonedSlices = true
-					}
-					updatedCue.Tracks[i].CoverID = covers.ingest(cand)
+					updatedCue.Tracks[i].CoverID = covID
 					updatedCue.TrackCovers[i] = cachedCueTrackCover{
 						EmbeddedCover: false,
 						AlbumTitle:    tc.AlbumTitle,
@@ -642,6 +661,20 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 			continue
 		}
 
+		var resolvedRefs []cachedCueFileRef
+		seenRes := map[string]bool{}
+		for _, litRef := range loaded.allRefs {
+			rPath, rSize, rModNs, exists := resolveCueLiteralRef(cw.path, litRef, seenAudio)
+			if !exists {
+				continue
+			}
+			rk := canonicalPathKey(rPath)
+			if !seenRes[rk] {
+				seenRes[rk] = true
+				resolvedRefs = append(resolvedRefs, cachedCueFileRef{Path: rPath, Size: rSize, ModTimeNs: rModNs})
+			}
+		}
+
 		var refs []cachedCueFileRef
 		for _, cp := range loaded.consumed {
 			ck := canonicalPathKey(cp)
@@ -658,7 +691,9 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 			ModTimeNs:    cw.modTimeNs,
 			AddedAt:      addedAt,
 			CoverTracked: true,
+			RefTracked:   true,
 			AllRefs:      loaded.allRefs,
+			ResolvedRefs: resolvedRefs,
 			Consumed:     refs,
 			TrackCovers:  loaded.trackCovers,
 			Tracks:       loaded.tracks,
@@ -679,18 +714,17 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 					continue
 				}
 			} else {
-				cand := covers.candidate(prev.Track.Dir, prev.Track.Album)
-				sameSidecar := sameSidecarPath(cand.path, prev.SidecarCover) &&
-					cand.modTimeNs == prev.SidecarModNs &&
-					cand.size == prev.SidecarSize
-				coverOK := cand.path == "" || l.coverDir == "" || (prev.Track.CoverID != "" && coverPresent(prev.Track.CoverID))
-				if sameSidecar && coverOK {
+				covID, cand, same := covers.checkCachedOrResolve(
+					prev.Track.Dir, prev.Track.Album,
+					prev.SidecarCover, prev.SidecarModNs, prev.SidecarSize, prev.Track.CoverID,
+					coverPresent,
+				)
+				if same {
 					nextFiles[aw.key] = prev
 					continue
 				}
 				updated := prev
-				updated.Track = cloneTrack(prev.Track)
-				updated.Track.CoverID = covers.ingest(cand)
+				updated.Track.CoverID = covID
 				updated.SidecarCover = cand.path
 				updated.SidecarModNs = cand.modTimeNs
 				updated.SidecarSize = cand.size
@@ -800,7 +834,7 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 					continue
 				}
 				if isUnderAnyFolder(cf.Path, unavailPaths) && !isUnderAnyFolder(cf.Path, readableRoots) {
-					nextFiles[k] = cf
+					nextFiles[k] = cloneCachedFile(cf)
 				}
 			}
 			for k, cc := range l.cues {
@@ -808,7 +842,7 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 					continue
 				}
 				if isUnderAnyFolder(cc.Path, unavailPaths) && !isUnderAnyFolder(cc.Path, readableRoots) {
-					nextCues[k] = cc
+					nextCues[k] = cloneCachedCue(cc)
 				}
 			}
 		}
@@ -2079,20 +2113,21 @@ func (l *Library) applyPersistedRoonGenresLocked() {
 			albID = makeAlbumID(cf.Track.Album, cf.Track.AlbumArtist, grpDir)
 		}
 		if rgs, ok := l.roonGenres[albID]; ok {
-			changed := false
+			var missing []string
 			for _, g := range rgs {
 				if !containsFold(cf.Track.Genres, g) {
-					cf.Track.Genres = append(cf.Track.Genres, g)
-					changed = true
+					missing = append(missing, g)
 				}
 			}
-			if changed {
+			if len(missing) > 0 {
+				cf.Track = cloneTrack(cf.Track)
+				cf.Track.Genres = append(cf.Track.Genres, missing...)
 				l.files[k] = cf
 			}
 		}
 	}
 	for k, cc := range l.cues {
-		changed := false
+		cloned := false
 		for i := range cc.Tracks {
 			tr := &cc.Tracks[i]
 			grpDir := albumGroupDir(tr.Dir)
@@ -2103,13 +2138,21 @@ func (l *Library) applyPersistedRoonGenresLocked() {
 			if rgs, ok := l.roonGenres[albID]; ok {
 				for _, g := range rgs {
 					if !containsFold(tr.Genres, g) {
+						if !cloned {
+							tracksCp := make([]LocalTrack, len(cc.Tracks))
+							for ti := range cc.Tracks {
+								tracksCp[ti] = cloneTrack(cc.Tracks[ti])
+							}
+							cc.Tracks = tracksCp
+							tr = &cc.Tracks[i]
+							cloned = true
+						}
 						tr.Genres = append(tr.Genres, g)
-						changed = true
 					}
 				}
 			}
 		}
-		if changed {
+		if cloned {
 			l.cues[k] = cc
 		}
 	}

@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -266,6 +267,9 @@ func TestExtend(t *testing.T) {
 func TestSkipGuardAndErrorText(t *testing.T) {
 	was := songURL
 	defer func() { songURL = was }()
+	wasLyrics := fetchLyrics
+	fetchLyrics = func(*ytm.Track) (string, string, string, error) { return "", "", "", nil }
+	defer func() { fetchLyrics = wasLyrics }()
 
 	queue := make([]ytm.Track, 8)
 	for i := range queue {
@@ -601,14 +605,10 @@ func TestLocalNativeBackendWithoutPCMDecoderAndDownloadingFlag(t *testing.T) {
 		t.Fatal(err)
 	}
 	holdDownload := make(chan struct{})
-	var closeHoldOnce struct{ done bool }
+	var releaseOnce sync.Once
 	releaseHold := func() {
-		if !closeHoldOnce.done {
-			closeHoldOnce.done = true
-			close(holdDownload)
-		}
+		releaseOnce.Do(func() { close(holdDownload) })
 	}
-	defer releaseHold()
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/slow.m4a" {
 			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(m4aBytes)+4096))
@@ -616,15 +616,26 @@ func TestLocalNativeBackendWithoutPCMDecoderAndDownloadingFlag(t *testing.T) {
 			if fl, ok := w.(http.Flusher); ok {
 				fl.Flush()
 			}
-			<-holdDownload
+			select {
+			case <-holdDownload:
+			case <-r.Context().Done():
+			}
 			return
 		}
 		_, _ = w.Write(m4aBytes)
 	}))
 	defer srv.Close()
+	defer releaseHold()
 
 	was := songURL
 	defer func() { songURL = was }()
+	wasLyrics := fetchLyrics
+	var lyricsCalls atomic.Int32
+	fetchLyrics = func(*ytm.Track) (string, string, string, error) {
+		lyricsCalls.Add(1)
+		return "[00:01.00]Stubbed", "", "", nil
+	}
+	defer func() { fetchLyrics = wasLyrics }()
 	songURL = func(id, level string) (*ytm.Stream, error) {
 		if id == "online_slow" {
 			return &ytm.Stream{URL: srv.URL + "/slow.m4a", Size: int64(len(m4aBytes) + 4096), Type: "m4a", Level: "standard"}, nil
@@ -654,6 +665,33 @@ func TestLocalNativeBackendWithoutPCMDecoderAndDownloadingFlag(t *testing.T) {
 		slowDL, _ = p.stream.source()
 	}
 
+	// Verify closing a shared OpenPCM stream wakes an in-flight blocked Read immediately without closing slowDL.
+	sharedDec, err := be.gotSrc.OpenPCM()
+	if err != nil {
+		t.Fatalf("OpenPCM on slow stream: %v", err)
+	}
+	readDone := make(chan error, 1)
+	go func() {
+		buf := make([]float32, 8192)
+		for {
+			_, rerr := sharedDec.Read(buf)
+			if rerr != nil {
+				readDone <- rerr
+				return
+			}
+		}
+	}()
+	time.Sleep(25 * time.Millisecond)
+	_ = sharedDec.Close()
+	select {
+	case rerr := <-readDone:
+		if rerr == nil {
+			t.Fatal("closed shared PCMDecoder returned nil error")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("shared PCMDecoder.Close did not unblock in-flight Read")
+	}
+
 	// Pre-populate cache for online_cached and verify Downloading is false.
 	dl := p.Cache.download("online_cached", &ytm.Stream{URL: srv.URL + "/fast.m4a", Size: int64(len(m4aBytes)), Type: "m4a", Level: "standard"})
 	dl.waitFor(int64(len(m4aBytes)))
@@ -676,6 +714,9 @@ func TestLocalNativeBackendWithoutPCMDecoderAndDownloadingFlag(t *testing.T) {
 	}
 	if be.gotSrc.Downloading {
 		t.Fatal("cached online track reported TrackSource.Downloading = true, want false")
+	}
+	if lyricsCalls.Load() < 2 {
+		t.Fatalf("fetchLyrics stub called %d times, want >= 2", lyricsCalls.Load())
 	}
 	var curDL *download
 	if p.stream != nil {

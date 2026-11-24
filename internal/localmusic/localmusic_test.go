@@ -1707,6 +1707,397 @@ func TestLibraryRevisionAndTrackByIDWithoutDecoder(t *testing.T) {
 	}
 }
 
+// TestConcurrentScanAndApplyRoonGenresOnCueSheet checks that an in-flight Scan and concurrent ApplyRoonGenres isolate CUE track slices without racing or dropping genres (fixing unsynchronized prevCues sharing with applyPersistedRoonGenresLocked).
+func TestConcurrentScanAndApplyRoonGenresOnCueSheet(t *testing.T) {
+	root := t.TempDir()
+	cueDir := filepath.Join(root, "music", "cue_album")
+	flacDir := filepath.Join(root, "music", "standalone")
+	for _, d := range []string{cueDir, flacDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pcm := make([]byte, 44100*2*4)
+	if err := os.WriteFile(filepath.Join(cueDir, "disc.wav"), buildPCM16WAV(44100, 2, pcm), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cueText := strings.Join([]string{
+		`PERFORMER "Bill Evans Trio"`,
+		`TITLE "Sunday at the Village Vanguard"`,
+		`FILE "disc.wav" WAVE`,
+		`  TRACK 01 AUDIO`,
+		`    TITLE "Gloria's Step"`,
+		`    INDEX 01 00:00:00`,
+		`  TRACK 02 AUDIO`,
+		`    TITLE "Alice in Wonderland"`,
+		`    INDEX 01 00:01:00`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(cueDir, "disc.cue"), []byte(cueText), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	flacPath := filepath.Join(flacDir, "01 - Trigger.flac")
+	if err := os.WriteFile(flacPath, buildSyntheticFLAC(44100, 2, 16, 44100*10, []string{
+		"TITLE=Trigger",
+		"ARTIST=Soloist",
+		"ALBUM=Trigger Album",
+	}, nil), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	lib := NewLibrary(filepath.Join(root, "index.json"), filepath.Join(root, "covers"))
+	lib.AddFolder(filepath.Join(root, "music"))
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("initial Scan failed: %v", err)
+	}
+
+	roonSets := [][]string{
+		{"Jazz"},
+		{"Post-Bop"},
+		{"Cool Jazz"},
+		{"Live Jazz"},
+	}
+	prevHook := onFileParsedHook
+	onFileParsedHook = func(string) {
+		for _, gs := range roonSets {
+			lib.ApplyRoonGenres([]RoonAlbumGenre{{
+				Album:  "Sunday at the Village Vanguard",
+				Artist: "Bill Evans Trio",
+				Genres: gs,
+			}})
+		}
+	}
+	defer func() { onFileParsedHook = prevHook }()
+
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for i := 0; ; i++ {
+			select {
+			case <-done:
+				return
+			default:
+				lib.ApplyRoonGenres([]RoonAlbumGenre{{
+					Album:  "Sunday at the Village Vanguard",
+					Artist: "Bill Evans Trio",
+					Genres: roonSets[i%len(roonSets)],
+				}})
+				_ = lib.Tracks("", "", "cue")
+			}
+		}
+	}()
+
+	for round := range 4 {
+		cov := []byte{0xFF, 0xD8, 0xFF, 0xE0, byte('A' + round), 0xFF, 0xD9}
+		covPath := filepath.Join(cueDir, "cover.jpg")
+		if err := os.WriteFile(covPath, cov, 0o644); err != nil {
+			close(done)
+			wg.Wait()
+			t.Fatal(err)
+		}
+		ts := time.Unix(1_760_000_000+int64(round)*10, 0)
+		_ = os.Chtimes(covPath, ts, ts)
+		_ = os.Chtimes(flacPath, ts, ts)
+		if err := lib.Scan(context.Background(), nil); err != nil {
+			close(done)
+			wg.Wait()
+			t.Fatalf("concurrent Scan round %d failed: %v", round, err)
+		}
+	}
+	close(done)
+	wg.Wait()
+
+	cueTracks := lib.Tracks("", "", "cue")
+	if len(cueTracks) != 2 {
+		t.Fatalf("expected 2 CUE tracks after concurrent scans, got %d", len(cueTracks))
+	}
+	for _, tr := range cueTracks {
+		if tr.CoverID == "" {
+			t.Fatalf("expected CUE track CoverID populated, got %+v", tr)
+		}
+		for _, wantG := range []string{"Jazz", "Post-Bop", "Cool Jazz", "Live Jazz"} {
+			if !slices.Contains(tr.Genres, wantG) {
+				t.Fatalf("CUE track %q missing merged Roon genre %q in %v", tr.Title, wantG, tr.Genres)
+			}
+		}
+	}
+}
+
+// TestDataOnlyCueDoesNotSuppressSiblingAudioFile checks that a data-only MODE1/2352 CUE sheet keeps AllRefs tracked without hiding a basename-matching standalone audio file (fixing premature Consumed marking before AUDIO track extraction).
+func TestDataOnlyCueDoesNotSuppressSiblingAudioFile(t *testing.T) {
+	root := t.TempDir()
+	dataOnlyDir := filepath.Join(root, "music", "data_only")
+	mixedDir := filepath.Join(root, "music", "mixed_cue")
+	for _, d := range []string{dataOnlyDir, mixedDir} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	pcm := make([]byte, 44100*2*4)
+	// 1. Data-only CUE ("game.bin" -> basename fallback matches "game.wav"), zero AUDIO tracks.
+	if err := os.WriteFile(filepath.Join(dataOnlyDir, "game.wav"), buildPCM16WAV(44100, 2, pcm), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	dataCue := strings.Join([]string{
+		`FILE "game.bin" BINARY`,
+		`  TRACK 01 MODE1/2352`,
+		`    INDEX 01 00:00:00`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(dataOnlyDir, "game.cue"), []byte(dataCue), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 2. Mixed multi-FILE CUE: FILE 1 is MODE1/2352 matching bonus_data.wav; FILE 2 has an AUDIO track on disc_audio.wav.
+	if err := os.WriteFile(filepath.Join(mixedDir, "bonus_data.wav"), buildPCM16WAV(44100, 2, pcm), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(mixedDir, "disc_audio.wav"), buildPCM16WAV(44100, 2, pcm), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mixedCue := strings.Join([]string{
+		`PERFORMER "OST Composer"`,
+		`TITLE "Enhanced Disc"`,
+		`FILE "bonus_data.bin" BINARY`,
+		`  TRACK 01 MODE1/2352`,
+		`    INDEX 01 00:00:00`,
+		`FILE "disc_audio.wav" WAVE`,
+		`  TRACK 02 AUDIO`,
+		`    TITLE "Main Theme"`,
+		`    INDEX 01 00:00:00`,
+		"",
+	}, "\n")
+	if err := os.WriteFile(filepath.Join(mixedDir, "mixed.cue"), []byte(mixedCue), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var parsedCount atomic.Int32
+	prevHook := onFileParsedHook
+	onFileParsedHook = func(string) { parsedCount.Add(1) }
+	defer func() { onFileParsedHook = prevHook }()
+
+	lib := NewLibrary(filepath.Join(root, "index.json"), filepath.Join(root, "covers"))
+	lib.AddFolder(filepath.Join(root, "music"))
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("initial Scan failed: %v", err)
+	}
+
+	if got := lib.Tracks("game", "", ""); len(got) != 1 || got[0].Spec.IsCUE {
+		t.Fatalf("expected standalone game.wav to remain visible alongside MODE1/2352 game.cue, got %+v", got)
+	}
+	if got := lib.Tracks("bonus_data", "", ""); len(got) != 1 || got[0].Spec.IsCUE {
+		t.Fatalf("expected standalone bonus_data.wav from data-only FILE block to remain visible, got %+v", got)
+	}
+	if got := lib.Tracks("Main Theme", "", "cue"); len(got) != 1 {
+		t.Fatalf("expected AUDIO FILE block to yield Main Theme CUE track, got %+v", got)
+	}
+	if got := lib.Tracks("disc_audio", "", ""); len(got) != 0 {
+		t.Fatalf("expected whole-disc disc_audio.wav to be suppressed by its AUDIO CUE track, got %+v", got)
+	}
+
+	// Incremental rescan must reuse both the data-only CUE cache and standalone file cache without re-parsing.
+	parsedCount.Store(0)
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("incremental Scan failed: %v", err)
+	}
+	if got := parsedCount.Load(); got != 0 {
+		t.Fatalf("expected 0 standalone files re-parsed on unchanged incremental scan, got %d", got)
+	}
+	if got := lib.Tracks("game", "", ""); len(got) != 1 || got[0].Spec.IsCUE {
+		t.Fatalf("expected game.wav to remain visible after incremental scan, got %+v", got)
+	}
+}
+
+// TestDSD1024AndDSD2048x48TagAndPreviewDecode checks that 44.1kHz- and 48kHz-family DSD1024 and DSD2048 DSF/DFF streams parse and decimate cleanly up to 98.304 MHz while rejecting higher rates (fixing the 45.1584 MHz ceiling rejecting DSD1024x48).
+func TestDSD1024AndDSD2048x48TagAndPreviewDecode(t *testing.T) {
+	dir := t.TempDir()
+
+	cases := []struct {
+		name      string
+		rate      int
+		isDFF     bool
+		wantCodec string
+		wantOutSR int
+	}{
+		{name: "dsd1024_44.dsf", rate: 45158400, isDFF: false, wantCodec: "DSD1024", wantOutSR: 88200},
+		{name: "dsd1024_48.dsf", rate: 49152000, isDFF: false, wantCodec: "DSD1024", wantOutSR: 96000},
+		{name: "dsd1024_48.dff", rate: 49152000, isDFF: true, wantCodec: "DSD1024", wantOutSR: 96000},
+		{name: "dsd2048_44.dsf", rate: 90316800, isDFF: false, wantCodec: "DSD2048", wantOutSR: 88200},
+		{name: "dsd2048_48.dsf", rate: 98304000, isDFF: false, wantCodec: "DSD2048", wantOutSR: 96000},
+		{name: "dsd2048_48.dff", rate: 98304000, isDFF: true, wantCodec: "DSD2048", wantOutSR: 96000},
+	}
+
+	for _, tc := range cases {
+		var raw []byte
+		if tc.isDFF {
+			raw = buildSyntheticDFF(tc.rate, 2, 8192, tc.name, "High Rate DSD")
+		} else {
+			raw = buildSyntheticDSF(tc.rate, 2, 1, 1000.0, nil)
+		}
+		p := filepath.Join(dir, tc.name)
+		if err := os.WriteFile(p, raw, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		meta, err := parseAudioFile(p, int64(len(raw)))
+		if err != nil {
+			t.Fatalf("parseAudioFile(%s @ %d Hz) failed: %v", tc.name, tc.rate, err)
+		}
+		if meta.spec.SampleRate != tc.rate || meta.spec.Codec != tc.wantCodec || !meta.spec.IsDSD {
+			t.Fatalf("%s spec = %+v, want rate=%d codec=%s", tc.name, meta.spec, tc.rate, tc.wantCodec)
+		}
+
+		dec, err := OpenTrackDecoder(&LocalTrack{Path: p, Spec: meta.spec})
+		if err != nil {
+			t.Fatalf("OpenTrackDecoder(%s @ %d Hz) failed: %v", tc.name, tc.rate, err)
+		}
+		if dec.SampleRate() != tc.wantOutSR || dec.Len() <= 0 {
+			if c, ok := dec.(io.Closer); ok {
+				_ = c.Close()
+			}
+			t.Fatalf("%s decoder sr=%d len=%d, want sr=%d len>0", tc.name, dec.SampleRate(), dec.Len(), tc.wantOutSR)
+		}
+		buf := make([]float32, 32)
+		n, rerr := dec.Read(buf)
+		if c, ok := dec.(io.Closer); ok {
+			_ = c.Close()
+		}
+		if n == 0 || (rerr != nil && rerr != io.EOF) {
+			t.Fatalf("%s Read failed: n=%d err=%v", tc.name, n, rerr)
+		}
+	}
+
+	// Above 98304000 Hz must still be rejected by both parser and decoder.
+	overBytes := buildSyntheticDSF(2822400, 2, 1, 1000.0, nil)
+	binary.LittleEndian.PutUint32(overBytes[28+28:28+32], 98304001)
+	overPath := filepath.Join(dir, "too_high.dsf")
+	if err := os.WriteFile(overPath, overBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseAudioFile(overPath, int64(len(overBytes))); err == nil {
+		t.Fatal("expected DSF above 98304000 Hz to be rejected by parseAudioFile")
+	}
+	if dec, err := OpenTrackDecoder(&LocalTrack{Path: overPath}); err == nil {
+		if c, ok := dec.(io.Closer); ok {
+			_ = c.Close()
+		}
+		t.Fatal("expected DSF above 98304000 Hz to be rejected by OpenTrackDecoder")
+	}
+}
+
+// TestFolderCoverDeduplicatesInFlightReadsAndFallsBackOnUnreadableSidecar checks that parallel scan workers read an album sidecar cover once and fall through to the next candidate when the preferred cover is unreadable (fixing duplicate concurrent cover reads and caching unreadable sidecars).
+func TestFolderCoverDeduplicatesInFlightReadsAndFallsBackOnUnreadableSidecar(t *testing.T) {
+	root := t.TempDir()
+	albumDir := filepath.Join(root, "music", "Octet Album")
+	if err := os.MkdirAll(albumDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	for i := 1; i <= 8; i++ {
+		name := fmt.Sprintf("%02d - Movement %d.flac", i, i)
+		if err := os.WriteFile(filepath.Join(albumDir, name), buildSyntheticFLAC(96000, 2, 24, 96000*10, []string{
+			fmt.Sprintf("TITLE=Movement %d", i),
+			"ARTIST=Chamber Octet",
+			"ALBUM=Octet Sessions",
+			"ALBUMARTIST=Chamber Octet",
+			fmt.Sprintf("TRACKNUMBER=%d", i),
+		}, nil), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	coverJPGBytes := []byte{0xFF, 0xD8, 0xFF, 0xE0, 'C', 'O', 'V', 'J', 'P', 'G', 0xFF, 0xD9}
+	folderPNGBytes := []byte{0x89, 'P', 'N', 'G', 0x0D, 0x0A, 0x1A, 0x0A, 'F', 'L', 'D', 'R'}
+	coverJPGPath := filepath.Clean(filepath.Join(albumDir, "cover.jpg"))
+	folderPNGPath := filepath.Clean(filepath.Join(albumDir, "folder.png"))
+	if err := os.WriteFile(coverJPGPath, coverJPGBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(folderPNGPath, folderPNGBytes, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	var (
+		blockCoverJPG atomic.Bool
+		coverReads    atomic.Int32
+		folderReads   atomic.Int32
+	)
+	blockCoverJPG.Store(true)
+
+	origReadCover := readCoverFile
+	readCoverFile = func(p string) ([]byte, error) {
+		switch canonicalPathKey(p) {
+		case canonicalPathKey(coverJPGPath):
+			coverReads.Add(1)
+			if blockCoverJPG.Load() {
+				return nil, os.ErrPermission
+			}
+			return os.ReadFile(p)
+		case canonicalPathKey(folderPNGPath):
+			folderReads.Add(1)
+			time.Sleep(10 * time.Millisecond) // hold in-flight so all 8 scan workers converge
+			return os.ReadFile(p)
+		default:
+			return os.ReadFile(p)
+		}
+	}
+	defer func() { readCoverFile = origReadCover }()
+
+	lib := NewLibrary(filepath.Join(root, "index.json"), filepath.Join(root, "covers"))
+	lib.AddFolder(filepath.Join(root, "music"))
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("initial Scan failed: %v", err)
+	}
+
+	if got := coverReads.Load(); got != 1 {
+		t.Fatalf("expected unreadable cover.jpg to be probed once across 8 workers, got %d", got)
+	}
+	if got := folderReads.Load(); got != 1 {
+		t.Fatalf("expected fallback folder.png to be read & hashed once across 8 workers, got %d", got)
+	}
+
+	tracks := lib.Tracks("", "", "")
+	if len(tracks) != 8 {
+		t.Fatalf("expected 8 indexed tracks, got %d", len(tracks))
+	}
+	for _, tr := range tracks {
+		gotCov, err := lib.CoverBytes(tr.CoverID)
+		if err != nil || !bytes.Equal(gotCov, folderPNGBytes) {
+			t.Fatalf("track %q did not receive fallback folder.png cover: err=%v", tr.Title, err)
+		}
+	}
+
+	// Second incremental scan while cover.jpg remains unreadable must preserve folder.png.
+	folderReads.Store(0)
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("second Scan failed: %v", err)
+	}
+	if got := folderReads.Load(); got != 1 {
+		t.Fatalf("expected incremental fallback check to read folder.png once across 8 cached tracks, got %d", got)
+	}
+	for _, tr := range lib.Tracks("", "", "") {
+		gotCov, err := lib.CoverBytes(tr.CoverID)
+		if err != nil || !bytes.Equal(gotCov, folderPNGBytes) {
+			t.Fatalf("track %q lost fallback folder.png cover on incremental scan: err=%v", tr.Title, err)
+		}
+	}
+
+	// Once cover.jpg becomes readable, the next incremental scan upgrades all 8 tracks to cover.jpg.
+	blockCoverJPG.Store(false)
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("third Scan failed: %v", err)
+	}
+	for _, tr := range lib.Tracks("", "", "") {
+		gotCov, err := lib.CoverBytes(tr.CoverID)
+		if err != nil || !bytes.Equal(gotCov, coverJPGBytes) {
+			t.Fatalf("track %q did not upgrade to recovered cover.jpg: err=%v", tr.Title, err)
+		}
+	}
+}
+
 // --- Synthetic Audiophile Test Fixture Builders ---
 
 type flacPicSpec struct {

@@ -770,7 +770,7 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 				}
 			}
 		} else {
-			lrc, trans, yrc, err := ytm.Lyrics(&t)
+			lrc, trans, yrc, err := fetchLyrics(&t)
 			if err == nil {
 				lines = lyrics.Build(lrc, trans, yrc)
 				if len(lines) == 0 {
@@ -1165,6 +1165,9 @@ func (p *Player) open(t ytm.Track, level string) (*ytm.Stream, stream, error) {
 
 // songURL finds where a song streams; tests replace it.
 var songURL = ytm.SongURL
+
+// fetchLyrics fetches a track's lyrics; tests replace it.
+var fetchLyrics = ytm.Lyrics
 
 // Swap plays t in place of the track playing, from where that one is, as
 // the music video of a song, whose sound plays instead.

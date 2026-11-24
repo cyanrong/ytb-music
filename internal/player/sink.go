@@ -121,13 +121,15 @@ func openSharedWithSpec(dl *download, spec *spectrum) (PCMDecoder, error) {
 	if !dl.share() {
 		return nil, errors.New("player: the song is gone")
 	}
-	dec, err := mp4.NewDecoder(&downloadFile{d: dl})
+	df := &downloadFile{d: dl}
+	dec, err := mp4.NewDecoder(df)
 	if err != nil {
 		dl.release()
 		return nil, err
 	}
 	return &m4aStream{
 		dl:     dl,
+		file:   df,
 		dec:    dec,
 		spec:   spec,
 		writer: newSpecWriter(spec),
@@ -156,6 +158,11 @@ func (r *sharedRawStream) Size() (int64, error) {
 }
 
 func (r *sharedRawStream) Close() error {
-	r.once.Do(r.drop)
+	r.once.Do(func() {
+		r.downloadFile.closeReader()
+		if r.drop != nil {
+			r.drop()
+		}
+	})
 	return nil
 }

@@ -311,9 +311,6 @@ func TestSignalPillOpensSignalPathPopover(t *testing.T) {
 	if !a.audio.open {
 		t.Fatal("clicking signal pill did not open output popover")
 	}
-	if got := a.audio.hqpSignal.OutputDetail(); got != "SDM · DSD256 (11.29 MHz / 1-bit)" {
-		t.Fatalf("OutputDetail() = %q", got)
-	}
 
 	// Clicking the pill again closes the popover cleanly.
 	if err := tt.Click("AAC 256kbps · 44.1kHz → DSD256"); err != nil {

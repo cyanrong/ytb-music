@@ -1094,6 +1094,28 @@ func TestHQPlayerLocalCoverAndDirectoryLockfile(t *testing.T) {
 		t.Fatalf("serveHQPCover status=%d type=%q match=%v", cResp.StatusCode, cResp.Header.Get("Content-Type"), bytes.Equal(gotCover, pngCover))
 	}
 
+	// Verify local WebP and GIF artwork preserve their exact MIME types in both WAV ID3 APIC and serveHQPCover.
+	webpCover := []byte("RIFF\x14\x00\x00\x00WEBPVP8 \x08\x00\x00\x00\x01\x02\x03\x04\x05\x06\x07\x08")
+	if id3WebP := buildWAVID3Chunk("Song", "Artist", "Album", webpCover); !bytes.Contains(id3WebP, []byte("image/webp\x00")) {
+		t.Fatalf("buildWAVID3Chunk did not preserve image/webp MIME in APIC")
+	}
+	if id3GIF := buildWAVID3Chunk("Song", "Artist", "Album", []byte("GIF89a\x01\x00\x01\x00")); !bytes.Contains(id3GIF, []byte("image/gif\x00")) {
+		t.Fatalf("buildWAVID3Chunk did not preserve image/gif MIME in APIC")
+	}
+	_, webpCoverURL := srv1.RegisterHQPCover(player.TrackSource{
+		Track:      ytm.Track{ID: "localfile:webp1", Name: "WebP Cover"},
+		CoverBytes: webpCover,
+	}, "127.0.0.1:4321")
+	webpResp, err := http.Get(webpCoverURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotWebP, _ := io.ReadAll(webpResp.Body)
+	webpResp.Body.Close()
+	if webpResp.StatusCode != http.StatusOK || webpResp.Header.Get("Content-Type") != "image/webp" || !bytes.Equal(gotWebP, webpCover) {
+		t.Fatalf("WebP serveHQPCover status=%d type=%q match=%v", webpResp.StatusCode, webpResp.Header.Get("Content-Type"), bytes.Equal(gotWebP, webpCover))
+	}
+
 	// Track with localcover:// PicURL and empty CoverBytes must return empty coverURL and never call ytm.Fetch.
 	_, _, _, coverURL2, _, err := srv1.PrepareHQPTrack(context.Background(), player.TrackSource{
 		Track: ytm.Track{
@@ -1520,42 +1542,41 @@ func TestRoonAACRejectsIncompatibleTracksAndWaitPaired(t *testing.T) {
 	defer srv.Close()
 
 	rb := NewRoonBackend(srv, nil, "")
-	if rb.StreamFormat() != "wav" {
-		t.Fatalf("default StreamFormat() = %q, want wav", rb.StreamFormat())
-	}
 	rb.SetStreamFormat("aac")
 	if rb.StreamFormat() != "aac" {
 		t.Fatalf("StreamFormat() = %q, want aac", rb.StreamFormat())
 	}
 
-	// 1) Local FLAC (OpenRaw == nil) in AAC mode closes dec and returns clear guidance error.
-	var flacDecClosed atomic.Int32
+	// 1) Local FLAC (OpenRaw == nil) in AAC mode rejects upfront without leaking any PCMDecoder.
+	var flacDecOpened, flacDecClosed atomic.Int32
 	_, err = rb.Open(context.Background(), player.TrackSource{
 		Track:    ytm.Track{ID: "localfile:flac1", Name: "Lossless", Duration: 2000},
 		Duration: 2 * time.Second,
 		OpenPCM: func() (player.PCMDecoder, error) {
+			flacDecOpened.Add(1)
 			return &closeTrackPCMDecoder{rampPCMDecoder: rampPCMDecoder{rate: 44100, frames: 88200}, closed: &flacDecClosed}, nil
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "当前曲目不支持 Roon AAC 直通") || flacDecClosed.Load() != 1 {
-		t.Fatalf("FLAC on Roon AAC: err=%v decClosed=%d", err, flacDecClosed.Load())
+	if err == nil || !strings.Contains(err.Error(), "当前曲目不支持 Roon AAC 直通") || flacDecOpened.Load() != flacDecClosed.Load() {
+		t.Fatalf("FLAC on Roon AAC: err=%v decOpened=%d decClosed=%d", err, flacDecOpened.Load(), flacDecClosed.Load())
 	}
 
-	// 2) Invalid/non-AAC OpenRaw (e.g. ALAC or MP3 bytes) closes both raw and dec and returns clear error.
-	var badDecClosed, badRawClosed atomic.Int32
+	// 2) Invalid/non-AAC OpenRaw (e.g. ALAC or MP3 bytes) closes raw without leaking any PCMDecoder and returns clear error.
+	var badDecOpened, badDecClosed, badRawClosed atomic.Int32
 	badBytes := []byte("fLaC\x00\x00\x00\x22not-mp4-aac")
 	_, err = rb.Open(context.Background(), player.TrackSource{
 		Track:    ytm.Track{ID: "localfile:alac1", Name: "ALAC", Duration: 2000},
 		Duration: 2 * time.Second,
 		OpenPCM: func() (player.PCMDecoder, error) {
+			badDecOpened.Add(1)
 			return &closeTrackPCMDecoder{rampPCMDecoder: rampPCMDecoder{rate: 44100, frames: 88200}, closed: &badDecClosed}, nil
 		},
 		OpenRaw: func() (player.RawStream, error) {
 			return &memRawStream{Reader: bytes.NewReader(badBytes), size: int64(len(badBytes)), closed: &badRawClosed}, nil
 		},
 	})
-	if err == nil || !strings.Contains(err.Error(), "当前曲目不支持 Roon AAC 直通") || badDecClosed.Load() != 1 || badRawClosed.Load() != 1 {
-		t.Fatalf("non-AAC raw on Roon AAC: err=%v decClosed=%d rawClosed=%d", err, badDecClosed.Load(), badRawClosed.Load())
+	if err == nil || !strings.Contains(err.Error(), "当前曲目不支持 Roon AAC 直通") || badDecOpened.Load() != badDecClosed.Load() || badRawClosed.Load() != 1 {
+		t.Fatalf("non-AAC raw on Roon AAC: err=%v decOpened=%d decClosed=%d rawClosed=%d", err, badDecOpened.Load(), badDecClosed.Load(), badRawClosed.Load())
 	}
 
 	// 3) Valid AAC-in-MP4 succeeds and reuses the single validated RawStream + ADTS reader without opening twice.
@@ -1728,5 +1749,501 @@ func TestRoonAACRejectsIncompatibleTracksAndWaitPaired(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for cold-start FetchLibraryGenres")
+	}
+}
+
+func testMP4Box(typ string, body ...[]byte) []byte {
+	total := 8
+	for _, b := range body {
+		total += len(b)
+	}
+	out := make([]byte, 8, total)
+	binary.BigEndian.PutUint32(out[0:4], uint32(total))
+	copy(out[4:8], typ)
+	for _, b := range body {
+		out = append(out, b...)
+	}
+	return out
+}
+
+func testMP4FullBox(typ string, ver byte, flags uint32, body ...[]byte) []byte {
+	var vf [4]byte
+	vf[0] = ver
+	vf[1] = byte(flags >> 16)
+	vf[2] = byte(flags >> 8)
+	vf[3] = byte(flags)
+	parts := append([][]byte{vf[:]}, body...)
+	return testMP4Box(typ, parts...)
+}
+
+func testMP4AACSampleEntry(aot, freqIdx, chanCfg int) []byte {
+	asc := []byte{
+		byte((aot << 3) | (freqIdx >> 1)),
+		byte(((freqIdx & 1) << 7) | (chanCfg << 3)),
+	}
+	tag5 := append([]byte{0x05, byte(len(asc))}, asc...)
+	dcHdr := []byte{0x40, 0x15, 0, 0, 0, 0, 0, 128, 0, 0, 0, 128, 0}
+	tag4 := append([]byte{0x04, byte(len(dcHdr) + len(tag5))}, append(dcHdr, tag5...)...)
+	esHdr := []byte{0x00, 0x01, 0x00}
+	tag3 := append([]byte{0x03, byte(len(esHdr) + len(tag4))}, append(esHdr, tag4...)...)
+	esds := testMP4FullBox("esds", 0, 0, tag3)
+
+	var audioHdr [28]byte
+	binary.BigEndian.PutUint16(audioHdr[6:8], 1)
+	binary.BigEndian.PutUint16(audioHdr[16:18], uint16(chanCfg))
+	binary.BigEndian.PutUint16(audioHdr[18:20], 16)
+	binary.BigEndian.PutUint32(audioHdr[24:28], uint32(adtsSampleRates[freqIdx])<<16)
+	return testMP4Box("mp4a", audioHdr[:], esds)
+}
+
+func testMP4Trak(trackID uint32, handlerType string, sampleEntry []byte, chunkOff uint32, sizes []uint32) []byte {
+	var tkhdPayload [80]byte
+	binary.BigEndian.PutUint32(tkhdPayload[8:12], trackID)
+	tkhd := testMP4FullBox("tkhd", 0, 3, tkhdPayload[:])
+
+	var mdhdPayload [20]byte
+	binary.BigEndian.PutUint32(mdhdPayload[8:12], 44100)
+	binary.BigEndian.PutUint32(mdhdPayload[12:16], uint32(len(sizes)*1024))
+	mdhd := testMP4FullBox("mdhd", 0, 0, mdhdPayload[:])
+
+	var hdlrPayload [21]byte
+	copy(hdlrPayload[4:8], handlerType)
+	hdlr := testMP4FullBox("hdlr", 0, 0, hdlrPayload[:])
+
+	var cnt1 [4]byte
+	binary.BigEndian.PutUint32(cnt1[:], 1)
+	stsd := testMP4FullBox("stsd", 0, 0, cnt1[:], sampleEntry)
+
+	var sttsEntry [12]byte
+	binary.BigEndian.PutUint32(sttsEntry[0:4], 1)
+	binary.BigEndian.PutUint32(sttsEntry[4:8], uint32(max(1, len(sizes))))
+	binary.BigEndian.PutUint32(sttsEntry[8:12], 1024)
+	stts := testMP4FullBox("stts", 0, 0, sttsEntry[:])
+
+	var stscEntry [16]byte
+	binary.BigEndian.PutUint32(stscEntry[0:4], 1)
+	binary.BigEndian.PutUint32(stscEntry[4:8], 1)
+	binary.BigEndian.PutUint32(stscEntry[8:12], uint32(max(1, len(sizes))))
+	binary.BigEndian.PutUint32(stscEntry[12:16], 1)
+	stsc := testMP4FullBox("stsc", 0, 0, stscEntry[:])
+
+	stszBody := make([]byte, 8+len(sizes)*4)
+	binary.BigEndian.PutUint32(stszBody[4:8], uint32(len(sizes)))
+	for i, sz := range sizes {
+		binary.BigEndian.PutUint32(stszBody[8+i*4:12+i*4], sz)
+	}
+	stsz := testMP4FullBox("stsz", 0, 0, stszBody)
+
+	var stcoBody [8]byte
+	binary.BigEndian.PutUint32(stcoBody[0:4], 1)
+	binary.BigEndian.PutUint32(stcoBody[4:8], chunkOff)
+	stco := testMP4FullBox("stco", 0, 0, stcoBody[:])
+
+	var stbl []byte
+	if len(sizes) == 0 {
+		var zeroStsz [8]byte
+		stbl = testMP4Box("stbl", stsd, testMP4FullBox("stsz", 0, 0, zeroStsz[:]))
+	} else {
+		stbl = testMP4Box("stbl", stsd, stts, stsc, stsz, stco)
+	}
+	minf := testMP4Box("minf", stbl)
+	mdia := testMP4Box("mdia", mdhd, hdlr, minf)
+	return testMP4Box("trak", tkhd, mdia)
+}
+
+func buildTestIndexedAACMP4(aot, freqIdx, chanCfg, packetCount int) ([]byte, [][]byte) {
+	ftyp := testMP4Box("ftyp", []byte("M4A \x00\x00\x00\x00"))
+	pkts := make([][]byte, packetCount)
+	sizes := make([]uint32, packetCount)
+	var mdatPayload []byte
+	for i := range packetCount {
+		p := []byte{0xA5, byte(i), byte(i ^ 0x5A), 0x7E}
+		pkts[i] = p
+		sizes[i] = uint32(len(p))
+		mdatPayload = append(mdatPayload, p...)
+	}
+	mdat := testMP4Box("mdat", mdatPayload)
+	chunkOff := uint32(len(ftyp) + 8)
+	trak := testMP4Trak(1, "soun", testMP4AACSampleEntry(aot, freqIdx, chanCfg), chunkOff, sizes)
+	moov := testMP4Box("moov", trak)
+	out := append(append(ftyp, mdat...), moov...)
+	return out, pkts
+}
+
+// Joining a Roon AAC stream after PCM ticks have already advanced the playhead aligns the ADTS reader to the current frame instead of restarting at packet 0, and AAC-mode RoonBackend.Open succeeds even when OpenPCM fails on HE-AAC.
+func TestRoonAACMidTrackJoinAndOptionalPCMDecoder(t *testing.T) {
+	srv, err := NewServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	rb := NewRoonBackend(srv, nil, "")
+	rb.SetStreamFormat("aac")
+
+	mp4Bytes, rawPkts := buildTestIndexedAACMP4(2, 4, 2, 24)
+	sink, err := rb.Open(context.Background(), player.TrackSource{
+		Track:    ytm.Track{ID: "midjoin", Name: "Mid-Track Join", Duration: 500},
+		Duration: 500 * time.Millisecond,
+		Gain:     1.0,
+		OpenPCM: func() (player.PCMDecoder, error) {
+			return &rampPCMDecoder{rate: 44100, frames: 24 * 1024}, nil
+		},
+		OpenRaw: func() (player.RawStream, error) {
+			return &memRawStream{Reader: bytes.NewReader(mp4Bytes), size: int64(len(mp4Bytes))}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("RoonBackend.Open failed: %v", err)
+	}
+	defer sink.Close()
+
+	rs := sink.(*roonSink)
+	rs.stateMu.Lock()
+	rs.playing = true
+	rs.stateMu.Unlock()
+
+	// Advance 6 PCM clock ticks (6 * 882 = 5292 frames -> packet 5292/1024 = 5) before any AAC listener pulls.
+	for range 6 {
+		if pcm := rs.pullPCM24(882); len(pcm) == 0 {
+			t.Fatal("expected non-empty PCM tick before AAC listener joins")
+		}
+	}
+	pkt5 := rs.pullADTS(true)
+	if len(pkt5) != 7+len(rawPkts[5]) || !bytes.Equal(pkt5[7:], rawPkts[5]) {
+		t.Fatalf("mid-track AAC join returned payload %x, want packet 5 (%x)", pkt5, rawPkts[5])
+	}
+	pkt6 := rs.pullADTS(true)
+	if len(pkt6) != 7+len(rawPkts[6]) || !bytes.Equal(pkt6[7:], rawPkts[6]) {
+		t.Fatalf("subsequent AAC pull returned payload %x, want packet 6 (%x)", pkt6, rawPkts[6])
+	}
+
+	// Advance 5 more PCM ticks without an active AAC subscriber (posFrames = 5292 + 2048 + 4410 = 11750 -> packet 11) and verify re-alignment.
+	for range 5 {
+		_ = rs.pullPCM24(882)
+	}
+	pkt11 := rs.pullADTS(true)
+	if len(pkt11) != 7+len(rawPkts[11]) || !bytes.Equal(pkt11[7:], rawPkts[11]) {
+		t.Fatalf("re-joined AAC pull returned payload %x, want packet 11 (%x)", pkt11, rawPkts[11])
+	}
+
+	// HE-AAC (aot=5, 24kHz core) where OpenPCM returns an error must still open in AAC mode, advance clock with dec==nil, and stream aligned ADTS frames.
+	heMP4, hePkts := buildTestIndexedAACMP4(5, 6, 2, 16)
+	heSink, err := rb.Open(context.Background(), player.TrackSource{
+		Track:    ytm.Track{ID: "localfile:heaac", Name: "HE-AAC Track", Duration: 600},
+		Duration: 600 * time.Millisecond,
+		Gain:     1.0,
+		OpenPCM: func() (player.PCMDecoder, error) {
+			return nil, errors.New("aac: unsupported AudioSpecificConfig object type 5")
+		},
+		OpenRaw: func() (player.RawStream, error) {
+			return &memRawStream{Reader: bytes.NewReader(heMP4), size: int64(len(heMP4))}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("AAC-mode RoonBackend.Open failed when OpenPCM errored: %v", err)
+	}
+	defer heSink.Close()
+
+	heRS := heSink.(*roonSink)
+	if heRS.srcRate != 24000 {
+		t.Fatalf("HE-AAC sink srcRate = %d, want 24000", heRS.srcRate)
+	}
+	heRS.stateMu.Lock()
+	heRS.playing = true
+	heRS.stateMu.Unlock()
+
+	// Advance 5 ticks via dec==nil PCM clock (5 * 480 = 2400 frames -> packet 2400/1024 = 2), then pull ADTS.
+	for range 5 {
+		_ = heRS.pullPCM24(882)
+	}
+	heFrame := heRS.pullADTS(true)
+	if len(heFrame) != 7+len(hePkts[2]) || !bytes.Equal(heFrame[7:], hePkts[2]) {
+		t.Fatalf("HE-AAC mid-track ADTS frame = %x, want packet 2 (%x)", heFrame, hePkts[2])
+	}
+}
+
+// Multi-track standard and fragmented MP4 containers with trailing cover-art video or chapter text tracks index only the selected AAC sound track's packets.
+func TestMultiTrackMP4AACIndexing(t *testing.T) {
+	ftyp := testMP4Box("ftyp", []byte("M4A \x00\x00\x00\x00"))
+	audioPkts := [][]byte{
+		{0x11, 0x22, 0x33, 0x44},
+		{0x55, 0x66, 0x77, 0x88, 0x99},
+		{0xAA, 0xBB, 0xCC},
+	}
+	coverJPEG := []byte{0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, 'J', 'F', 'I', 'F', 0xFF, 0xD9}
+	chapterTxt := []byte("Chapter 01 - Opening")
+
+	var mdatBody []byte
+	audioOff := uint32(len(ftyp) + 8)
+	var audioSizes []uint32
+	for _, p := range audioPkts {
+		mdatBody = append(mdatBody, p...)
+		audioSizes = append(audioSizes, uint32(len(p)))
+	}
+	videoOff := audioOff + uint32(len(mdatBody))
+	mdatBody = append(mdatBody, coverJPEG...)
+	textOff := audioOff + uint32(len(mdatBody))
+	mdatBody = append(mdatBody, chapterTxt...)
+	mdat := testMP4Box("mdat", mdatBody)
+
+	sounTrak := testMP4Trak(1, "soun", testMP4AACSampleEntry(2, 4, 2), audioOff, audioSizes)
+	videEntry := testMP4Box("jpeg", make([]byte, 78))
+	videTrak := testMP4Trak(2, "vide", videEntry, videoOff, []uint32{uint32(len(coverJPEG))})
+	textEntry := testMP4Box("tx3g", make([]byte, 30))
+	textTrak := testMP4Trak(3, "text", textEntry, textOff, []uint32{uint32(len(chapterTxt))})
+
+	// Place trailing vide and text tracks after the AAC sound track in moov.
+	moov := testMP4Box("moov", sounTrak, videTrak, textTrak)
+	multiMP4 := append(append(ftyp, mdat...), moov...)
+
+	ar, err := openAACADTSReader(bytes.NewReader(multiMP4), int64(len(multiMP4)))
+	if err != nil {
+		t.Fatalf("openAACADTSReader multi-track MP4: %v", err)
+	}
+	for i, want := range audioPkts {
+		got, ferr := ar.NextFrame()
+		if ferr != nil {
+			t.Fatalf("NextFrame[%d]: %v", i, ferr)
+		}
+		if len(got) != 7+len(want) || !bytes.Equal(got[7:], want) {
+			t.Fatalf("NextFrame[%d] payload = %x, want %x", i, got[7:], want)
+		}
+	}
+	if _, ferr := ar.NextFrame(); !errors.Is(ferr, io.EOF) {
+		t.Fatalf("expected io.EOF after 3 audio packets, got %v", ferr)
+	}
+
+	// Verify fragmented MP4 moof -> traf filtering ignores non-audio track_ID trafs.
+	makeTrex := func(id uint32) []byte {
+		var b [20]byte
+		binary.BigEndian.PutUint32(b[0:4], id)
+		binary.BigEndian.PutUint32(b[4:8], 1)
+		return testMP4FullBox("trex", 0, 0, b[:])
+	}
+	fragSoun := testMP4Trak(1, "soun", testMP4AACSampleEntry(2, 4, 2), 0, nil)
+	fragVide := testMP4Trak(2, "vide", videEntry, 0, nil)
+	mvex := testMP4Box("mvex", makeTrex(1), makeTrex(2))
+	fragMoov := testMP4Box("moov", fragSoun, fragVide, mvex)
+
+	fragAudioPayload := []byte{0xDE, 0xAD, 0xBE, 0xEF, 0x42}
+	fragVideoPayload := []byte{0xFF, 0xD8, 0x00, 0x11, 0x22, 0xFF, 0xD9}
+	fragMdatPayload := append(append([]byte(nil), fragAudioPayload...), fragVideoPayload...)
+	fragMdat := testMP4Box("mdat", fragMdatPayload)
+
+	buildTraf := func(trackID uint32, dataOff int32, sz uint32) []byte {
+		var tfhdBody [4]byte
+		binary.BigEndian.PutUint32(tfhdBody[:], trackID)
+		tfhd := testMP4FullBox("tfhd", 0, 0, tfhdBody[:])
+
+		var trunBody [12]byte
+		binary.BigEndian.PutUint32(trunBody[0:4], 1)
+		binary.BigEndian.PutUint32(trunBody[4:8], uint32(dataOff))
+		binary.BigEndian.PutUint32(trunBody[8:12], sz)
+		trun := testMP4FullBox("trun", 0, 0x000201, trunBody[:])
+		return testMP4Box("traf", tfhd, trun)
+	}
+	// Pre-compute moof size with dummy offsets to determine exact data_offset into mdat.
+	dummyMoof := testMP4Box("moof", buildTraf(1, 0, uint32(len(fragAudioPayload))), buildTraf(2, 0, uint32(len(fragVideoPayload))))
+	audioDataRel := int32(len(dummyMoof) + 8)
+	videoDataRel := audioDataRel + int32(len(fragAudioPayload))
+	realMoof := testMP4Box("moof",
+		buildTraf(1, audioDataRel, uint32(len(fragAudioPayload))),
+		buildTraf(2, videoDataRel, uint32(len(fragVideoPayload))),
+	)
+
+	var fragFile []byte
+	fragFile = append(fragFile, ftyp...)
+	fragFile = append(fragFile, fragMoov...)
+	fragFile = append(fragFile, realMoof...)
+	fragFile = append(fragFile, fragMdat...)
+
+	far, err := openAACADTSReader(bytes.NewReader(fragFile), int64(len(fragFile)))
+	if err != nil {
+		t.Fatalf("openAACADTSReader fragmented multi-track MP4: %v", err)
+	}
+	fFrame, err := far.NextFrame()
+	if err != nil || len(fFrame) != 7+len(fragAudioPayload) || !bytes.Equal(fFrame[7:], fragAudioPayload) {
+		t.Fatalf("fragmented NextFrame = %x (err=%v), want %x", fFrame, err, fragAudioPayload)
+	}
+	if _, err := far.NextFrame(); !errors.Is(err, io.EOF) {
+		t.Fatalf("expected io.EOF after single audio traf packet, got %v", err)
+	}
+}
+
+type blockingClosePCMDecoder struct {
+	rate       int
+	estFrames  int64
+	fastFrames int64
+	pos        int64
+	closedOnce sync.Once
+	closedCh   chan struct{}
+}
+
+func (d *blockingClosePCMDecoder) SampleRate() int          { return d.rate }
+func (d *blockingClosePCMDecoder) Channels() int            { return 2 }
+func (d *blockingClosePCMDecoder) Len() int64               { return d.estFrames }
+func (d *blockingClosePCMDecoder) SetPosition(f int64) error { d.pos = f; return nil }
+func (d *blockingClosePCMDecoder) Close() error {
+	d.closedOnce.Do(func() { close(d.closedCh) })
+	return nil
+}
+
+func (d *blockingClosePCMDecoder) Read(dst []float32) (int, error) {
+	if d.pos < d.fastFrames {
+		avail := int(min(int64(len(dst)/2), d.fastFrames-d.pos))
+		for i := range avail {
+			dst[i*2] = 0.25
+			dst[i*2+1] = -0.25
+		}
+		d.pos += int64(avail)
+		return avail * 2, nil
+	}
+	<-d.closedCh
+	return 0, io.ErrClosedPipe
+}
+
+// PrepareHQPTrack materializes unknown-length or prebuffer-sized downloads in full without inventing length, fails truncated progressive streams exceeding 2 seconds of shortfall with ErrUnexpectedEOF, and unblocks stalled progressive reads immediately on Server.Close.
+func TestHQPProgressiveUnknownLengthTruncationAndCancel(t *testing.T) {
+	srv, err := NewServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	// 1) Unknown total length (dec.Len() == 0 && src.Duration == 0) on an active download > prebuffer
+	// must materialize the full WAV to EOF rather than truncating or inventing prebuffered + 30s.
+	const unknownTotalFrames int64 = 43692 + 8000*40 // > prebuffered + 30s at 8kHz
+	seqUnk, fileURIUnk, wavURLUnk, _, actualDurUnk, err := srv.PrepareHQPTrack(context.Background(), player.TrackSource{
+		Track:       ytm.Track{ID: "unk_len", Name: "Unknown Length Live"},
+		Downloading: true,
+		OpenPCM: func() (player.PCMDecoder, error) {
+			return &gatedPCMDecoder{
+				rate:        8000,
+				estFrames:   0,
+				fastFrames:  unknownTotalFrames,
+				totalFrames: unknownTotalFrames,
+			}, nil
+		},
+	}, "127.0.0.1:4321")
+	if err != nil {
+		t.Fatalf("PrepareHQPTrack unknown length: %v", err)
+	}
+	if fileURIUnk == "" || srv.lookupHQP(seqUnk).prog != nil {
+		t.Fatalf("unknown-length download entered progressive path (fileURI=%q prog=%v), want full materialization", fileURIUnk, srv.lookupHQP(seqUnk).prog)
+	}
+	respUnk, err := http.Head(wavURLUnk)
+	if err != nil {
+		t.Fatal(err)
+	}
+	respUnk.Body.Close()
+	id3Unk := buildWAVID3Chunk("Unknown Length Live", "", "", nil)
+	wantUnkBytes := int64(80+len(id3Unk)) + unknownTotalFrames*6
+	if respUnk.ContentLength != wantUnkBytes {
+		t.Fatalf("unknown-length WAV Content-Length = %d, want exact %d (actualDur=%v)", respUnk.ContentLength, wantUnkBytes, actualDurUnk)
+	}
+
+	// Also verify estimatedFrames == prebufferedFrames (43692) materializes exact length without +30s silence.
+	seqExact, fileURIExact, wavURLExact, _, _, err := srv.PrepareHQPTrack(context.Background(), player.TrackSource{
+		Track:       ytm.Track{ID: "exact_pre", Name: "Exact Prebuffer"},
+		Downloading: true,
+		OpenPCM: func() (player.PCMDecoder, error) {
+			return &gatedPCMDecoder{
+				rate:        44100,
+				estFrames:   43692,
+				fastFrames:  50000,
+				totalFrames: 43692,
+			}, nil
+		},
+	}, "127.0.0.1:4321")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fileURIExact == "" || srv.lookupHQP(seqExact).prog != nil {
+		t.Fatalf("exact-prebuffer track entered progressive path")
+	}
+	respExact, err := http.Head(wavURLExact)
+	if err != nil {
+		t.Fatal(err)
+	}
+	respExact.Body.Close()
+	id3Exact := buildWAVID3Chunk("Exact Prebuffer", "", "", nil)
+	if wantExact := int64(80+len(id3Exact)) + 43692*6; respExact.ContentLength != wantExact {
+		t.Fatalf("exact-prebuffer WAV Content-Length = %d, want %d", respExact.ContentLength, wantExact)
+	}
+
+	// 2) Truncated progressive download with >2s shortfall records io.ErrUnexpectedEOF instead of padding silence.
+	truncGate := make(chan struct{})
+	const truncEstFrames int64 = 44100 * 10
+	seqTrunc, _, truncWAVURL, _, _, err := srv.PrepareHQPTrack(context.Background(), player.TrackSource{
+		Track:       ytm.Track{ID: "trunc_prog", Name: "Truncated Stream", Duration: 10000},
+		Duration:    10 * time.Second,
+		Downloading: true,
+		OpenPCM: func() (player.PCMDecoder, error) {
+			return &gatedPCMDecoder{
+				rate:        44100,
+				estFrames:   truncEstFrames,
+				fastFrames:  50000,
+				totalFrames: 60000, // ~8.6s short (> 2s maxPad)
+				gate:        truncGate,
+			}, nil
+		},
+	}, "127.0.0.1:4321")
+	if err != nil {
+		t.Fatal(err)
+	}
+	close(truncGate)
+	entryTrunc := srv.lookupHQP(seqTrunc)
+	<-entryTrunc.prog.doneCh
+	failed, writtenTrunc, pErr := entryTrunc.prog.failureState()
+	if !failed || !errors.Is(pErr, io.ErrUnexpectedEOF) || writtenTrunc >= entryTrunc.prog.totalSize {
+		t.Fatalf("truncated stream failureState = (failed=%v written=%d/%d err=%v), want ErrUnexpectedEOF without zero-padding", failed, writtenTrunc, entryTrunc.prog.totalSize, pErr)
+	}
+	reqTruncTail, _ := http.NewRequest(http.MethodGet, truncWAVURL, nil)
+	reqTruncTail.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", entryTrunc.prog.totalSize-512, entryTrunc.prog.totalSize-1))
+	respTruncTail, err := http.DefaultClient.Do(reqTruncTail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	respTruncTail.Body.Close()
+	if respTruncTail.StatusCode != http.StatusBadGateway {
+		t.Fatalf("truncated tail Range status = %d, want 502 Bad Gateway", respTruncTail.StatusCode)
+	}
+
+	// 3) Server.Close() immediately interrupts a blocked progressive dec.Read via dec.Close().
+	closeSrv, err := NewServer("127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	blkDec := &blockingClosePCMDecoder{
+		rate:       44100,
+		estFrames:  44100 * 20,
+		fastFrames: 50000,
+		closedCh:   make(chan struct{}),
+	}
+	if _, _, _, _, _, err := closeSrv.PrepareHQPTrack(context.Background(), player.TrackSource{
+		Track:       ytm.Track{ID: "stalled_prog", Name: "Stalled Stream", Duration: 20000},
+		Duration:    20 * time.Second,
+		Downloading: true,
+		OpenPCM: func() (player.PCMDecoder, error) {
+			return blkDec, nil
+		},
+	}, "127.0.0.1:4321"); err != nil {
+		closeSrv.Close()
+		t.Fatal(err)
+	}
+
+	closeDone := make(chan error, 1)
+	go func() {
+		closeDone <- closeSrv.Close()
+	}()
+	select {
+	case cerr := <-closeDone:
+		if cerr != nil {
+			t.Fatalf("closeSrv.Close() returned error: %v", cerr)
+		}
+	case <-time.After(time.Second):
+		_ = blkDec.Close()
+		t.Fatal("Server.Close() hung on blocked progressive PCMDecoder.Read")
 	}
 }

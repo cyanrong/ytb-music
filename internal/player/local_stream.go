@@ -3,6 +3,7 @@ package player
 import (
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/egoist/mygo/audio"
 )
@@ -18,6 +19,7 @@ type localPCMStream struct {
 	writer    *specWriter
 	scratch   []float32
 	rem       []float32
+	closed    atomic.Bool
 	closeOnce sync.Once
 	closeErr  error
 }
@@ -45,6 +47,9 @@ func (s *localPCMStream) Channels() int   { return 2 }
 func (s *localPCMStream) Len() int64      { return s.dec.Len() }
 
 func (s *localPCMStream) Read(dst []float32) (int, error) {
+	if s.closed.Load() {
+		return 0, io.ErrClosedPipe
+	}
 	wantFrames := len(dst) / 2
 	if wantFrames == 0 {
 		return 0, nil
@@ -52,6 +57,9 @@ func (s *localPCMStream) Read(dst []float32) (int, error) {
 	switch {
 	case s.srcCh == 2:
 		n, err := s.dec.Read(dst[:wantFrames*2])
+		if s.closed.Load() {
+			return 0, io.ErrClosedPipe
+		}
 		frames := n / 2
 		out := frames * 2
 		if out > 0 {
@@ -62,6 +70,9 @@ func (s *localPCMStream) Read(dst []float32) (int, error) {
 
 	case s.srcCh == 1:
 		n, err := s.dec.Read(dst[:wantFrames:wantFrames])
+		if s.closed.Load() {
+			return 0, io.ErrClosedPipe
+		}
 		for i := n - 1; i >= 0; i-- {
 			v := dst[i]
 			dst[i*2] = v
@@ -86,6 +97,9 @@ func (s *localPCMStream) Read(dst []float32) (int, error) {
 		for copied < s.srcCh && err == nil {
 			var n int
 			n, err = s.dec.Read(buf[copied:])
+			if s.closed.Load() {
+				return 0, io.ErrClosedPipe
+			}
 			copied += n
 			if n == 0 && err == nil {
 				break
@@ -110,6 +124,9 @@ func (s *localPCMStream) Read(dst []float32) (int, error) {
 }
 
 func (s *localPCMStream) SetPosition(frame int64) error {
+	if s.closed.Load() {
+		return io.ErrClosedPipe
+	}
 	if err := s.dec.SetPosition(frame); err != nil {
 		return err
 	}
@@ -124,6 +141,7 @@ func (s *localPCMStream) source() (*download, *spectrum) {
 
 func (s *localPCMStream) Close() error {
 	s.closeOnce.Do(func() {
+		s.closed.Store(true)
 		if c, ok := s.dec.(io.Closer); ok {
 			s.closeErr = c.Close()
 		}
