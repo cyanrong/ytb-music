@@ -22,14 +22,23 @@ var (
 )
 
 const (
-	musicAPI   = "https://music.youtube.com/youtubei/v1/"
-	playerAPI  = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
-	remixName  = "WEB_REMIX"
-	remixID    = "67"
-	remixVer   = "1.20251020.01.00"
-	visionName = "VISIONOS"
-	visionID   = "101"
-	visionVer  = "0.1"
+	musicAPI     = "https://music.youtube.com/youtubei/v1/"
+	playerAPI    = "https://www.youtube.com/youtubei/v1/player?prettyPrint=false"
+	remixName    = "WEB_REMIX"
+	remixID      = "67"
+	remixVer     = "1.20260707.12.00"
+	visionName   = "VISIONOS"
+	visionID     = "101"
+	visionVer    = "1.02"
+	visionUA     = "Mozilla/5.0 (Macintosh; Intel Mac OS X 15_7_3) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Safari/605.1.15"
+	tvName       = "TVHTML5"
+	tvID         = "7"
+	tvSamsungVer = "5.20260707"
+	tvSamsungUA  = "Mozilla/5.0 (SMART-TV; Linux; Tizen 2.4.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/2.4.0 TV Safari/538.1"
+	webName      = "WEB"
+	webID        = "1"
+	webVer       = "2.20260708.00.00"
+	webSafariUA  = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.5 Safari/605.1.15,gzip(gfe)"
 )
 
 var httpClient = &http.Client{Timeout: 20 * time.Second, Transport: proxyTransport}
@@ -216,7 +225,7 @@ func call(endpoint string, body map[string]any) (any, error) {
 }
 
 // callPlayer asks the visionOS client for a video's streams: its formats
-// come as plain URLs that serve whole.
+// come as plain URLs that serve whole when YouTube allows anonymous access.
 func callPlayer(id string) (any, error) {
 	return callPlayerOn(httpClient, id)
 }
@@ -225,16 +234,127 @@ func callPlayerOn(hc *http.Client, id string) (any, error) {
 	body := map[string]any{"videoId": id, "contentCheckOk": true, "racyCheckOk": true}
 	return postOn(hc, playerAPI, body, func(vd string) (map[string]any, http.Header) {
 		client := map[string]any{
-			"clientName": visionName, "clientVersion": visionVer, "hl": Language, "gl": Region,
-			"deviceMake": "Apple", "deviceModel": "RealityDevice14,1",
-			"osName": "visionOS", "osVersion": "1.3.21O771",
+			"clientName": visionName, "clientVersion": visionVer, "hl": Language,
+			"deviceMake": "Apple", "deviceModel": "RealityDevice17,1",
+			"userAgent": visionUA,
+			"osName": "visionOS", "osVersion": "26.5.23O471",
 		}
 		if vd != "" {
 			client["visitorData"] = vd
 		}
 		h := http.Header{}
+		h.Set("User-Agent", visionUA)
 		h.Set("X-YouTube-Client-Name", visionID)
 		h.Set("X-YouTube-Client-Version", visionVer)
+		return client, h
+	})
+}
+
+// callTVPlayer asks the Samsung Smart TV client (TVHTML5) for a video's
+// streams. Unlike WEB_REMIX, TVHTML5 supports account cookies without
+// requiring GVS PO tokens on googlevideo.com, so signed-in non-Premium and
+// Premium accounts both receive playable 128 kbps AAC streams.
+func callTVPlayer(id string, sts int) (any, error) {
+	return callTVPlayerOn(httpClient, id, sts)
+}
+
+func callTVPlayerOn(hc *http.Client, id string, sts int) (any, error) {
+	cpc := map[string]any{"html5Preference": "HTML5_PREF_WANTS"}
+	if sts > 0 {
+		cpc["signatureTimestamp"] = sts
+	}
+	body := map[string]any{
+		"videoId": id, "contentCheckOk": true, "racyCheckOk": true,
+		"playbackContext": map[string]any{"contentPlaybackContext": cpc},
+	}
+	signedIn := SignedIn()
+	return postWithVisitorOn(hc, playerAPI, body, !signedIn, func(vd string) (map[string]any, http.Header) {
+		client := map[string]any{
+			"clientName": tvName, "clientVersion": tvSamsungVer, "hl": Language,
+			"deviceMake": "Samsung", "deviceModel": "UKS9800",
+			"userAgent": tvSamsungUA,
+			"osName": "Tizen", "osVersion": "2.4.0",
+			"timeZone": "UTC", "utcOffsetMinutes": 0,
+		}
+		if vd != "" {
+			client["visitorData"] = vd
+		}
+		h := http.Header{}
+		h.Set("User-Agent", tvSamsungUA)
+		h.Set("Origin", "https://www.youtube.com")
+		h.Set("Referer", "https://www.youtube.com/")
+		h.Set("X-YouTube-Client-Name", tvID)
+		h.Set("X-YouTube-Client-Version", tvSamsungVer)
+		signRequest(h, "https://www.youtube.com")
+		return client, h
+	})
+}
+
+// callWebRemixPlayer asks YouTube Music's WEB_REMIX player endpoint for a
+// track's streams (itag 141 for Premium, itag 140 for standard, and HLS).
+func callWebRemixPlayer(id string, sts int) (any, error) {
+	return callWebRemixPlayerOn(httpClient, id, sts)
+}
+
+func callWebRemixPlayerOn(hc *http.Client, id string, sts int) (any, error) {
+	cpc := map[string]any{"html5Preference": "HTML5_PREF_WANTS"}
+	if sts > 0 {
+		cpc["signatureTimestamp"] = sts
+	}
+	body := map[string]any{
+		"videoId": id, "contentCheckOk": true, "racyCheckOk": true,
+		"playbackContext": map[string]any{
+			"contentPlaybackContext": cpc,
+			"adPlaybackContext":      map[string]any{"pyv": true},
+		},
+	}
+	signedIn := SignedIn()
+	return postWithVisitorOn(hc, musicAPI+"player?prettyPrint=false", body, !signedIn, func(vd string) (map[string]any, http.Header) {
+		client := map[string]any{"clientName": remixName, "clientVersion": remixVer, "hl": Language}
+		if vd != "" {
+			client["visitorData"] = vd
+		}
+		h := http.Header{}
+		h.Set("Origin", "https://music.youtube.com")
+		h.Set("Referer", "https://music.youtube.com/")
+		h.Set("X-YouTube-Client-Name", remixID)
+		h.Set("X-YouTube-Client-Version", remixVer)
+		signRequest(h, "https://music.youtube.com")
+		return client, h
+	})
+}
+
+// callSafariPlayer asks the Safari WEB client for HLS video manifests when
+// signed in and anonymous VISIONOS is blocked.
+func callSafariPlayer(id string, sts int) (any, error) {
+	return callSafariPlayerOn(httpClient, id, sts)
+}
+
+func callSafariPlayerOn(hc *http.Client, id string, sts int) (any, error) {
+	cpc := map[string]any{"html5Preference": "HTML5_PREF_WANTS"}
+	if sts > 0 {
+		cpc["signatureTimestamp"] = sts
+	}
+	body := map[string]any{
+		"videoId": id, "contentCheckOk": true, "racyCheckOk": true,
+		"playbackContext": map[string]any{"contentPlaybackContext": cpc},
+	}
+	signedIn := SignedIn()
+	return postWithVisitorOn(hc, playerAPI, body, !signedIn, func(vd string) (map[string]any, http.Header) {
+		client := map[string]any{
+			"clientName": webName, "clientVersion": webVer, "hl": Language,
+			"userAgent": webSafariUA,
+		}
+		if vd != "" {
+			client["visitorData"] = vd
+		}
+		h := http.Header{}
+		h.Set("User-Agent", webSafariUA)
+		h.Set("Origin", "https://www.youtube.com")
+		h.Set("Referer", "https://www.youtube.com/")
+		h.Set("X-YouTube-Client-Name", webID)
+		h.Set("X-YouTube-Client-Version", webVer)
+		signRequest(h, "https://www.youtube.com")
 		return client, h
 	})
 }
@@ -246,9 +366,20 @@ func post(url string, body map[string]any, client func(vd string) (map[string]an
 }
 
 func postOn(hc *http.Client, url string, body map[string]any, client func(vd string) (map[string]any, http.Header)) (any, error) {
+	return postWithVisitorOn(hc, url, body, true, client)
+}
+
+func postWithVisitorOn(hc *http.Client, url string, body map[string]any, useVisitor bool, client func(vd string) (map[string]any, http.Header)) (any, error) {
 	var err error
-	for try := 0; try < 2; try++ {
-		vd := visitorData()
+	tries := 1
+	if useVisitor {
+		tries = 2
+	}
+	for try := 0; try < tries; try++ {
+		vd := ""
+		if useVisitor {
+			vd = visitorData()
+		}
 		c, h := client(vd)
 		payload := make(map[string]any, len(body)+1)
 		for k, v := range body {
@@ -261,7 +392,7 @@ func postOn(hc *http.Client, url string, body map[string]any, client func(vd str
 		if err == nil {
 			return v, nil
 		}
-		if status != 401 && status != 403 {
+		if !useVisitor || (status != 401 && status != 403) {
 			break
 		}
 		dropVisitorData(vd)
@@ -282,7 +413,9 @@ func postJSONOn(hc *http.Client, url string, payload any, h http.Header, vd stri
 		req.Header[k] = vs
 	}
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("User-Agent", UserAgent)
+	if req.Header.Get("User-Agent") == "" {
+		req.Header.Set("User-Agent", UserAgent)
+	}
 	if vd != "" {
 		req.Header.Set("X-Goog-Visitor-Id", vd)
 	}
@@ -305,6 +438,9 @@ func postJSONOn(hc *http.Client, url string, payload any, h http.Header, vd stri
 	}
 	if jerr != nil {
 		return nil, resp.StatusCode, fmt.Errorf("ytm: %w", jerr)
+	}
+	if ds := str(v, "responseContext", "mainAppWebResponseContext", "datasyncId"); ds != "" {
+		noteDataSyncID(ds)
 	}
 	return v, resp.StatusCode, nil
 }
@@ -433,7 +569,7 @@ func clearCaches() {
 	chartCache.clear()
 	artistCache.clear()
 	discoCache.clear()
-	premiumCache.clear()
+	clearStreamCaches()
 	forgetPremium()
 	searches.mu.Lock()
 	searches.m = nil

@@ -16,6 +16,7 @@ import (
 // to YouTube, if any, then loads the home page for whoever is listening.
 func (a *app) boot() {
 	a.homeLoading = true
+	ytm.PreparePlayer()
 	go func() {
 		var prof *ytm.Profile
 		header := youtubeCookies()
@@ -40,10 +41,10 @@ func (a *app) boot() {
 	}()
 }
 
-// preparePremium works out YouTube's player ahead of the first song, for
-// the streams of Premium, when the settings ask for them.
+// preparePremium works out YouTube's player ahead of the first song so
+// signed-in streams unscramble without waiting on the first track.
 func (a *app) preparePremium() {
-	if a.profile != nil && a.settings.Quality == "exhigh" {
+	if a.profile != nil {
 		ytm.PreparePlayer()
 	}
 }
@@ -138,15 +139,22 @@ func (a *app) finishLogin(w *mygo.Window) {
 }
 
 // youtubeCookies returns the cookies the web view's store sends to YouTube
-// Music, as a Cookie header.
+// Music and YouTube, as a Cookie header.
 func youtubeCookies() string {
-	list, err := mygo.Cookies.List(mygo.CookieFilter{URL: "https://music.youtube.com/"})
-	if err != nil {
-		return ""
-	}
-	parts := make([]string, 0, len(list))
-	for _, c := range list {
-		parts = append(parts, c.Name+"="+c.Value)
+	seen := map[string]bool{}
+	var parts []string
+	for _, u := range []string{"https://music.youtube.com/", "https://www.youtube.com/"} {
+		list, err := mygo.Cookies.List(mygo.CookieFilter{URL: u})
+		if err != nil {
+			continue
+		}
+		for _, c := range list {
+			if c.Name == "" || seen[c.Name] {
+				continue
+			}
+			seen[c.Name] = true
+			parts = append(parts, c.Name+"="+c.Value)
+		}
 	}
 	return strings.Join(parts, "; ")
 }

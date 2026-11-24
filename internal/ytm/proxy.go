@@ -198,8 +198,7 @@ func InitWebViewProxy(raw string) {
 // IP-bound stream URLs after a network route change.
 func InvalidateRouteCaches() {
 	proxyTransport.CloseIdleConnections()
-	playerCache.clear()
-	premiumCache.clear()
+	clearStreamCaches()
 	resetVisitorData()
 }
 
@@ -209,9 +208,7 @@ func InvalidateTrackStream(id string) {
 	if id == "" {
 		return
 	}
-	suffix := "/" + id
-	playerCache.deleteSuffix(suffix)
-	premiumCache.deleteSuffix(suffix)
+	invalidateStreamSuffix("/" + id)
 }
 
 var musicOriginURL = &url.URL{Scheme: "https", Host: "music.youtube.com", Path: "/"}

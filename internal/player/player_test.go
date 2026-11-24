@@ -1,9 +1,11 @@
 package player
 
 import (
+	"fmt"
 	"math"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -249,5 +251,66 @@ func TestExtend(t *testing.T) {
 	p = &Player{queue: tracks("x", "y", "z"), order: []int{0, 1, 2}, at: 0}
 	if p.Extend(first, more) || len(p.queue) != 3 {
 		t.Errorf("another queue took the rest: %v", p.queue)
+	}
+}
+
+// Wrapped ErrUnavailable errors show the localized message and cap auto-skips
+// at 3 tracks rather than draining the whole queue, while ErrBotCheck stops
+// immediately on the first track.
+func TestSkipGuardAndErrorText(t *testing.T) {
+	was := songURL
+	defer func() { songURL = was }()
+
+	queue := make([]ytm.Track, 8)
+	for i := range queue {
+		queue[i] = ytm.Track{ID: fmt.Sprintf("t%d", i)}
+	}
+
+	var tried []string
+	songURL = func(id, level string) (*ytm.Stream, error) {
+		tried = append(tried, id)
+		return nil, fmt.Errorf("%w: uploader blocked country", ytm.ErrUnavailable)
+	}
+	ch := make(chan func(), 64)
+	p := New(func(fn func()) { ch <- fn })
+	p.PlayQueue(queue, 0)
+	for start := time.Now(); p.Playing() && time.Since(start) < 2*time.Second; {
+		select {
+		case fn := <-ch:
+			fn()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	for len(ch) > 0 {
+		(<-ch)()
+	}
+	if len(tried) != 3 {
+		t.Fatalf("unavailable queue tried %d tracks (%v), want 3", len(tried), tried)
+	}
+	if p.err != "这首歌暂时无法播放" {
+		t.Fatalf("err = %q, want localized unavailable message", p.err)
+	}
+
+	tried = nil
+	songURL = func(id, level string) (*ytm.Stream, error) {
+		tried = append(tried, id)
+		return nil, fmt.Errorf("%w: %w: Sign in to confirm you’re not a bot", ytm.ErrUnavailable, ytm.ErrBotCheck)
+	}
+	p.PlayQueue(queue, 0)
+	for start := time.Now(); p.Playing() && time.Since(start) < 2*time.Second; {
+		select {
+		case fn := <-ch:
+			fn()
+		case <-time.After(20 * time.Millisecond):
+		}
+	}
+	for len(ch) > 0 {
+		(<-ch)()
+	}
+	if len(tried) != 1 {
+		t.Fatalf("bot check tried %d tracks (%v), want 1", len(tried), tried)
+	}
+	if strings.Contains(p.err, "available") || p.err == "" {
+		t.Fatalf("bot check err = %q, want localized bot-check prompt", p.err)
 	}
 }

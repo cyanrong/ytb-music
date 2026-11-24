@@ -22,6 +22,9 @@ var (
 	// ErrUnavailable is what a song gives that doesn't stream: taken
 	// down, private, or kept from the listener's country.
 	ErrUnavailable = errors.New("this song isn't available to stream")
+	// ErrBotCheck marks an IP or session bot challenge ("Sign in to confirm
+	// you're not a bot") rather than a track-specific restriction.
+	ErrBotCheck = errors.New("youtube bot check")
 	// ErrSignIn is what needs an account gives, until the app signs in.
 	ErrSignIn = errors.New("需要登录 YouTube 账号")
 	// ErrUnsupported is what YouTube Music has no counterpart for.
@@ -155,8 +158,9 @@ func (p *Playlist) Cover() string {
 
 // Stream is where a track streams from, and what it is.
 type Stream struct {
-	URL  string `json:"-"`
-	Size int64  `json:"size"` // in bytes
+	URL       string `json:"-"`
+	UserAgent string `json:"-"` // client User-Agent expected by googlevideo.com, or empty for default
+	Size      int64  `json:"size"` // in bytes
 	// Type is the format: m4a, AAC in MP4.
 	Type string `json:"type"`
 	// Level is the level served.

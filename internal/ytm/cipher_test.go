@@ -4,6 +4,7 @@ import (
 	"net/url"
 	"os"
 	"testing"
+	"time"
 )
 
 // The embedded yt-dlp solver loads into jsc and unscrambles YouTube's live
@@ -12,7 +13,18 @@ func TestLiveSolver(t *testing.T) {
 	if os.Getenv("LIVE") == "" {
 		t.Skip("set LIVE to call YouTube")
 	}
-	PlayerCacheDir = t.TempDir()
+	dir := t.TempDir()
+	PlayerCacheDir = dir
+	t.Cleanup(func() {
+		PlayerCacheDir = ""
+		solvers.mu.Lock()
+		if solvers.cur != nil {
+			solvers.cur.ctx.Close()
+			solvers.cur = nil
+		}
+		solvers.checked = time.Time{}
+		solvers.mu.Unlock()
+	})
 	sv, err := currentSolver()
 	if err != nil {
 		t.Fatalf("currentSolver: %v", err)

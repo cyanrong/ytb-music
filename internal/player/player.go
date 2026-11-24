@@ -778,14 +778,22 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 				return
 			}
 			if err != nil {
-				p.err = err.Error()
 				switch {
-				case err != ytm.ErrUnavailable:
-				default:
+				case errors.Is(err, ytm.ErrBotCheck):
+					if ytm.SignedIn() {
+						p.err = "当前代理节点触发 YouTube 风控，请更换节点或重新登录"
+					} else {
+						p.err = "当前节点触发验证，请先登录 YouTube 账号"
+					}
+				case errors.Is(err, ytm.ErrUnavailable):
 					p.err = "这首歌暂时无法播放"
+				default:
+					p.err = err.Error()
 				}
-				// Skip what cannot play, unless nothing in the queue can.
-				if skipped+1 < len(p.order) {
+				const maxConsecutiveSkips = 3
+				// Skip individual unplayable tracks, but stop on a bot check or
+				// after a few consecutive failures instead of draining the queue.
+				if !errors.Is(err, ytm.ErrBotCheck) && skipped+1 < len(p.order) && skipped+1 < maxConsecutiveSkips {
 					next := at + 1
 					if next >= len(p.order) {
 						next = 0
@@ -849,11 +857,17 @@ func (p *Player) open(t ytm.Track, level string) (*ytm.Stream, stream, error) {
 		dl = p.Cache.download(t.ID, info)
 	}
 	s, err := openStream(dl, t.Duration)
-	if err != nil && !ok && info.Level != "standard" {
-		// A better stream that won't open, its URL unscrambled wrong as
-		// YouTube changed its player, gives way to the standard one.
+	if err != nil && !ok {
 		dl.Close()
-		if info, err = songURL(t.ID, "standard"); err != nil {
+		ytm.InvalidateTrackStream(t.ID)
+		fallback := "standard"
+		if info.Level == "standard" {
+			if !ytm.SignedIn() {
+				return nil, nil, err
+			}
+			fallback = "standard_fallback"
+		}
+		if info, err = songURL(t.ID, fallback); err != nil {
 			return nil, nil, err
 		}
 		dl = p.Cache.download(t.ID, info)

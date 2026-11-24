@@ -4,60 +4,214 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-// player is what the visionOS client says of a video: whether it plays,
-// its AAC stream and its HLS manifest.
+// player holds what an InnerTube player endpoint says of a video: whether
+// it plays, its 128 kbps / 256 kbps AAC-in-MP4 streams, and its HLS manifest.
 type player struct {
 	status, reason string
-	stream         *Stream
+	standard       *Stream
+	exhigh         *Stream
 	hls            string
 }
 
 // Streams last about six hours; they are kept for less, so a stream given
 // out is good for a while yet.
-var playerCache = newCache[*player](30*time.Minute, 64)
+var (
+	playerCache       = newCache[*player](30*time.Minute, 64)
+	tvPlayerCache     = newCache[*player](30*time.Minute, 64)
+	webRemixCache     = newCache[*player](30*time.Minute, 64)
+	safariPlayerCache = newCache[*player](30*time.Minute, 64)
+
+	fetchVisionPlayer   = callPlayer
+	fetchTVPlayer       = callTVPlayer
+	fetchWebRemixPlayer = callWebRemixPlayer
+	fetchSafariPlayer   = callSafariPlayer
+	getSolver           = currentSolver
+)
+
+func clearStreamCaches() {
+	playerCache.clear()
+	tvPlayerCache.clear()
+	webRemixCache.clear()
+	safariPlayerCache.clear()
+}
+
+func invalidateStreamSuffix(suffix string) {
+	playerCache.deleteSuffix(suffix)
+	tvPlayerCache.deleteSuffix(suffix)
+	webRemixCache.deleteSuffix(suffix)
+	safariPlayerCache.deleteSuffix(suffix)
+}
+
+func streamCacheKey(apiURL, id string) string {
+	return routeCacheKeyFor(apiURL) + "|" + authCacheKey() + "|" + Language + "/" + id
+}
+
+func isBotCheck(status, reason string) bool {
+	r := strings.ToLower(reason)
+	if strings.Contains(r, "not a bot") || strings.Contains(r, "机器人") {
+		return true
+	}
+	if status == "LOGIN_REQUIRED" && !strings.Contains(r, "age") && !strings.Contains(r, "年龄") {
+		return true
+	}
+	return false
+}
+
+var hlsNRe = regexp.MustCompile(`/n/([0-9a-zA-Z_-]+)`)
+
+func solveHLSManifest(raw string, solve func(sig, n string) (string, string, error)) string {
+	if raw == "" || solve == nil {
+		return raw
+	}
+	m := hlsNRe.FindStringSubmatch(raw)
+	if m == nil {
+		return raw
+	}
+	_, outN, err := solve("", m[1])
+	if err != nil || outN == "" {
+		return raw
+	}
+	return strings.Replace(raw, "/n/"+m[1], "/n/"+outN, 1)
+}
+
+func parsePlayerResp(id string, resp any, ua string, solve func(sig, n string) (string, string, error)) (*player, error) {
+	if vid := str(resp, "videoDetails", "videoId"); vid != "" && vid != id {
+		return nil, fmt.Errorf("%w: unexpected video %s", ErrUnavailable, vid)
+	}
+	ps := dig(resp, "playabilityStatus")
+	p := &player{status: str(ps, "status"), reason: str(ps, "reason")}
+	if p.reason == "" {
+		p.reason = text(dig(ps, "errorScreen", "playerErrorMessageRenderer", "reason"))
+	}
+	if isBotCheck(p.status, p.reason) {
+		if !SignedIn() {
+			resetVisitorData()
+		}
+		return nil, fmt.Errorf("%w: %w: %s", ErrUnavailable, ErrBotCheck, p.reason)
+	}
+	if p.status == "LOGIN_REQUIRED" {
+		return nil, fmt.Errorf("%w: %s", ErrUnavailable, p.reason)
+	}
+	if p.status != "OK" {
+		return p, nil
+	}
+	sd := dig(resp, "streamingData")
+	p.hls = solveHLSManifest(str(sd, "hlsManifestUrl"), solve)
+	for _, f := range arr(sd, "adaptiveFormats") {
+		itag, _ := num(f, "itag")
+		if itag != 140 && itag != 141 {
+			continue
+		}
+		var u string
+		var err error
+		if solve != nil {
+			u, err = streamURL(f, solve)
+			if err != nil {
+				continue
+			}
+		} else {
+			u = str(f, "url")
+		}
+		if u == "" {
+			continue
+		}
+		size, _ := strconv.ParseInt(str(f, "contentLength"), 10, 64)
+		level := "standard"
+		if itag == 141 {
+			level = "exhigh"
+		}
+		st := &Stream{
+			URL:       u,
+			UserAgent: ua,
+			Size:      size,
+			Type:      "m4a",
+			Level:     level,
+			Gain:      gainOf(f, resp),
+		}
+		if itag == 141 && p.exhigh == nil {
+			p.exhigh = st
+		} else if itag == 140 && p.standard == nil {
+			p.standard = st
+		}
+	}
+	return p, nil
+}
 
 func playerOf(id string) (*player, error) {
 	if id == "" {
 		return nil, ErrUnavailable
 	}
-	return playerCache.get(routeCacheKeyFor(playerAPI)+"|"+Language+"/"+Region+"/"+id, func() (*player, error) {
-		resp, err := callPlayer(id)
+	return playerCache.get(streamCacheKey(playerAPI, id), func() (*player, error) {
+		resp, err := fetchVisionPlayer(id)
 		if err != nil {
 			return nil, err
 		}
-		ps := dig(resp, "playabilityStatus")
-		p := &player{status: str(ps, "status"), reason: str(ps, "reason")}
-		if p.reason == "" {
-			p.reason = text(dig(ps, "errorScreen", "playerErrorMessageRenderer", "reason"))
+		return parsePlayerResp(id, resp, visionUA, nil)
+	})
+}
+
+func tvPlayerOf(id string) (*player, error) {
+	if id == "" {
+		return nil, ErrUnavailable
+	}
+	return tvPlayerCache.get(streamCacheKey(playerAPI, id), func() (*player, error) {
+		sv, err := getSolver()
+		if err != nil {
+			return nil, err
 		}
-		if p.status == "LOGIN_REQUIRED" {
-			// "Sign in to confirm you're not a bot": not the song's fault,
-			// so not kept, and the next try comes as another visitor.
-			resetVisitorData()
-			return nil, fmt.Errorf("%w: %s", ErrUnavailable, p.reason)
+		resp, err := fetchTVPlayer(id, sv.sts)
+		if err != nil {
+			return nil, err
 		}
-		if p.status != "OK" {
-			return p, nil
+		return parsePlayerResp(id, resp, tvSamsungUA, sv.solve)
+	})
+}
+
+func webRemixOf(id string) (*player, error) {
+	if id == "" {
+		return nil, ErrUnavailable
+	}
+	return webRemixCache.get(streamCacheKey(musicAPI+"player?prettyPrint=false", id), func() (*player, error) {
+		sv, err := getSolver()
+		if err != nil {
+			return nil, err
 		}
-		sd := dig(resp, "streamingData")
-		p.hls = str(sd, "hlsManifestUrl")
-		for _, f := range arr(sd, "adaptiveFormats") {
-			itag, _ := num(f, "itag")
-			u := str(f, "url")
-			if itag != 140 || u == "" {
-				continue
-			}
-			size, _ := strconv.ParseInt(str(f, "contentLength"), 10, 64)
-			p.stream = &Stream{URL: u, Size: size, Type: "m4a", Level: "standard", Gain: gainOf(f, resp)}
-			break
+		resp, err := fetchWebRemixPlayer(id, sv.sts)
+		if err != nil {
+			return nil, err
+		}
+		p, err := parsePlayerResp(id, resp, UserAgent, sv.solve)
+		if err != nil {
+			return nil, err
+		}
+		if SignedIn() && p.status == "OK" {
+			sawPremium(p.exhigh != nil)
 		}
 		return p, nil
+	})
+}
+
+func safariPlayerOf(id string) (*player, error) {
+	if id == "" {
+		return nil, ErrUnavailable
+	}
+	return safariPlayerCache.get(streamCacheKey(playerAPI, id), func() (*player, error) {
+		sv, err := getSolver()
+		if err != nil {
+			return nil, err
+		}
+		resp, err := fetchSafariPlayer(id, sv.sts)
+		if err != nil {
+			return nil, err
+		}
+		return parsePlayerResp(id, resp, webSafariUA, sv.solve)
 	})
 }
 
@@ -83,45 +237,108 @@ func gainOf(format, resp any) float64 {
 }
 
 // SongURL returns where to stream a track's audio, with its size and
-// loudness: AAC in MP4 at 128 kbps (itag 140, "standard") to anyone, or at
-// 256 kbps (itag 141, "exhigh") to a Premium account that asks, else the
-// standard one. Both are asked at once, so the standard one waits on
-// nothing.
+// loudness: AAC in MP4 at 128 kbps (itag 140, "standard"), or at 256 kbps
+// (itag 141, "exhigh") for a Premium account when available. Signed-in
+// standard playback uses TVHTML5 (cookie-authenticated without GVS PO token
+// requirements) with fallback to WEB_REMIX and VISIONOS.
 func SongURL(id string, level string) (*Stream, error) {
-	if level != "exhigh" || !SignedIn() || notPremium() {
-		return standardStream(id)
+	if id == "" {
+		return nil, ErrUnavailable
 	}
-	type result struct {
-		s   *Stream
-		err error
+	if level == "standard_fallback" {
+		if SignedIn() {
+			if s, err := webRemixStandardStream(id); err == nil {
+				return s, nil
+			}
+		}
+		return visionStream(id)
 	}
-	std := make(chan result, 1)
-	go func() {
-		s, err := standardStream(id)
-		std <- result{s, err}
-	}()
-	if s, err := premiumStream(id); err == nil {
-		return s, nil
+	if !SignedIn() {
+		s, err := visionStream(id)
+		if err == nil || errors.Is(err, ErrBotCheck) {
+			return s, err
+		}
+		if tv, tvErr := tvStream(id); tvErr == nil {
+			return tv, nil
+		}
+		return nil, err
 	}
-	r := <-std
-	return r.s, r.err
+	if level == "exhigh" && !notPremium() {
+		type result struct {
+			s   *Stream
+			err error
+		}
+		std := make(chan result, 1)
+		go func() {
+			s, err := tvStream(id)
+			std <- result{s, err}
+		}()
+		wr, wrErr := webRemixOf(id)
+		if wrErr == nil && wr.status == "OK" && wr.exhigh != nil {
+			cp := *wr.exhigh
+			return &cp, nil
+		}
+		r := <-std
+		if r.err == nil {
+			return r.s, nil
+		}
+		if wrErr == nil && wr.status == "OK" && wr.standard != nil {
+			cp := *wr.standard
+			return &cp, nil
+		}
+		if s, vErr := visionStream(id); vErr == nil {
+			return s, nil
+		}
+		if r.err != nil {
+			return nil, r.err
+		}
+		if wrErr != nil {
+			return nil, wrErr
+		}
+		return nil, fmt.Errorf("%w: %s", ErrUnavailable, wr.reason)
+	}
+	tv, tvErr := tvStream(id)
+	if tvErr == nil {
+		return tv, nil
+	}
+	if wr, wrErr := webRemixStandardStream(id); wrErr == nil {
+		return wr, nil
+	} else if errors.Is(wrErr, ErrBotCheck) {
+		return nil, wrErr
+	}
+	if v, vErr := visionStream(id); vErr == nil {
+		return v, nil
+	}
+	return nil, tvErr
 }
 
-// standardStream returns a track's AAC at 128 kbps, which the visionOS
-// client gives anyone, as a plain URL.
-func standardStream(id string) (*Stream, error) {
-	p, err := playerOf(id)
+func standardFromPlayer(p *player, err error) (*Stream, error) {
 	if err != nil {
 		return nil, err
 	}
 	if p.status != "OK" {
 		return nil, fmt.Errorf("%w: %s", ErrUnavailable, p.reason)
 	}
-	if p.stream == nil {
+	if p.standard == nil {
 		return nil, fmt.Errorf("%w: no AAC stream", ErrUnavailable)
 	}
-	s := *p.stream
+	s := *p.standard
 	return &s, nil
+}
+
+func visionStream(id string) (*Stream, error) {
+	p, err := playerOf(id)
+	return standardFromPlayer(p, err)
+}
+
+func tvStream(id string) (*Stream, error) {
+	p, err := tvPlayerOf(id)
+	return standardFromPlayer(p, err)
+}
+
+func webRemixStandardStream(id string) (*Stream, error) {
+	p, err := webRemixOf(id)
+	return standardFromPlayer(p, err)
 }
 
 // premium says whether the account signed in has Premium's streams: once
@@ -157,59 +374,28 @@ func forgetPremium() {
 	premium.mu.Unlock()
 }
 
-var errNotPremium = errors.New("ytm: the account has no Premium streams")
-
-var premiumCache = newCache[*Stream](30*time.Minute, 64)
-
-// premiumStream returns a track's AAC at 256 kbps, which YouTube Music's
-// web client gives an account with Premium, unscrambled.
-func premiumStream(id string) (*Stream, error) {
-	return premiumCache.get(routeCacheKeyFor(musicAPI+"player?prettyPrint=false")+"|"+Language+"/"+Region+"/"+id, func() (*Stream, error) {
-		sv, err := currentSolver()
-		if err != nil {
-			return nil, err
-		}
-		resp, err := call("player", map[string]any{
-			"videoId": id, "contentCheckOk": true, "racyCheckOk": true,
-			"playbackContext": map[string]any{"contentPlaybackContext": map[string]any{"signatureTimestamp": sv.sts}},
-		})
-		if err != nil {
-			return nil, err
-		}
-		if st := str(dig(resp, "playabilityStatus"), "status"); st != "OK" {
-			return nil, fmt.Errorf("%w: %s", ErrUnavailable, st)
-		}
-		for _, f := range arr(resp, "streamingData", "adaptiveFormats") {
-			if itag, _ := num(f, "itag"); itag != 141 {
-				continue
-			}
-			sawPremium(true)
-			u, err := streamURL(f, sv.solve)
-			if err != nil {
-				return nil, err
-			}
-			size, _ := strconv.ParseInt(str(f, "contentLength"), 10, 64)
-			return &Stream{URL: u, Size: size, Type: "m4a", Level: "exhigh", Gain: gainOf(f, resp)}, nil
-		}
-		sawPremium(false)
-		return nil, errNotPremium
-	})
-}
-
 // VideoURL returns the HLS manifest of a video, which the system's player
 // plays adaptively.
 func VideoURL(id string) (string, error) {
 	p, err := playerOf(id)
+	if err == nil && p.status == "OK" && p.hls != "" {
+		return p.hls, nil
+	}
+	if SignedIn() {
+		if sp, sErr := safariPlayerOf(id); sErr == nil && sp.status == "OK" && sp.hls != "" {
+			return sp.hls, nil
+		}
+		if wr, wErr := webRemixOf(id); wErr == nil && wr.status == "OK" && wr.hls != "" {
+			return wr.hls, nil
+		}
+	}
 	if err != nil {
 		return "", err
 	}
 	if p.status != "OK" {
 		return "", fmt.Errorf("%w: %s", ErrUnavailable, p.reason)
 	}
-	if p.hls == "" {
-		return "", fmt.Errorf("%w: no HLS manifest", ErrUnavailable)
-	}
-	return p.hls, nil
+	return "", fmt.Errorf("%w: no HLS manifest", ErrUnavailable)
 }
 
 // VideoStream returns the stream of a video's pictures alone: of its HLS

@@ -332,6 +332,52 @@ func TestBetterStreamGivesWay(t *testing.T) {
 	}
 }
 
+// Signed in at "standard", a TVHTML5 stream refused by googlevideo.com gives
+// way to "standard_fallback" (WEB_REMIX itag 140) and forwards the stream's
+// client User-Agent.
+func TestSignedInStandardOpenFallsBack(t *testing.T) {
+	b, err := os.ReadFile("testdata/seek.m4a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var gotUA string
+	good := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotUA = r.Header.Get("User-Agent")
+		w.Write(b)
+	}))
+	defer good.Close()
+	refused := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "forbidden", http.StatusForbidden)
+	}))
+	defer refused.Close()
+
+	ytm.SetCookies("SAPISID=test_sapisid; SID=test_sid")
+	defer ytm.ClearSession()
+
+	was := songURL
+	defer func() { songURL = was }()
+	var levels []string
+	songURL = func(id, level string) (*ytm.Stream, error) {
+		levels = append(levels, level)
+		if level == "standard" {
+			return &ytm.Stream{URL: refused.URL, UserAgent: "TV-UA/1.0", Size: int64(len(b)), Type: "m4a", Level: "standard"}, nil
+		}
+		return &ytm.Stream{URL: good.URL, UserAgent: "WebRemix-UA/1.0", Size: int64(len(b)), Type: "m4a", Level: "standard"}, nil
+	}
+	p := &Player{}
+	info, s, err := p.open(ytm.Track{ID: "trk1"}, "standard")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if len(levels) != 2 || levels[0] != "standard" || levels[1] != "standard_fallback" {
+		t.Fatalf("levels requested = %v, want [standard standard_fallback]", levels)
+	}
+	if info.Level != "standard" || gotUA != "WebRemix-UA/1.0" {
+		t.Fatalf("level=%q ua=%q", info.Level, gotUA)
+	}
+}
+
 // How fast songs come in is told by the ranges big enough to tell, in bits
 // a second, the latest weighing as much as all before.
 func TestThroughput(t *testing.T) {
@@ -387,7 +433,7 @@ func TestRangeDownloadRefreshesURLAfterRouteChange(t *testing.T) {
 	defer newSrv.Close()
 
 	refreshes := 0
-	dl := startDownloadWithRefresh(oldSrv.URL+"/.googlevideo.com/videoplayback?id=1", total, nil, nil, func() (string, error) {
+	dl := startDownloadWithRefresh(oldSrv.URL+"/.googlevideo.com/videoplayback?id=1", "Custom-TV-UA/1.0", total, nil, nil, func() (string, error) {
 		refreshes++
 		return newSrv.URL + "/.googlevideo.com/videoplayback?id=1", nil
 	})

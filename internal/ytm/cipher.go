@@ -145,8 +145,14 @@ func newSolver(id string) (*solver, error) {
 		return nil, err
 	}
 	// As the solver's getFromPrepared runs it: the player's code, which
-	// leaves its functions in _result.
-	ok, err := ctx.Eval("var _result = {n: null, sig: null};\n(function (_result) {\n" + prepared + "\n})(_result);\n!!(_result.n && _result.sig)")
+	// leaves its functions in _result. Sampled telemetry branches inside
+	// base.js sometimes instantiate a Disposable whose prototype methods the
+	// AST preprocessor pruned; stubbing addOnDisposeCallback keeps those
+	// sampled runs from throwing TypeError.
+	const disposeShim = `if (typeof Object.prototype.addOnDisposeCallback === "undefined") {` +
+		`Object.defineProperty(Object.prototype, "addOnDisposeCallback", {value: function(){}, configurable: true, writable: true});` +
+		`}` + "\n"
+	ok, err := ctx.Eval(disposeShim + "var _result = {n: null, sig: null};\n(function (_result) {\n" + prepared + "\n})(_result);\n!!(_result.n && _result.sig)")
 	if err != nil || ok != "true" {
 		ctx.Close()
 		if err == nil {

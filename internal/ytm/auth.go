@@ -22,6 +22,10 @@ var auth struct {
 	// The cookies the Authorization header hashes, as the web player
 	// does: SAPISID, and the first- and third-party ones beside it.
 	sapisid, sapisid1p, sapisid3p string
+	// pageID and userSessionID come from YouTube's datasyncId once an
+	// authenticated response has been seen ("delegated||user" for a Brand
+	// channel, or "user||" for a primary channel).
+	pageID, userSessionID string
 }
 
 // LoginURL is where a sign-in to YouTube Music starts, in a web view: it
@@ -40,16 +44,25 @@ func SetCookies(header string) bool {
 		sapisid = jar["__Secure-3PAPISID"]
 	}
 	auth.mu.Lock()
-	defer auth.mu.Unlock()
 	if sapisid == "" {
+		wasSignedIn := auth.header != ""
 		auth.header, auth.sapisid, auth.sapisid1p, auth.sapisid3p = "", "", "", ""
+		auth.pageID, auth.userSessionID = "", ""
+		auth.mu.Unlock()
+		if wasSignedIn {
+			clearCaches()
+		}
 		return false
 	}
 	changed := auth.header != header
 	auth.header = header
 	auth.sapisid, auth.sapisid1p, auth.sapisid3p = sapisid, jar["__Secure-1PAPISID"], jar["__Secure-3PAPISID"]
 	if changed {
-		go clearCaches()
+		auth.pageID, auth.userSessionID = "", ""
+	}
+	auth.mu.Unlock()
+	if changed {
+		clearCaches()
 	}
 	return true
 }
@@ -59,6 +72,33 @@ func SignedIn() bool {
 	auth.mu.RLock()
 	defer auth.mu.RUnlock()
 	return auth.header != ""
+}
+
+func authCacheKey() string {
+	auth.mu.RLock()
+	header, sapisid, pageID := auth.header, auth.sapisid, auth.pageID
+	auth.mu.RUnlock()
+	if header == "" {
+		return "anon"
+	}
+	sum := sha1.Sum([]byte(sapisid + "|" + pageID))
+	return "auth:" + hex.EncodeToString(sum[:6])
+}
+
+func noteDataSyncID(ds string) {
+	first, second, ok := strings.Cut(ds, "||")
+	if !ok || first == "" {
+		return
+	}
+	pageID, userID := "", first
+	if second != "" {
+		pageID, userID = first, second
+	}
+	auth.mu.Lock()
+	if auth.header != "" {
+		auth.pageID, auth.userSessionID = pageID, userID
+	}
+	auth.mu.Unlock()
 }
 
 func parseCookies(header string) map[string]string {
@@ -77,12 +117,17 @@ func parseCookies(header string) map[string]string {
 func signRequest(h http.Header, origin string) {
 	auth.mu.RLock()
 	header, sapisid, p1, p3 := auth.header, auth.sapisid, auth.sapisid1p, auth.sapisid3p
+	pageID, userID := auth.pageID, auth.userSessionID
 	auth.mu.RUnlock()
 	if header == "" {
 		return
 	}
 	ts := strconv.FormatInt(time.Now().Unix(), 10)
 	hash := func(cookie string) string {
+		if userID != "" {
+			sum := sha1.Sum([]byte(userID + " " + ts + " " + cookie + " " + origin))
+			return ts + "_" + hex.EncodeToString(sum[:]) + "_u"
+		}
 		sum := sha1.Sum([]byte(ts + " " + cookie + " " + origin))
 		return ts + "_" + hex.EncodeToString(sum[:])
 	}
@@ -96,6 +141,9 @@ func signRequest(h http.Header, origin string) {
 	h.Set("Cookie", header)
 	h.Set("Authorization", authz)
 	h.Set("X-Goog-AuthUser", "0")
+	if pageID != "" {
+		h.Set("X-Goog-PageId", pageID)
+	}
 	h.Set("X-Origin", origin)
 }
 
@@ -156,8 +204,9 @@ func ClearSession() {
 	fm.mu.Unlock()
 	auth.mu.Lock()
 	auth.header, auth.sapisid, auth.sapisid1p, auth.sapisid3p = "", "", "", ""
+	auth.pageID, auth.userSessionID = "", ""
 	auth.mu.Unlock()
-	go clearCaches()
+	clearCaches()
 }
 
 // Logout signs out: requests go anonymous. The app clears the web view's

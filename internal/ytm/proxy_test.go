@@ -54,7 +54,7 @@ func TestProxyForRequest(t *testing.T) {
 	// Changing proxy clears cached signed stream URLs, while reapplying an
 	// equivalent normalized address is a no-op.
 	_, _ = playerCache.get("route|en/US/vid1", func() (*player, error) {
-		return &player{status: "OK", stream: &Stream{URL: "https://old-ip"}}, nil
+		return &player{status: "OK", standard: &Stream{URL: "https://old-ip"}}, nil
 	})
 	if err := SetProxy("127.0.0.1:1080"); err != nil {
 		t.Fatal(err)
@@ -67,7 +67,7 @@ func TestProxyForRequest(t *testing.T) {
 	}
 
 	_, _ = playerCache.get("route|en/US/vid2", func() (*player, error) {
-		return &player{status: "OK", stream: &Stream{URL: "https://same-ip"}}, nil
+		return &player{status: "OK", standard: &Stream{URL: "https://same-ip"}}, nil
 	})
 	if err := SetProxy("http://127.0.0.1:1080"); err != nil {
 		t.Fatal(err)

@@ -36,6 +36,7 @@ type download struct {
 	part    string
 	keep    func(part string, n int64) (string, bool)
 	refresh func() (string, error) // reacquires a fresh signed URL after a route change
+	ua      string                 // client User-Agent expected by googlevideo.com
 	// users counts what reads or writes the song: the stream decoding it,
 	// until it closes, and the goroutine fetching it. The last to go
 	// closes the file, and removes it unless the cache kept it.
@@ -46,12 +47,12 @@ type download struct {
 // startDownload fetches url, of size bytes if known, into part, a file
 // that keep keeps once it has all come in: or into memory, without one.
 func startDownload(url string, size int64, part *os.File, keep func(string, int64) (string, bool)) *download {
-	return startDownloadWithRefresh(url, size, part, keep, nil)
+	return startDownloadWithRefresh(url, "", size, part, keep, nil)
 }
 
-func startDownloadWithRefresh(url string, size int64, part *os.File, keep func(string, int64) (string, bool), refresh func() (string, error)) *download {
+func startDownloadWithRefresh(url, ua string, size int64, part *os.File, keep func(string, int64) (string, bool), refresh func() (string, error)) *download {
 	ctx, cancel := context.WithCancel(context.Background())
-	d := &download{size: size, cancel: cancel, refresh: refresh, users: 2}
+	d := &download{size: size, cancel: cancel, refresh: refresh, ua: ua, users: 2}
 	d.cond.L = &d.mu
 	switch {
 	case part != nil:
@@ -61,6 +62,25 @@ func startDownloadWithRefresh(url string, size int64, part *os.File, keep func(s
 	}
 	go d.run(ctx, url)
 	return d
+}
+
+func (d *download) userAgent() string {
+	d.mu.Lock()
+	ua := d.ua
+	d.mu.Unlock()
+	if ua != "" {
+		return ua
+	}
+	return ytm.UserAgent
+}
+
+func (d *download) setUserAgent(ua string) {
+	if ua == "" {
+		return
+	}
+	d.mu.Lock()
+	d.ua = ua
+	d.mu.Unlock()
 }
 
 // maxPrealloc is the most memory set aside for a song before its bytes
@@ -106,7 +126,7 @@ func (d *download) run(ctx context.Context, url string) {
 		finish(err)
 		return
 	}
-	req.Header.Set("User-Agent", ytm.UserAgent)
+	req.Header.Set("User-Agent", d.userAgent())
 	res, err := ytm.StreamClient.Do(req)
 	if err != nil {
 		finish(err)
