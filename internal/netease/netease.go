@@ -37,14 +37,28 @@ type Playlist struct {
 
 // SourceTrack is a track from NetEase Cloud Music to be matched on YouTube Music.
 type SourceTrack struct {
-	ID         int64
-	Name       string
-	Alias      string
-	Artists    []string
-	Album      string
-	CoverURL   string
-	DurationMs int64
-	Missing    bool // omitted by NetEase song/detail (taken down or unavailable)
+	ID            int64
+	Name          string
+	Alias         string
+	Aliases       []string
+	Artists       []string
+	ArtistAliases []string
+	Album         string
+	AlbumID       int64
+	AlbumAliases  []string
+	AlbumSize     int
+	TrackNo       int // 1-based position on the album when known
+	CoverURL      string
+	DurationMs    int64
+	Missing       bool // omitted by NetEase song/detail (taken down or unavailable)
+}
+
+// AlbumMeta holds supplementary artist/album aliases and track count from
+// NetEase's /api/v1/album/<id> endpoint.
+type AlbumMeta struct {
+	AlbumAliases  []string
+	ArtistAliases []string
+	Size          int
 }
 
 func (t SourceTrack) DisplayArtist() string {
@@ -371,63 +385,203 @@ func FetchPlaylist(ctx context.Context, rawInput, rawMusicU string) (*Playlist, 
 }
 
 type rawSong struct {
-	ID   int64    `json:"id"`
-	Name string   `json:"name"`
-	Alia []string `json:"alia"`
-	Tns  []string `json:"tns"`
-	Dt   int64    `json:"dt"`
-	Duration int64 `json:"duration"`
-	Ar   []struct {
+	ID         int64    `json:"id"`
+	Name       string   `json:"name"`
+	No         int      `json:"no"`
+	Alia       []string `json:"alia"`
+	Tns        []string `json:"tns"`
+	TransNames []string `json:"transNames"`
+	Dt         int64    `json:"dt"`
+	Duration   int64    `json:"duration"`
+	OriginSong *struct {
 		Name string `json:"name"`
+	} `json:"originSongSimpleData"`
+	Ar []struct {
+		Name  string   `json:"name"`
+		Tns   []string `json:"tns"`
+		Alias []string `json:"alias"`
 	} `json:"ar"`
 	Artists []struct {
-		Name string `json:"name"`
+		Name  string   `json:"name"`
+		Tns   []string `json:"tns"`
+		Alias []string `json:"alias"`
 	} `json:"artists"`
 	Al struct {
-		Name   string `json:"name"`
-		PicURL string `json:"picUrl"`
+		ID     int64    `json:"id"`
+		Name   string   `json:"name"`
+		PicURL string   `json:"picUrl"`
+		Tns    []string `json:"tns"`
+		Alias  []string `json:"alias"`
 	} `json:"al"`
 	Album struct {
-		Name   string `json:"name"`
-		PicURL string `json:"picUrl"`
+		ID         int64    `json:"id"`
+		Name       string   `json:"name"`
+		PicURL     string   `json:"picUrl"`
+		Tns        []string `json:"tns"`
+		TransNames []string `json:"transNames"`
+		Alias      []string `json:"alias"`
 	} `json:"album"`
+}
+
+func isArrangementSourceNote(s string) bool {
+	t := strings.TrimSpace(s)
+	return strings.HasPrefix(t, "原曲：") || strings.HasPrefix(t, "原曲:") || strings.HasPrefix(strings.ToLower(t), "original:")
+}
+
+func appendUniqueTrimmed(dst []string, vals ...string) []string {
+	for _, v := range vals {
+		v = strings.TrimSpace(composeKana(v))
+		if v == "" {
+			continue
+		}
+		dup := false
+		for _, e := range dst {
+			if strings.EqualFold(e, v) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			dst = append(dst, v)
+		}
+	}
+	return dst
 }
 
 func (s rawSong) toSourceTrack() SourceTrack {
 	st := SourceTrack{
 		ID:         s.ID,
-		Name:       strings.TrimSpace(s.Name),
+		Name:       strings.TrimSpace(composeKana(s.Name)),
+		TrackNo:    s.No,
 		DurationMs: s.Dt,
 	}
 	if st.DurationMs == 0 {
 		st.DurationMs = s.Duration
 	}
-	if len(s.Tns) > 0 {
-		st.Alias = strings.TrimSpace(s.Tns[0])
-	} else if len(s.Alia) > 0 {
-		st.Alias = strings.TrimSpace(s.Alia[0])
-	}
-	for _, a := range s.Ar {
-		if n := strings.TrimSpace(a.Name); n != "" {
-			st.Artists = append(st.Artists, n)
+	addTitleAlias := func(list []string) {
+		for _, item := range list {
+			item = strings.TrimSpace(composeKana(item))
+			if item == "" || isArrangementSourceNote(item) || strings.EqualFold(item, st.Name) {
+				continue
+			}
+			st.Aliases = appendUniqueTrimmed(st.Aliases, item)
 		}
+	}
+	addTitleAlias(s.Tns)
+	addTitleAlias(s.TransNames)
+	addTitleAlias(s.Alia)
+	if s.OriginSong != nil && s.OriginSong.Name != "" {
+		// Only include originSong name when this track itself isn't tagged as a cover.
+		if !coverRe.MatchString(st.Name) {
+			addTitleAlias([]string{s.OriginSong.Name})
+		}
+	}
+	if len(st.Aliases) > 0 {
+		st.Alias = st.Aliases[0]
+	}
+
+	for _, a := range s.Ar {
+		if n := strings.TrimSpace(composeKana(a.Name)); n != "" {
+			st.Artists = appendUniqueTrimmed(st.Artists, n)
+		}
+		st.ArtistAliases = appendUniqueTrimmed(st.ArtistAliases, a.Tns...)
+		st.ArtistAliases = appendUniqueTrimmed(st.ArtistAliases, a.Alias...)
 	}
 	if len(st.Artists) == 0 {
 		for _, a := range s.Artists {
-			if n := strings.TrimSpace(a.Name); n != "" {
-				st.Artists = append(st.Artists, n)
+			if n := strings.TrimSpace(composeKana(a.Name)); n != "" {
+				st.Artists = appendUniqueTrimmed(st.Artists, n)
 			}
+			st.ArtistAliases = appendUniqueTrimmed(st.ArtistAliases, a.Tns...)
+			st.ArtistAliases = appendUniqueTrimmed(st.ArtistAliases, a.Alias...)
 		}
 	}
-	st.Album = strings.TrimSpace(s.Al.Name)
+	st.AlbumID = s.Al.ID
+	st.Album = strings.TrimSpace(composeKana(s.Al.Name))
 	st.CoverURL = s.Al.PicURL
+	st.AlbumAliases = appendUniqueTrimmed(st.AlbumAliases, s.Al.Tns...)
+	st.AlbumAliases = appendUniqueTrimmed(st.AlbumAliases, s.Al.Alias...)
+	if st.AlbumID == 0 {
+		st.AlbumID = s.Album.ID
+	}
 	if st.Album == "" {
-		st.Album = strings.TrimSpace(s.Album.Name)
+		st.Album = strings.TrimSpace(composeKana(s.Album.Name))
 	}
 	if st.CoverURL == "" {
 		st.CoverURL = s.Album.PicURL
 	}
+	st.AlbumAliases = appendUniqueTrimmed(st.AlbumAliases, s.Album.Tns...)
+	st.AlbumAliases = appendUniqueTrimmed(st.AlbumAliases, s.Album.TransNames...)
+	st.AlbumAliases = appendUniqueTrimmed(st.AlbumAliases, s.Album.Alias...)
 	return st
+}
+
+// FetchAlbumMeta queries NetEase's album detail endpoint to obtain English /
+// Romaji artist aliases (e.g. "オーライフジャパン" -> "O-LIFE.JP"), album aliases,
+// and album track counts.
+func FetchAlbumMeta(ctx context.Context, albumID int64) (*AlbumMeta, error) {
+	if albumID <= 0 {
+		return nil, nil
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/v1/album/%d", APIBase, albumID), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Referer", "https://music.163.com/")
+	req.Header.Set("User-Agent", neteaseUA)
+	res, err := HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("netease: album HTTP %d", res.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(res.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Code  int `json:"code"`
+		Album *struct {
+			Size       int      `json:"size"`
+			Alias      []string `json:"alias"`
+			TransNames []string `json:"transNames"`
+			Artist     struct {
+				Name  string   `json:"name"`
+				Trans string   `json:"trans"`
+				Alias []string `json:"alias"`
+			} `json:"artist"`
+			Artists []struct {
+				Name  string   `json:"name"`
+				Trans string   `json:"trans"`
+				Alias []string `json:"alias"`
+			} `json:"artists"`
+		} `json:"album"`
+		Songs []struct {
+			ID int64 `json:"id"`
+		} `json:"songs"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Code != 200 || payload.Album == nil {
+		return nil, errors.New("netease: invalid album response")
+	}
+	meta := &AlbumMeta{Size: payload.Album.Size}
+	if len(payload.Songs) > meta.Size {
+		meta.Size = len(payload.Songs)
+	}
+	meta.AlbumAliases = appendUniqueTrimmed(meta.AlbumAliases, payload.Album.Alias...)
+	meta.AlbumAliases = appendUniqueTrimmed(meta.AlbumAliases, payload.Album.TransNames...)
+	if payload.Album.Artist.Trans != "" {
+		meta.ArtistAliases = appendUniqueTrimmed(meta.ArtistAliases, payload.Album.Artist.Trans)
+	}
+	meta.ArtistAliases = appendUniqueTrimmed(meta.ArtistAliases, payload.Album.Artist.Alias...)
+	for _, ar := range payload.Album.Artists {
+		if ar.Trans != "" {
+			meta.ArtistAliases = appendUniqueTrimmed(meta.ArtistAliases, ar.Trans)
+		}
+		meta.ArtistAliases = appendUniqueTrimmed(meta.ArtistAliases, ar.Alias...)
+	}
+	return meta, nil
 }
 
 func fetchSongBatch(ctx context.Context, ids []int64, musicU string) ([]SourceTrack, error) {

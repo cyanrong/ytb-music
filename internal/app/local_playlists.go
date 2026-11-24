@@ -63,6 +63,7 @@ func newLocalPlaylistID() string {
 }
 
 func normalizeLocalPlaylist(pl *ytm.Playlist) {
+	pl.Editable = true
 	pl.TrackCount = len(pl.Tracks)
 	if pl.Creator.Nickname == "" {
 		pl.Creator.Nickname = "本地歌单"
@@ -237,6 +238,31 @@ func (a *app) removeTrackFromLocalPlaylist(id, trackID string) error {
 	if nextList[i].CoverURL != "" && len(after) == 0 {
 		nextList[i].CoverURL = ""
 	}
+	normalizeLocalPlaylist(&nextList[i])
+	if err := a.saveLocalPlaylistsList(nextList); err != nil {
+		return err
+	}
+	a.localPlaylists = nextList
+	a.syncLocalPlaylists()
+	return nil
+}
+
+func (a *app) moveTrackToTopLocalPlaylist(id, trackID string) error {
+	i := slices.IndexFunc(a.localPlaylists, func(pl ytm.Playlist) bool { return pl.ID == id })
+	if i < 0 {
+		return errors.New("本地歌单不存在")
+	}
+	before := a.localPlaylists[i].Tracks
+	idx := slices.IndexFunc(before, func(t ytm.Track) bool { return t.ID == trackID })
+	if idx <= 0 {
+		return nil
+	}
+	reordered := make([]ytm.Track, 0, len(before))
+	reordered = append(reordered, before[idx])
+	reordered = append(reordered, before[:idx]...)
+	reordered = append(reordered, before[idx+1:]...)
+	nextList := slices.Clone(a.localPlaylists)
+	nextList[i].Tracks = reordered
 	normalizeLocalPlaylist(&nextList[i])
 	if err := a.saveLocalPlaylistsList(nextList); err != nil {
 		return err

@@ -321,3 +321,61 @@ func TestImportDialogFrames(t *testing.T) {
 	tt.SetDark(false)
 	save("import-dialog-light")
 }
+
+// Imported cloud playlists initially placed in saved are promoted to mine once
+// their detail page reports Editable, unlocking track reordering and removal,
+// and read-only playlists can be forked into an editable local copy.
+func TestEditablePromotionAndPlaylistFork(t *testing.T) {
+	tmp := t.TempDir()
+	origPath := localPlaylistsPath
+	localPlaylistsPath = func() (string, error) { return filepath.Join(tmp, "local_playlists.json"), nil }
+	defer func() { localPlaylistsPath = origPath }()
+
+	realStart := playlistStart
+	defer func() { playlistStart = realStart }()
+	playlistStart = func(id string) (*ytm.Playlist, string, error) {
+		return &ytm.Playlist{
+			ID:       id,
+			Name:     "好耶来了可爱喜欢",
+			Editable: true,
+			Tracks: []ytm.Track{
+				{ID: "jp1", Name: "静寂の一人歩き", Artists: []ytm.Artist{{Name: "O-LIFE.JP"}}, Duration: 294000},
+				{ID: "jp2", Name: "妖精は真冬の夢を見る", Artists: []ytm.Artist{{Name: "O-LIFE.JP"}}, Duration: 450000},
+			},
+		}, "", nil
+	}
+
+	a := editTestApp()
+	a.initLocalPlaylists()
+	posts := make(chan func(), 16)
+	a.postHook = func(fn func()) { posts <- fn }
+
+	// Simulate an imported cloud playlist misclassified under saved before opening.
+	a.saved = []ytm.Playlist{{ID: "PL_IMPORTED", Name: "好耶来了可爱喜欢", Subscribed: true}}
+	a.open(route{page: pagePlaylist, id: "PL_IMPORTED"})
+	drainPosts(t, posts, func() bool { return a.playlists["PL_IMPORTED"] != nil })
+
+	if a.editable("PL_IMPORTED") == nil || len(a.saved) != 0 {
+		t.Fatalf("expected PL_IMPORTED promoted from saved to editable mine; editable=%v saved=%d", a.editable("PL_IMPORTED"), len(a.saved))
+	}
+
+	// Forking a read-only playlist to local creates an editable local playlist and reorders tracks.
+	readOnly := &ytm.Playlist{
+		ID:   "PL_OTHER",
+		Name: "东方精选",
+		Tracks: []ytm.Track{
+			{ID: "t1", Name: "第一首", Duration: 180000},
+			{ID: "t2", Name: "第二首", Duration: 200000},
+		},
+	}
+	a.forkPlaylist(readOnly, false)
+	if !isLocalPlaylist(a.route.id) || a.editable(a.route.id) == nil {
+		t.Fatalf("expected forked local playlist to be active and editable, route=%+v", a.route)
+	}
+	forkID := a.route.id
+	a.moveTop(forkID, &readOnly.Tracks[1])
+	got := a.playlists[forkID].Tracks
+	if len(got) != 2 || got[0].ID != "t2" || got[1].ID != "t1" {
+		t.Fatalf("reordered tracks = %+v, want [t2 t1]", got)
+	}
+}

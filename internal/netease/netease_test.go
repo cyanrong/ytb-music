@@ -157,3 +157,136 @@ func TestMatchTracksPrefersStudioATV(t *testing.T) {
 		t.Fatalf("path ID extraction failed")
 	}
 }
+
+// Japanese songs match across Chinese translations, NFD Kana, Shinjitai/Simplified
+// Kanji, Kana-to-Romaji skeletons, Knowledge-Graph Rank-0 hits, and album track
+// positions while ignoring Touhou original-theme ("原曲：") annotations.
+func TestJapaneseChineseAndRomajiMatching(t *testing.T) {
+	origMeta, origAlbum := FetchAlbumMetaFn, ResolveYTMAlbumFn
+	defer func() {
+		FetchAlbumMetaFn = origMeta
+		ResolveYTMAlbumFn = origAlbum
+	}()
+
+	FetchAlbumMetaFn = func(_ context.Context, albumID int64) (*AlbumMeta, error) {
+		switch albumID {
+		case 79257706:
+			return &AlbumMeta{
+				ArtistAliases: []string{"O-LIFE.JP", "まさみティー"},
+				Size:          10,
+			}, nil
+		case 90001:
+			return &AlbumMeta{
+				ArtistAliases: []string{"Ikimonogakari", "いきものがかり"},
+				Size:          14,
+			}, nil
+		}
+		return nil, nil
+	}
+
+	ResolveYTMAlbumFn = func(_ context.Context, query string) (*ytm.AlbumProfile, error) {
+		if strings.Contains(query, "四季音方陣") {
+			songs := make([]ytm.Track, 10)
+			for i := range songs {
+				songs[i] = ytm.Track{
+					ID:        fmt.Sprintf("shiki-%d", i+1),
+					Name:      fmt.Sprintf("Track %d Romaji", i+1),
+					Artists:   []ytm.Artist{{Name: "O-LIFE.JP"}},
+					Duration:  200000,
+					VideoType: ytm.VideoATV,
+				}
+			}
+			songs[3] = ytm.Track{
+				ID:        "seijaku-romaji",
+				Name:      "Seijaku no hitori aruki",
+				Artists:   []ytm.Artist{{Name: "O-LIFE.JP"}},
+				Album:     ytm.Album{Name: "Shiki Oto Houjin"},
+				Duration:  294000,
+				VideoType: ytm.VideoATV,
+			}
+			return &ytm.AlbumProfile{
+				Album: ytm.Album{ID: "MPREb_shiki", Name: "Shiki Oto Houjin"},
+				Songs: songs,
+			}, nil
+		}
+		return nil, nil
+	}
+
+	// Verify rawSong ignores "原曲：..." as a song title alias while normalizing NFD Kana.
+	parsed := (rawSong{
+		ID:   1366518623,
+		Name: "ファンキーハ\u3099ックタ\u3099ンサース\u3099", // NFD decomposed dakuten
+		Alia: []string{"原曲：クレイジーバックダンサーズ"},
+		Dt:   316000,
+		No:   9,
+		Ar:   []struct{ Name string `json:"name"`; Tns []string `json:"tns"`; Alias []string `json:"alias"` }{{Name: "オーライフジャパン"}},
+		Al:   struct{ ID int64 `json:"id"`; Name string `json:"name"`; PicURL string `json:"picUrl"`; Tns []string `json:"tns"`; Alias []string `json:"alias"` }{ID: 79257706, Name: "四季音方陣"},
+	}).toSourceTrack()
+	if parsed.Alias != "" || len(parsed.Aliases) != 0 {
+		t.Fatalf("expected 原曲 annotation ignored, got Alias=%q Aliases=%v", parsed.Alias, parsed.Aliases)
+	}
+
+	src := []SourceTrack{
+		// 0: NFD Katakana + ignored 原曲 note -> NFC + Romaji title on YTM
+		parsed,
+		// 1: Mixed Kanji+Kana -> Kunrei/Hepburn Romaji on YTM
+		{
+			ID: 2, Name: "いつでも頼りになるアイツ", Artists: []string{"オーライフジャパン"},
+			Album: "四季音方陣", AlbumID: 79257706, TrackNo: 3, DurationMs: 245000,
+		},
+		// 2: Simplified Chinese title -> Shinjitai + Romaji on YTM
+		{
+			ID: 3, Name: "极乐净土", Artists: []string{"GARNiDELiA"}, DurationMs: 219000,
+		},
+		// 3: Pure Chinese translation where direct search returns wrong-duration song, resolved via Album Track #4
+		{
+			ID: 4, Name: "寂静的独自行走", Artists: []string{"オーライフジャパン"},
+			Album: "四季音方陣", AlbumID: 79257706, TrackNo: 4, DurationMs: 294000,
+		},
+		// 4: Pure Chinese translation ("青鸟") where YTM Knowledge Graph returns Kana/Romaji at Rank #0 with exact duration
+		{
+			ID: 5, Name: "青鸟", Artists: []string{"生物股长"},
+			Album: "My song Your song", AlbumID: 90001, DurationMs: 219000,
+		},
+	}
+
+	fakeSearch := func(query string, _ int) ([]ytm.Track, error) {
+		switch {
+		case strings.Contains(query, "ファンキーバックダンサーズ"):
+			return []ytm.Track{
+				{ID: "zun-orig", Name: "クレイジーバックダンサーズ", Artists: []ytm.Artist{{Name: "Team Shanghai Alice"}}, Duration: 316000, VideoType: ytm.VideoATV},
+				{ID: "funky-olife", Name: "ファンキーバックダンサーズ - Funky back dancers", Artists: []ytm.Artist{{Name: "O-LIFE.JP"}}, Album: ytm.Album{Name: "Shiki Oto Houjin"}, Duration: 316000, VideoType: ytm.VideoATV},
+			}, nil
+		case strings.Contains(query, "いつでも頼りになるアイツ"):
+			return []ytm.Track{
+				{ID: "itudemo-rom", Name: "Itudemo tayori ni naru aitsu", Artists: []ytm.Artist{{Name: "O-LIFE.JP"}}, Album: ytm.Album{Name: "Shiki Oto Houjin"}, Duration: 245000, VideoType: ytm.VideoATV},
+			}, nil
+		case strings.Contains(query, "极乐净土"):
+			return []ytm.Track{
+				{ID: "gokuraku", Name: "極楽浄土 - Gokuraku Joudo", Artists: []ytm.Artist{{Name: "GARNiDELiA"}}, Duration: 219500, VideoType: ytm.VideoATV},
+			}, nil
+		case strings.Contains(query, "寂静的独自行走"):
+			// Unrelated song with wrong duration (213s vs 294s): must be rejected by Rank-0 guard and caught by Album Track #4!
+			return []ytm.Track{
+				{ID: "wrong-olife", Name: "Reichi no taiyou shinkou", Artists: []ytm.Artist{{Name: "O-LIFE.JP"}}, Duration: 213000, VideoType: ytm.VideoATV},
+			}, nil
+		case strings.Contains(query, "青鸟"):
+			return []ytm.Track{
+				{ID: "bluebird", Name: "ブルーバード - Blue Bird", Artists: []ytm.Artist{{Name: "Ikimonogakari"}}, Duration: 218500, VideoType: ytm.VideoATV},
+			}, nil
+		}
+		return nil, nil
+	}
+
+	got, err := MatchTracks(context.Background(), src, 3, fakeSearch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantIDs := []string{"funky-olife", "itudemo-rom", "gokuraku", "seijaku-romaji", "bluebird"}
+	for i, want := range wantIDs {
+		if !got[i].Matched || got[i].Track.ID != want {
+			t.Errorf("track %d (%q): matched=%v id=%q score=%d, want %q",
+				i, src[i].Name, got[i].Matched, got[i].Track.ID, got[i].Score, want)
+		}
+	}
+}

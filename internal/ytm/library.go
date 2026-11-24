@@ -100,14 +100,16 @@ func UserPlaylists(uid string) (made, saved []Playlist, err error) {
 		if !ok || strings.HasPrefix(pl.ID, "RDCLAK") && pl.Creator.Nickname == "" {
 			continue
 		}
+		owned := playlistMenuEditable(v) || (p != nil && (pl.Creator.Nickname == p.Nickname || pl.Creator.UserID == p.UserID ||
+			pl.Creator.Nickname == "" && p.Nickname != "" && strings.Contains(pl.Subtitle, p.Nickname)))
 		switch {
 		case pl.ID == likedID:
 			pl.SpecialType = 5
 			pl.Name = "我喜欢的音乐"
 			mine(&pl, p)
 			made = append([]Playlist{pl}, made...)
-		case p != nil && (pl.Creator.Nickname == p.Nickname || pl.Creator.UserID == p.UserID ||
-			pl.Creator.Nickname == "" && strings.Contains(pl.Subtitle, p.Nickname)):
+		case owned:
+			pl.Editable = true
 			mine(&pl, p)
 			made = append(made, pl)
 		default:
@@ -116,6 +118,11 @@ func UserPlaylists(uid string) (made, saved []Playlist, err error) {
 		}
 	}
 	return made, saved, nil
+}
+
+func playlistMenuEditable(v any) bool {
+	m := dig(v, "menu")
+	return find(m, "deletePlaylistEndpoint") != nil || find(m, "editPlaylistDialogEndpoint") != nil
 }
 
 // mine marks a playlist the listener's, as the app tells their own.
@@ -253,7 +260,7 @@ func CreatePlaylist(name string) (*Playlist, error) {
 	if id == "" {
 		return nil, errors.New("ytm: the playlist wasn't made")
 	}
-	pl := &Playlist{ID: id, Name: name, Privacy: 10}
+	pl := &Playlist{ID: id, Name: name, Privacy: 10, Editable: true}
 	mine(pl, myProfile())
 	return pl, nil
 }
@@ -320,32 +327,59 @@ func RemoveFromPlaylist(pid string, songs ...string) error {
 	return err
 }
 
+// MoveTrackToTop moves videoID to the top of one of the listener's playlists.
+func MoveTrackToTop(pid, videoID string) error {
+	order, entries, err := playlistEntriesOrdered(pid)
+	if err != nil {
+		return err
+	}
+	setID, ok := entries[videoID]
+	if !ok || len(order) < 2 || order[0] == setID {
+		return nil
+	}
+	_, err = editPlaylist(pid, []any{map[string]any{
+		"action":                   "ACTION_MOVE_VIDEO_BEFORE",
+		"setVideoId":               setID,
+		"movedSetVideoIdSuccessor": order[0],
+	}}, false)
+	return err
+}
+
 // playlistEntries returns the setVideoIds of the songs of a playlist, by
 // video ID.
 func playlistEntries(pid string) (map[string]string, error) {
+	_, entries, err := playlistEntriesOrdered(pid)
+	return entries, err
+}
+
+func playlistEntriesOrdered(pid string) ([]string, map[string]string, error) {
 	if err := needSignIn(); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	resp, err := browse("VL"+strings.TrimPrefix(pid, "VL"), "")
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	tab, sec := sectionContents(resp)
 	items, token := trackShelf(append(sec, tab...))
 	out := map[string]string{}
+	var order []string
 	for i := 0; ; i++ {
 		for _, it := range items {
 			d := dig(it, "musicResponsiveListItemRenderer", "playlistItemData")
 			if id, set := str(d, "videoId"), str(d, "playlistSetVideoId"); id != "" && set != "" {
-				out[id] = set
+				if _, seen := out[id]; !seen {
+					out[id] = set
+				}
+				order = append(order, set)
 			}
 		}
 		if token == "" || i == 20 {
-			return out, nil
+			return order, out, nil
 		}
 		more, err := browseNext(token)
 		if err != nil {
-			return out, nil
+			return order, out, nil
 		}
 		items, token = continued(more)
 	}

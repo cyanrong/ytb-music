@@ -375,6 +375,7 @@ func (a *app) startImport() {
 			if d.gen != gen {
 				return
 			}
+			created.Editable = true
 			created.Name = finalName
 			if created.CoverURL == "" {
 				if src.CoverURL != "" {

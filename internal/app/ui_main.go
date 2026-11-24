@@ -510,6 +510,7 @@ func (a *app) loadPlaylist(id string, thenPlay bool) {
 				return
 			}
 			a.playlists[id] = pl
+			a.promoteEditablePlaylist(pl)
 			if thenPlay {
 				a.pl.PlayQueue(pl.Tracks, firstPlayable(pl.Tracks))
 			}

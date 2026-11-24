@@ -396,8 +396,27 @@ func parsePlaylist(resp any, id string) (*Playlist, string, error) {
 		}
 	}
 	items, token := trackShelf(append(sec, tab...))
+	if id != likedID {
+		p.Editable = find(resp, "musicEditablePlaylistDetailHeaderRenderer") != nil ||
+			find(h, "deletePlaylistEndpoint") != nil ||
+			find(h, "editPlaylistDialogEndpoint") != nil ||
+			hasEditableTrackItems(items)
+		if p.Editable {
+			mine(p, myProfile())
+		}
+	}
 	p.Tracks = tracksOf(items)
 	return p, token, nil
+}
+
+func hasEditableTrackItems(items []any) bool {
+	for _, it := range items {
+		d := dig(it, "musicResponsiveListItemRenderer", "playlistItemData")
+		if str(d, "playlistSetVideoId") != "" {
+			return true
+		}
+	}
+	return false
 }
 
 // detailHeader returns the header of a playlist's or an album's page, in

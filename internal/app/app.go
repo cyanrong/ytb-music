@@ -243,6 +243,7 @@ func Run() error {
 		cacheUsed:  -1,
 	}
 	mygo.App.WhenReady(func() {
+		ytm.Language = "zh-CN"
 		a.settings = loadSettings()
 		a.initLocalPlaylists()
 		_ = ytm.SetProxy(a.settings.Proxy)

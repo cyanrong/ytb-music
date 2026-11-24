@@ -335,16 +335,43 @@ func (a *app) playlistHeader(c *ui.Context, pl *ytm.Playlist) {
 					}
 				}
 				if mine := a.editable(pl.ID); mine != nil {
-					more := iconButton(c.Key("more"), iconMore, 18, p.muted, "更多")
-					more.Menu(func(m *ui.Menu) {
+					editBtn := pillButton(c.Key("edit-pl"), iconMore, "编辑歌单", p.hover.Over(p.bg), p.text).Label("更多")
+					editBtn.Menu(func(m *ui.Menu) {
+						if m.Item("搜索添加歌曲…").Chosen() {
+							a.searchBox.Focus(c)
+							a.toast = "搜索后点击曲目右侧“⋯”或右键即可添加到此歌单"
+						}
 						if m.Item("重命名…").Chosen() {
 							a.startRename(mine)
+						}
+						if isLocalPlaylist(pl.ID) && a.profile != nil {
+							if m.Item("同步为 YouTube 云端歌单").Chosen() {
+								a.forkPlaylist(pl, true)
+							}
+						} else if !isLocalPlaylist(pl.ID) && len(pl.Tracks) > 0 {
+							if m.Item("另存为本地离线歌单").Chosen() {
+								a.forkPlaylist(pl, false)
+							}
 						}
 						m.Separator()
 						if m.Item("删除歌单…").Chosen() {
 							a.confirmDelete(mine)
 						}
 					})
+				} else if pl.SpecialType != 5 && len(pl.Tracks) > 0 {
+					forkBtn := pillButton(c.Key("fork-pl"), iconPlus, "转为可编辑歌单", p.hover.Over(p.bg), p.text)
+					if a.profile != nil {
+						forkBtn.Menu(func(m *ui.Menu) {
+							if m.Item("复制为我的 YouTube 歌单").Chosen() {
+								a.forkPlaylist(pl, true)
+							}
+							if m.Item("复制为本地可编辑歌单").Chosen() {
+								a.forkPlaylist(pl, false)
+							}
+						})
+					} else if forkBtn.Clicked() {
+						a.forkPlaylist(pl, false)
+					}
 				}
 				switch {
 				case pl.SpecialType != 5:
@@ -467,6 +494,11 @@ func (a *app) trackRows(c *ui.Context, tracks []ytm.Track, covers bool, header f
 			ui.Box(c).Size(32, 32).Center().Children(func() {
 				if a.liked[tr.ID] || hovered {
 					a.likeButton(c.Key("like"), tr, 15, p.muted)
+				}
+			})
+			ui.Box(c).Size(28, 32).Center().Children(func() {
+				if hovered {
+					iconButton(c.Key("row-more"), iconMore, 15, p.muted, "曲目操作").Menu(a.songItems(tr, pid))
 				}
 			})
 			ui.Text(c, clock(tr.Length())).FontSize(12.5).FontFeatures("tnum").TextColor(p.faint).Width(44).TextAlign(ui.End)

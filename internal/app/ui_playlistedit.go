@@ -19,6 +19,7 @@ var (
 	renamePlaylist     = ytm.RenamePlaylist
 	addToPlaylist      = ytm.AddToPlaylist
 	removeFromPlaylist = ytm.RemoveFromPlaylist
+	moveTrackToTop     = ytm.MoveTrackToTop
 	deletePlaylist     = ytm.DeletePlaylist
 	savePlaylist       = ytm.SubscribePlaylist
 )
@@ -47,7 +48,32 @@ func (a *app) editable(id string) *ytm.Playlist {
 			return &a.mine[i]
 		}
 	}
+	if pl := a.playlists[id]; pl != nil && pl.Editable && pl.ID != "LM" && pl.SpecialType != 5 {
+		return pl
+	}
 	return nil
+}
+
+// promoteEditablePlaylist moves pl from saved into mine when its detail page
+// reveals the signed-in listener has edit permission on it.
+func (a *app) promoteEditablePlaylist(pl *ytm.Playlist) {
+	if pl == nil || !pl.Editable || pl.ID == "LM" || pl.SpecialType == 5 || isLocalPlaylist(pl.ID) {
+		return
+	}
+	if i := slices.IndexFunc(a.saved, func(s ytm.Playlist) bool { return s.ID == pl.ID }); i >= 0 {
+		a.saved = slices.Delete(slices.Clone(a.saved), i, i+1)
+	}
+	if slices.ContainsFunc(a.mine, func(m ytm.Playlist) bool { return m.ID == pl.ID }) {
+		return
+	}
+	entry := *pl
+	entry.Subscribed = false
+	entry.Tracks, entry.TrackIDs = nil, nil
+	at := 0
+	if len(a.mine) > 0 && a.mine[0].SpecialType == 5 {
+		at = 1
+	}
+	a.mine = slices.Insert(slices.Clone(a.mine), at, entry)
 }
 
 // isSaved reports whether the listener saved playlist pl, as its page or
@@ -59,7 +85,7 @@ func (a *app) isSaved(pl *ytm.Playlist) bool {
 // savable reports whether the listener may save playlist pl: anyone's but
 // their own. Signed out, saving asks them to sign in.
 func (a *app) savable(pl *ytm.Playlist) bool {
-	if isLocalPlaylist(pl.ID) {
+	if isLocalPlaylist(pl.ID) || pl.Editable || a.editable(pl.ID) != nil {
 		return false
 	}
 	// Without an account there is nowhere to save it to yet.
@@ -133,6 +159,30 @@ func (a *app) loadMine(uid string) {
 		made, saved, err := ytm.UserPlaylists(uid)
 		a.post(func() {
 			if err == nil && a.profile != nil && a.profile.UserID == uid {
+				knownEditable := map[string]bool{}
+				for _, m := range a.mine {
+					if m.SpecialType != 5 && !isLocalPlaylist(m.ID) {
+						knownEditable[m.ID] = true
+					}
+				}
+				for id, pl := range a.playlists {
+					if pl != nil && pl.Editable && pl.SpecialType != 5 && !isLocalPlaylist(id) {
+						knownEditable[id] = true
+					}
+				}
+				if len(knownEditable) > 0 {
+					var keptSaved []ytm.Playlist
+					for _, s := range saved {
+						if knownEditable[s.ID] {
+							s.Editable = true
+							s.Subscribed = false
+							made = append(made, s)
+						} else {
+							keptSaved = append(keptSaved, s)
+						}
+					}
+					saved = keptSaved
+				}
 				a.mine, a.saved = a.withLocalPlaylists(made), saved
 			}
 		})
@@ -250,7 +300,11 @@ func (a *app) deleteChosen() {
 	id := a.deleting.id
 	a.deleting.open = false
 	i := slices.IndexFunc(a.mine, func(pl ytm.Playlist) bool { return pl.ID == id })
-	if i < 0 || a.mine[i].SpecialType == 5 {
+	loaded := a.playlists[id]
+	if i < 0 && (loaded == nil || !loaded.Editable || loaded.SpecialType == 5) {
+		return
+	}
+	if i >= 0 && a.mine[i].SpecialType == 5 {
 		return
 	}
 	var pl ytm.Playlist
@@ -259,9 +313,12 @@ func (a *app) deleteChosen() {
 			a.toast = "删除失败，请检查磁盘权限"
 			return
 		}
-	} else {
+	} else if i >= 0 {
 		pl = a.mine[i]
 		a.mine = slices.Delete(slices.Clone(a.mine), i, i+1)
+	} else if loaded != nil {
+		pl = *loaded
+		pl.Tracks, pl.TrackIDs = nil, nil
 	}
 	// Leave no way back to its page, and leave it for the page before.
 	gone := func(r route) bool { return r.page == pagePlaylist && r.id == id }
@@ -282,7 +339,9 @@ func (a *app) deleteChosen() {
 		err := deletePlaylist(id)
 		a.post(func() {
 			if err != nil {
-				a.mine = slices.Insert(a.mine, min(i, len(a.mine)), pl)
+				if i >= 0 {
+					a.mine = slices.Insert(a.mine, min(i, len(a.mine)), pl)
+				}
 				a.toast = "删除失败，请稍后再试"
 				return
 			}
@@ -370,6 +429,114 @@ func (a *app) removeFrom(pid string, tr *ytm.Track) {
 	}()
 }
 
+// moveTop moves tr to the top of the listener's playlist pid.
+func (a *app) moveTop(pid string, tr *ytm.Track) {
+	if isLocalPlaylist(pid) {
+		if err := a.moveTrackToTopLocalPlaylist(pid, tr.ID); err != nil {
+			a.toast = "调整顺序失败，请检查磁盘空间"
+		}
+		return
+	}
+	id := tr.ID
+	pl := a.playlists[pid]
+	var before []ytm.Track
+	if pl != nil {
+		idx := slices.IndexFunc(pl.Tracks, func(t ytm.Track) bool { return t.ID == id })
+		if idx <= 0 {
+			return
+		}
+		before = pl.Tracks
+		reordered := make([]ytm.Track, 0, len(before))
+		reordered = append(reordered, before[idx])
+		reordered = append(reordered, before[:idx]...)
+		reordered = append(reordered, before[idx+1:]...)
+		pl.Tracks = reordered
+	}
+	go func() {
+		err := moveTrackToTop(pid, id)
+		a.post(func() {
+			if err != nil {
+				if pl != nil && a.playlists[pid] == pl && before != nil {
+					pl.Tracks = before
+				}
+				a.toast = "调整顺序失败，请稍后再试"
+				return
+			}
+			a.toast = "已移至歌单顶部"
+		})
+	}()
+}
+
+// forkPlaylist copies src's tracks into a brand-new editable playlist owned by
+// the listener (on YouTube Music when signed in and toCloud is true, else on
+// local disk) and navigates to it.
+func (a *app) forkPlaylist(src *ytm.Playlist, toCloud bool) {
+	if src == nil || len(src.Tracks) == 0 {
+		return
+	}
+	name := strings.TrimSpace(src.Name)
+	if name == "" {
+		name = "我的歌单"
+	}
+	tracks := slices.Clone(src.Tracks)
+	cover := src.Cover()
+	if !toCloud || a.profile == nil {
+		pl, err := a.createLocalPlaylist(name, src.Description, cover, tracks)
+		if err != nil {
+			a.toast = "创建本地歌单失败，请检查磁盘空间"
+			return
+		}
+		a.toast = "已复制为可编辑本地歌单"
+		a.open(route{page: pagePlaylist, id: pl.ID})
+		return
+	}
+	a.toast = "正在创建可编辑云端歌单…"
+	uid := a.profile.UserID
+	go func() {
+		created, err := createPlaylist(name)
+		if err != nil {
+			a.post(func() { a.toast = "创建云端歌单失败，请稍后再试" })
+			return
+		}
+		ids := make([]string, 0, len(tracks))
+		for _, t := range tracks {
+			if t.ID != "" {
+				ids = append(ids, t.ID)
+			}
+		}
+		for start := 0; start < len(ids); start += 50 {
+			end := min(start+50, len(ids))
+			if addErr := addToPlaylist(created.ID, ids[start:end]...); addErr != nil && !errors.Is(addErr, ytm.ErrInPlaylist) {
+				a.post(func() { a.toast = "部分歌曲写入失败，已创建歌单" })
+				break
+			}
+		}
+		a.post(func() {
+			created.Editable = true
+			created.Name = name
+			if created.CoverURL == "" {
+				created.CoverURL = cover
+			}
+			created.TrackCount = len(tracks)
+			sidebarEntry := *created
+			sidebarEntry.Tracks = nil
+			at := 0
+			if len(a.mine) > 0 && a.mine[0].SpecialType == 5 {
+				at = 1
+			}
+			a.mine = slices.Insert(slices.Clone(a.mine), at, sidebarEntry)
+			full := *created
+			full.Tracks = tracks
+			a.playlists[created.ID] = &full
+			if a.profile != nil && a.profile.UserID == uid {
+				a.loadMine(uid)
+			}
+			a.toast = "已生成可编辑歌单“" + name + "”"
+			a.open(route{page: pagePlaylist, id: created.ID})
+		})
+	}()
+}
+
 // playlistItems are the items of a song's menu that put it in the
 // listener's playlists, or take it out of pid, the one it is listed in, if
 // set.
@@ -397,8 +564,13 @@ func (a *app) playlistItems(m *ui.Menu, tr *ytm.Track, pid string) {
 			}
 		}
 	})
-	if a.editable(pid) != nil && m.Item("从歌单中移除").Chosen() {
-		a.removeFrom(pid, tr)
+	if a.editable(pid) != nil {
+		if m.Item("移至歌单顶部").Chosen() {
+			a.moveTop(pid, tr)
+		}
+		if m.Item("从歌单中移除").Chosen() {
+			a.removeFrom(pid, tr)
+		}
 	}
 }
 

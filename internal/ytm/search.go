@@ -1,6 +1,7 @@
 package ytm
 
 import (
+	"net/http"
 	"strconv"
 	"strings"
 	"sync"
@@ -234,6 +235,58 @@ func window[T any](s []T, offset, limit int) []T {
 	}
 	end := min(offset+limit, len(s))
 	return append([]T(nil), s[offset:end]...)
+}
+
+// SearchInLang searches YouTube Music songs anonymously in a specific UI
+// language (such as "ja" or "zh-CN") so Japanese/CJK tracks return their
+// native Kanji/Kana titles even when a signed-in account's cookie prefers
+// romanized English metadata.
+func SearchInLang(query string, limit int, lang string) ([]Track, error) {
+	query = strings.TrimSpace(query)
+	if query == "" {
+		return nil, nil
+	}
+	if limit <= 0 {
+		limit = 8
+	}
+	if lang == "" {
+		lang = Language
+	}
+	params := searchParams[SearchSongs][0]
+	resp, err := postWithVisitorOn(httpClient, musicAPI+"search?prettyPrint=false", map[string]any{
+		"query":  query,
+		"params": params,
+	}, false, func(_ string) (map[string]any, http.Header) {
+		client := map[string]any{"clientName": remixName, "clientVersion": remixVer, "hl": lang}
+		h := http.Header{}
+		h.Set("Origin", "https://music.youtube.com")
+		h.Set("Referer", "https://music.youtube.com/")
+		h.Set("X-YouTube-Client-Name", remixID)
+		h.Set("X-YouTube-Client-Version", remixVer)
+		return client, h
+	})
+	if err != nil {
+		return nil, err
+	}
+	items, _ := searchShelf(resp)
+	var out []Track
+	seen := map[string]bool{}
+	for _, it := range items {
+		k, v := only(it)
+		if k != "musicResponsiveListItemRenderer" {
+			continue
+		}
+		t := responsiveTrack(v, false)
+		if t.ID == "" || seen[t.ID] {
+			continue
+		}
+		seen[t.ID] = true
+		out = append(out, t)
+		if len(out) >= limit {
+			break
+		}
+	}
+	return out, nil
 }
 
 // SearchSuggest returns what a search for query may be after.
