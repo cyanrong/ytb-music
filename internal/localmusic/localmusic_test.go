@@ -1875,15 +1875,23 @@ func TestDataOnlyCueDoesNotSuppressSiblingAudioFile(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	var parsedCount atomic.Int32
+	var parsedCount, cueParsedCount atomic.Int64
 	prevHook := onFileParsedHook
+	prevCueHook := onCueParsedHook
 	onFileParsedHook = func(string) { parsedCount.Add(1) }
-	defer func() { onFileParsedHook = prevHook }()
+	onCueParsedHook = func(string) { cueParsedCount.Add(1) }
+	defer func() {
+		onFileParsedHook = prevHook
+		onCueParsedHook = prevCueHook
+	}()
 
 	lib := NewLibrary(filepath.Join(root, "index.json"), filepath.Join(root, "covers"))
 	lib.AddFolder(filepath.Join(root, "music"))
 	if err := lib.Scan(context.Background(), nil); err != nil {
 		t.Fatalf("initial Scan failed: %v", err)
+	}
+	if cueParsedCount.Load() == 0 {
+		t.Fatal("expected initial scan to parse CUE files")
 	}
 
 	if got := lib.Tracks("game", "", ""); len(got) != 1 || got[0].Spec.IsCUE {
@@ -1901,11 +1909,15 @@ func TestDataOnlyCueDoesNotSuppressSiblingAudioFile(t *testing.T) {
 
 	// Incremental rescan must reuse both the data-only CUE cache and standalone file cache without re-parsing.
 	parsedCount.Store(0)
+	cueParsedCount.Store(0)
 	if err := lib.Scan(context.Background(), nil); err != nil {
 		t.Fatalf("incremental Scan failed: %v", err)
 	}
 	if got := parsedCount.Load(); got != 0 {
 		t.Fatalf("expected 0 standalone files re-parsed on unchanged incremental scan, got %d", got)
+	}
+	if got := cueParsedCount.Load(); got != 0 {
+		t.Fatalf("expected 0 CUE sheets re-parsed on unchanged incremental scan, got %d", got)
 	}
 	if got := lib.Tracks("game", "", ""); len(got) != 1 || got[0].Spec.IsCUE {
 		t.Fatalf("expected game.wav to remain visible after incremental scan, got %+v", got)

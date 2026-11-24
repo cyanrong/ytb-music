@@ -296,6 +296,9 @@ func parseMoofPackets(r io.ReaderAt, moofOff, moofHdrLen, moofEnd int64, audioTr
 		return nil, false, err
 	}
 
+	prevTrafEnd := moofOff
+	prevTrafExplicit := false
+	firstTraf := true
 	for typ, traf := range mp4Boxes(moofBody) {
 		if typ != "traf" {
 			continue
@@ -306,12 +309,16 @@ func parseMoofPackets(r io.ReaderAt, moofOff, moofHdrLen, moofEnd int64, audioTr
 		}
 		tfFlags := uint32(tfhd[1])<<16 | uint32(tfhd[2])<<8 | uint32(tfhd[3])
 		trackID := binary.BigEndian.Uint32(tfhd[4:8])
-		if audioTrackID != 0 && trackID != audioTrackID {
-			continue
-		}
+		wantTrack := audioTrackID == 0 || trackID == audioTrackID
 
 		baseOffset := moofOff
 		hasBaseOffset := false
+		if !firstTraf && tfFlags&0x020000 == 0 {
+			baseOffset = prevTrafEnd
+			hasBaseOffset = prevTrafExplicit
+		}
+		firstTraf = false
+
 		idx := 8
 		if tfFlags&0x000001 != 0 && idx+8 <= len(tfhd) {
 			baseOffset = int64(binary.BigEndian.Uint64(tfhd[idx : idx+8]))
@@ -369,17 +376,21 @@ func parseMoofPackets(r io.ReaderAt, moofOff, moofHdrLen, moofEnd int64, audioTr
 				if hasCTS {
 					tIdx += 4
 				}
-				if !explicitOff {
-					needMdatOffset = true
+				if wantTrack {
+					if !explicitOff {
+						needMdatOffset = true
+					}
+					pkts = append(pkts, rawFragPacket{
+						offset:   curOff,
+						size:     sz,
+						explicit: explicitOff,
+					})
 				}
-				pkts = append(pkts, rawFragPacket{
-					offset:   curOff,
-					size:     sz,
-					explicit: explicitOff,
-				})
 				curOff += int64(sz)
 			}
 		}
+		prevTrafEnd = curOff
+		prevTrafExplicit = explicitOff
 	}
 	return pkts, needMdatOffset, nil
 }
@@ -462,13 +473,17 @@ func parseAACSampleEntry(stsd []byte) (profile, freqIdx, chanCfg int, ok bool) {
 		aot := int(asc[0] >> 3)
 		fIdx := int((asc[0]&0x07)<<1 | (asc[1] >> 7))
 		cCfg := int((asc[1] >> 3) & 0x0f)
-		if aot == 5 || aot == 29 {
+		switch aot {
+		case 5, 29: // SBR / PS (HE-AAC / HE-AACv2) signaled over AAC-LC in ADTS
 			aot = 2
+		case 1, 2, 3, 4: // AAC Main, LC, SSR, LTP
+		default:
+			continue
 		}
 		if fIdx >= 13 || adtsSampleRates[fIdx] == 0 || cCfg == 0 {
 			continue
 		}
-		return max(0, min(3, aot-1)), fIdx, cCfg, true
+		return aot - 1, fIdx, cCfg, true
 	}
 	return 0, 0, 0, false
 }

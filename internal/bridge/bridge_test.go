@@ -2072,12 +2072,14 @@ func TestMultiTrackMP4AACIndexing(t *testing.T) {
 }
 
 type blockingClosePCMDecoder struct {
-	rate       int
-	estFrames  int64
-	fastFrames int64
-	pos        int64
-	closedOnce sync.Once
-	closedCh   chan struct{}
+	rate        int
+	estFrames   int64
+	fastFrames  int64
+	pos         int64
+	blockedOnce sync.Once
+	blockedCh   chan struct{}
+	closedOnce  sync.Once
+	closedCh    chan struct{}
 }
 
 func (d *blockingClosePCMDecoder) SampleRate() int          { return d.rate }
@@ -2098,6 +2100,9 @@ func (d *blockingClosePCMDecoder) Read(dst []float32) (int, error) {
 		}
 		d.pos += int64(avail)
 		return avail * 2, nil
+	}
+	if d.blockedCh != nil {
+		d.blockedOnce.Do(func() { close(d.blockedCh) })
 	}
 	<-d.closedCh
 	return 0, io.ErrClosedPipe
@@ -2219,6 +2224,7 @@ func TestHQPProgressiveUnknownLengthTruncationAndCancel(t *testing.T) {
 		rate:       44100,
 		estFrames:  44100 * 20,
 		fastFrames: 50000,
+		blockedCh:  make(chan struct{}),
 		closedCh:   make(chan struct{}),
 	}
 	if _, _, _, _, _, err := closeSrv.PrepareHQPTrack(context.Background(), player.TrackSource{
@@ -2231,6 +2237,13 @@ func TestHQPProgressiveUnknownLengthTruncationAndCancel(t *testing.T) {
 	}, "127.0.0.1:4321"); err != nil {
 		closeSrv.Close()
 		t.Fatal(err)
+	}
+
+	select {
+	case <-blkDec.blockedCh:
+	case <-time.After(time.Second):
+		closeSrv.Close()
+		t.Fatal("progressive background worker never entered blocking Read")
 	}
 
 	closeDone := make(chan error, 1)

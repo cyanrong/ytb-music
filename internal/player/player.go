@@ -757,6 +757,7 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 		}()
 	}
 
+	lyricsFn := fetchLyrics
 	go func() {
 		var lines []lyrics.Line
 		var plain []string
@@ -770,7 +771,7 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 				}
 			}
 		} else {
-			lrc, trans, yrc, err := fetchLyrics(&t)
+			lrc, trans, yrc, err := lyricsFn(&t)
 			if err == nil {
 				lines = lyrics.Build(lrc, trans, yrc)
 				if len(lines) == 0 {

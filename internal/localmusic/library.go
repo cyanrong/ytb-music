@@ -78,6 +78,7 @@ type cachedCue struct {
 	AddedAt      int64                 `json:"addedAt"`
 	CoverTracked bool                  `json:"coverTracked,omitempty"`
 	RefTracked   bool                  `json:"refTracked,omitempty"`
+	HadParseErr  bool                  `json:"hadParseErr,omitempty"`
 	AllRefs      []string              `json:"allRefs,omitempty"`
 	ResolvedRefs []cachedCueFileRef    `json:"resolvedRefs,omitempty"`
 	Consumed     []cachedCueFileRef    `json:"consumed,omitempty"`
@@ -572,14 +573,13 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 			prev.Size == cw.size &&
 			prev.ModTimeNs == cw.modTimeNs &&
 			prev.CoverTracked &&
+			prev.RefTracked &&
+			!prev.HadParseErr &&
 			len(prev.AllRefs) > 0 &&
 			len(prev.TrackCovers) == len(prev.Tracks) {
 
-			refsUnchanged := prev.RefTracked || len(prev.Tracks) > 0
+			refsUnchanged := true
 			expectedRefs := prev.ResolvedRefs
-			if !prev.RefTracked {
-				expectedRefs = prev.Consumed
-			}
 			prevRefMap := make(map[string]cachedCueFileRef, len(expectedRefs))
 			for _, ref := range expectedRefs {
 				prevRefMap[canonicalPathKey(ref.Path)] = ref
@@ -692,6 +692,7 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 			AddedAt:      addedAt,
 			CoverTracked: true,
 			RefTracked:   true,
+			HadParseErr:  loaded.hadParseErr,
 			AllRefs:      loaded.allRefs,
 			ResolvedRefs: resolvedRefs,
 			Consumed:     refs,

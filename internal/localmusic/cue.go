@@ -316,17 +316,23 @@ func parseDiscNumberFromDir(dir string) int {
 	return 0
 }
 
+var onCueParsedHook func(path string)
+
 type loadedCue struct {
 	tracks      []LocalTrack
 	trackCovers []cachedCueTrackCover
 	consumed    []string
 	allRefs     []string
+	hadParseErr bool
 }
 
 // loadCueTracks parses cuePath, resolves its referenced audio files, extracts
 // audio specs and covers, and returns the sliced CUE tracks together with
 // sidecar cover dependencies, resolved consumed files, and all literal FILE refs.
 func loadCueTracks(cuePath string, addedAt int64, covers *folderCoverResolver) (*loadedCue, error) {
+	if h := onCueParsedHook; h != nil {
+		h(cuePath)
+	}
 	raw, err := os.ReadFile(cuePath)
 	if err != nil {
 		return nil, err
@@ -350,6 +356,7 @@ func loadCueTracks(cuePath string, addedAt int64, covers *folderCoverResolver) (
 		allRefs     []string
 		seenCons    = map[string]bool{}
 		seenAllRefs = map[string]bool{}
+		hadParseErr = false
 	)
 
 	for _, fb := range cs.files {
@@ -381,6 +388,7 @@ func loadCueTracks(cuePath string, addedAt int64, covers *folderCoverResolver) (
 
 		audioMeta, err := parseAudioFile(audioPath, audioInfo.Size())
 		if err != nil {
+			hadParseErr = true
 			continue
 		}
 
@@ -560,6 +568,7 @@ func loadCueTracks(cuePath string, addedAt int64, covers *folderCoverResolver) (
 		trackCovers: trackCovers,
 		consumed:    consumed,
 		allRefs:     allRefs,
+		hadParseErr: hadParseErr,
 	}, nil
 }
 

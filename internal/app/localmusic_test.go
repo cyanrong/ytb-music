@@ -577,8 +577,12 @@ func TestLocalLibraryBrowseFilterAndPlayback(t *testing.T) {
 	if got := searchCalls.Load(); got != 2 {
 		t.Fatalf("expected 2 search calls after clicking 重试, got %d", got)
 	}
-	if !tt.HasText("Waltz for Debby") || !tt.HasText("Waltz for Debby (Live)") {
-		t.Fatalf("expected both local and online tracks rendered after retry: %v", tt.Texts())
+	sd := a.searches[a.route]
+	if sd == nil || len(sd.localSongs) != 1 || !localmusic.IsLocalTrack(sd.localSongs[0].ID) || len(sd.res.Songs) != 1 || sd.res.Songs[0].ID != "online1" {
+		t.Fatalf("expected distinct local and online tracks retained after retry, got local=%+v online=%+v", sd.localSongs, sd.res.Songs)
+	}
+	if !tt.HasText("Waltz for Debby (Live)") {
+		t.Fatalf("expected online track rendered after retry: %v", tt.Texts())
 	}
 }
 
@@ -924,12 +928,13 @@ func TestLocalPartialRescanInvalidatesOpenAlbumPage(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	a.toast = ""
 	a.rescanLocalLibrary()
 	drainLocalPosts(t, posts, nil, func() bool {
 		return !a.local.scanning
 	})
-	if !strings.Contains(a.toast, "扫描本地曲库失败") {
-		t.Fatalf("expected partial scan error surfaced in toast, got %q", a.toast)
+	if a.toast == "" || !strings.Contains(a.toast, filepath.Base(nasRoot)) {
+		t.Fatalf("expected partial scan error toast identifying unavailable root %q, got %q", nasRoot, a.toast)
 	}
 	tt.Frame()
 	if !tt.HasText("Opening") || !tt.HasText("Finale") {

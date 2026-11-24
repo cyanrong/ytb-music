@@ -112,6 +112,8 @@ func (f *downloadFile) size() (int64, error) {
 	return n, err
 }
 
+var onDownloadWaitHook func()
+
 func (f *downloadFile) ReadAt(b []byte, off int64) (int, error) {
 	if off < 0 {
 		return 0, errors.New("player: negative offset")
@@ -124,6 +126,9 @@ func (f *downloadFile) ReadAt(b []byte, off int64) (int, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	for d.n < want && !d.done && !f.closed {
+		if h := onDownloadWaitHook; h != nil {
+			h()
+		}
 		d.cond.Wait()
 	}
 	if f.closed {

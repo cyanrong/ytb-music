@@ -1663,7 +1663,7 @@ func (s *roonSink) pullPCM24(outFrames int) []byte {
 			if !aacActive {
 				s.adtsAligned = false
 			}
-			reachedEnd := s.duration <= 0 || (s.srcRate > 0 && time.Duration(float64(s.posFrames)/float64(s.srcRate)*float64(time.Second)) >= s.duration)
+			reachedEnd := s.duration > 0 && s.srcRate > 0 && time.Duration(float64(s.posFrames)/float64(s.srcRate)*float64(time.Second)) >= s.duration
 			if reachedEnd && !s.endedOnce {
 				s.endedOnce = true
 				s.playing = false
@@ -1832,17 +1832,9 @@ func (s *roonSink) pullADTS(advancePos bool) []byte {
 		s.ioMu.Unlock()
 		return nil
 	}
-	curSample := curFrames
-	if s.srcRate > 0 && ar.SampleRate() != s.srcRate {
-		curSample = curFrames * int64(ar.SampleRate()) / int64(s.srcRate)
-	}
-	drift := curSample - int64(ar.pktCursor)*1024
-	if drift < 0 {
-		drift = -drift
-	}
-	if !aligned || s.appliedAACSeek != wantSeekGen || drift >= 4096 {
+	if !aligned || s.appliedAACSeek != wantSeekGen {
 		targetFrames := seekTarget
-		if !aligned || drift >= 4096 {
+		if !aligned && s.appliedAACSeek == wantSeekGen {
 			targetFrames = curFrames
 		}
 		sample := targetFrames

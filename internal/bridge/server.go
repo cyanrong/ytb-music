@@ -678,9 +678,13 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 			_ = dec.Close()
 		})
 	}
-	stopPrepCancel := func() bool { return false }
-	if src.Downloading {
-		stopPrepCancel = context.AfterFunc(ctx, closeDec)
+	var prepCanceled atomic.Bool
+	stopPrepCancel := func() bool { return true }
+	if src.Downloading && ctx.Done() != nil {
+		stopPrepCancel = context.AfterFunc(ctx, func() {
+			prepCanceled.Store(true)
+			closeDec()
+		})
 	}
 
 	sr := dec.SampleRate()
@@ -827,6 +831,13 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 			}
 		}
 		stopPrepCancel()
+		if prepCanceled.Load() || ctx.Err() != nil {
+			cerr := ctx.Err()
+			if cerr == nil {
+				cerr = context.Canceled
+			}
+			return cleanupSyncErr(cerr)
+		}
 		closeDec()
 
 		if pcmBytes == 0 {
@@ -890,7 +901,13 @@ func (s *Server) PrepareHQPTrack(ctx context.Context, src player.TrackSource, pe
 			return cleanupSyncErr(err)
 		}
 	}
-	stopPrepCancel()
+	if !stopPrepCancel() || prepCanceled.Load() || ctx.Err() != nil {
+		cerr := ctx.Err()
+		if cerr == nil {
+			cerr = context.Canceled
+		}
+		return cleanupSyncErr(cerr)
+	}
 
 	written := int64(len(hdr)) + int64(len(preBuf))
 	totalSize := int64(len(hdr)) + estimatedDataBytes

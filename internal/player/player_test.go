@@ -647,7 +647,7 @@ func TestLocalNativeBackendWithoutPCMDecoderAndDownloadingFlag(t *testing.T) {
 	p.SetBackend(be)
 	p.PlayQueue([]ytm.Track{{ID: "online_slow", Name: "Streaming", Duration: 5000}}, 0)
 	deadline = time.Now().Add(2 * time.Second)
-	for p.Loading() && time.Now().Before(deadline) {
+	for (p.Loading() || !p.lyricsLoaded) && time.Now().Before(deadline) {
 		select {
 		case fn := <-ch:
 			fn()
@@ -670,6 +670,12 @@ func TestLocalNativeBackendWithoutPCMDecoderAndDownloadingFlag(t *testing.T) {
 	if err != nil {
 		t.Fatalf("OpenPCM on slow stream: %v", err)
 	}
+	waitEntered := make(chan struct{})
+	var waitOnce sync.Once
+	prevWaitHook := onDownloadWaitHook
+	onDownloadWaitHook = func() { waitOnce.Do(func() { close(waitEntered) }) }
+	defer func() { onDownloadWaitHook = prevWaitHook }()
+
 	readDone := make(chan error, 1)
 	go func() {
 		buf := make([]float32, 8192)
@@ -681,7 +687,12 @@ func TestLocalNativeBackendWithoutPCMDecoderAndDownloadingFlag(t *testing.T) {
 			}
 		}
 	}()
-	time.Sleep(25 * time.Millisecond)
+	select {
+	case <-waitEntered:
+	case <-time.After(time.Second):
+		_ = sharedDec.Close()
+		t.Fatal("shared PCMDecoder.Read never entered download wait")
+	}
 	_ = sharedDec.Close()
 	select {
 	case rerr := <-readDone:
@@ -702,7 +713,7 @@ func TestLocalNativeBackendWithoutPCMDecoderAndDownloadingFlag(t *testing.T) {
 
 	p.PlayQueue([]ytm.Track{{ID: "online_cached", Name: "Cached", Duration: 5000}}, 0)
 	deadline = time.Now().Add(2 * time.Second)
-	for p.Loading() && time.Now().Before(deadline) {
+	for (p.Loading() || !p.lyricsLoaded) && time.Now().Before(deadline) {
 		select {
 		case fn := <-ch:
 			fn()
