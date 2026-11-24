@@ -38,6 +38,15 @@ type RoonZone struct {
 	ZoneID      string `json:"zone_id"`
 	DisplayName string `json:"display_name"`
 	State       string `json:"state"`
+	NowPlaying  *struct {
+		OneLine struct {
+			Line1 string `json:"line1"`
+		} `json:"one_line"`
+		ThreeLine struct {
+			Line1 string `json:"line1"`
+			Line2 string `json:"line2"`
+		} `json:"three_line"`
+	} `json:"now_playing,omitempty"`
 }
 
 // RoonStatus summarizes the current Roon Core pairing and Live Radio state.
@@ -77,6 +86,7 @@ type RoonManager struct {
 	wantPlaying   bool
 	wantZoneID    string
 	startedZoneID string
+	zoneOwned     bool
 	startCancel   context.CancelFunc
 
 	browseMu sync.Mutex
@@ -478,11 +488,17 @@ func (m *RoonManager) subscribeZones(sess *mooSession) {
 		}
 		for _, z := range payload.ZonesChanged {
 			m.zonesMap[z.ZoneID] = z
+			if z.ZoneID == m.startedZoneID && m.zoneOwned && !m.wantPlaying {
+				if z.State == "stopped" || (z.NowPlaying != nil && !zoneMatchesBridge(z)) {
+					m.zoneOwned = false
+				}
+			}
 		}
 		for _, id := range payload.ZonesRemoved {
 			delete(m.zonesMap, id)
 			if m.startedZoneID == id {
 				m.startedZoneID = ""
+				m.zoneOwned = false
 			}
 		}
 		m.mu.Unlock()
@@ -512,6 +528,17 @@ func (m *RoonManager) handleIncomingRequest(sess *mooSession, msg mooMessage) {
 	default:
 		_ = sess.Reply(msg.RequestID, "COMPLETE", "InvalidRequest", nil)
 	}
+}
+
+func zoneMatchesBridge(z RoonZone) bool {
+	if z.NowPlaying == nil {
+		return true
+	}
+	joined := strings.ToLower(z.NowPlaying.OneLine.Line1 + " " + z.NowPlaying.ThreeLine.Line1 + " " + z.NowPlaying.ThreeLine.Line2)
+	if strings.TrimSpace(joined) == "" {
+		return true
+	}
+	return strings.Contains(joined, "ytb") || strings.Contains(joined, "youtube")
 }
 
 func isMOOSuccess(msg mooMessage) bool {
@@ -610,7 +637,10 @@ func (m *RoonManager) ensureStationPlayingSerialized(ctx context.Context, gen ui
 		Action string `json:"action"`
 	}
 	_ = json.Unmarshal(brMsg.Body, &brRes)
-	played := brRes.Action != "list"
+	if brRes.Action == "message" {
+		return nil
+	}
+	played := brRes.Action == "none" || brRes.Action == ""
 	if brRes.Action == "list" {
 		actLoad, err := sess.Request(ctx, "com.roonlabs.browse:1/load", map[string]any{
 			"hierarchy": "internet_radio",
@@ -654,6 +684,13 @@ func (m *RoonManager) ensureStationPlayingSerialized(ctx context.Context, gen ui
 		if err != nil || !isMOOSuccess(actMsg) {
 			return err
 		}
+		var actRes struct {
+			Action string `json:"action"`
+		}
+		_ = json.Unmarshal(actMsg.Body, &actRes)
+		if actRes.Action == "message" {
+			return nil
+		}
 		played = true
 	}
 
@@ -661,21 +698,24 @@ func (m *RoonManager) ensureStationPlayingSerialized(ctx context.Context, gen ui
 		return nil
 	}
 
-	// Stop the previously started Roon zone when handing playback to a new zone.
-	if prevStarted != "" && prevStarted != zoneID {
+	// Record the newly started zone immediately (even if superseded while stopping old zone)
+	// and check whether the previous zone is still owned by our bridge before stopping it.
+	m.mu.Lock()
+	oldZone := m.startedZoneID
+	oldOwned := m.zoneOwned
+	oldInfo, hasOld := m.zonesMap[oldZone]
+	m.startedZoneID = zoneID
+	m.zoneOwned = true
+	m.mu.Unlock()
+
+	if oldZone != "" && oldZone != zoneID && oldOwned && (!hasOld || zoneMatchesBridge(oldInfo)) {
 		stopCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 		_, _ = sess.Request(stopCtx, "com.roonlabs.transport:2/control", map[string]any{
-			"zone_or_output_id": prevStarted,
+			"zone_or_output_id": oldZone,
 			"control":           "stop",
 		})
 		cancel()
 	}
-
-	m.mu.Lock()
-	if m.wantPlaying && m.intentGen == gen {
-		m.startedZoneID = zoneID
-	}
-	m.mu.Unlock()
 	return nil
 }
 
@@ -1256,6 +1296,11 @@ func (s *roonSink) pullPCM24(outFrames int) []byte {
 	valid := !s.closed && s.playing && s.playGen == wantPlayGen && s.seekGen == wantSeekGen
 	if !valid {
 		out = nil
+		// If paused mid-read without an explicit seek, resync decoder cursor back to posFrames before next resume!
+		if !s.closed && s.seekGen == wantSeekGen && gotSrcFrames > 0 {
+			s.seekTarget = s.posFrames
+			s.seekGen++
+		}
 	} else {
 		s.posFrames += int64(gotSrcFrames)
 		if errors.Is(readErr, io.EOF) && !s.endedOnce {
@@ -1343,6 +1388,10 @@ func (s *roonSink) pullADTS(advancePos bool) []byte {
 	valid := !s.closed && s.playing && s.playGen == wantPlayGen && s.seekGen == wantSeekGen
 	if !valid {
 		pkt = nil
+		if !s.closed && s.seekGen == wantSeekGen {
+			s.seekTarget = s.posFrames
+			s.seekGen++
+		}
 	} else {
 		if len(pkt) > 0 && advancePos {
 			step := int64(1024)

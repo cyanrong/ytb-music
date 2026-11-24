@@ -253,14 +253,16 @@ func (a *app) deleteChosen() {
 	if i < 0 || a.mine[i].SpecialType == 5 {
 		return
 	}
+	var pl ytm.Playlist
 	if isLocalPlaylist(id) {
 		if err := a.deleteLocalPlaylist(id); err != nil {
 			a.toast = "删除失败，请检查磁盘权限"
 			return
 		}
+	} else {
+		pl = a.mine[i]
+		a.mine = slices.Delete(slices.Clone(a.mine), i, i+1)
 	}
-	pl := a.mine[i]
-	a.mine = slices.Delete(slices.Clone(a.mine), i, i+1)
 	// Leave no way back to its page, and leave it for the page before.
 	gone := func(r route) bool { return r.page == pagePlaylist && r.id == id }
 	a.history = slices.DeleteFunc(a.history, gone)

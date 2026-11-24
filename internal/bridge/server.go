@@ -118,12 +118,17 @@ func (s *Server) Rebind(listenAddr string) error {
 	if err != nil {
 		return fmt.Errorf("无效的桥接监听地址 %q: %w", listenAddr, err)
 	}
-	if _, err := net.ResolveTCPAddr("tcp", listenAddr); err != nil {
+	resAddr, err := net.ResolveTCPAddr("tcp", listenAddr)
+	if err != nil {
 		return fmt.Errorf("无效的桥接监听地址 %q: %w", listenAddr, err)
+	}
+	resolvedHost := newHost
+	if resAddr.IP != nil {
+		resolvedHost = resAddr.IP.String()
 	}
 
 	s.mu.Lock()
-	if s.ln != nil && s.listenAddr == listenAddr {
+	if s.ln != nil && (s.listenAddr == listenAddr || s.listenAddr == resAddr.String()) {
 		s.mu.Unlock()
 		return nil
 	}
@@ -131,7 +136,7 @@ func (s *Server) Rebind(listenAddr string) error {
 	oldSrv := s.httpSrv
 	oldLn := s.ln
 	oldHost, oldPort, _ := net.SplitHostPort(oldAddr)
-	overlapSamePort := oldLn != nil && newPort != "0" && oldPort == newPort && hostsOverlap(oldHost, newHost)
+	overlapSamePort := oldLn != nil && newPort != "0" && oldPort == strconv.Itoa(resAddr.Port) && hostsOverlap(oldHost, resolvedHost)
 	if overlapSamePort {
 		s.httpSrv = nil
 		s.ln = nil

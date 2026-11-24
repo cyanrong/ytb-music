@@ -3,6 +3,7 @@ package app
 import (
 	"context"
 	"maps"
+	"net"
 	"strings"
 	"sync"
 	"time"
@@ -85,6 +86,7 @@ func (a *app) syncAudioInputs() {
 func (a *app) initAudioChain() {
 	a.syncAudioInputs()
 	if a.settings.OutputMode != outputLocal {
+		a.audio.desiredMode = a.settings.OutputMode
 		if err := a.applyOutputMode(a.settings.OutputMode); err != nil {
 			a.settings.OutputMode = outputLocal
 			a.toast = err.Error()
@@ -103,7 +105,7 @@ func (a *app) stopUnusedServices(keepMode string) {
 	if keepMode != outputHQPlayer && a.audio.hqp != nil {
 		hqp := a.audio.hqp
 		a.audio.hqp = nil
-		hqp.Shutdown(false)
+		hqp.Shutdown(true)
 	}
 	if keepMode != outputRoon && a.audio.roonMgr != nil {
 		mgr := a.audio.roonMgr
@@ -321,18 +323,35 @@ func (a *app) applyBridgeListen() {
 	if addr == "" {
 		addr = bridge.DefaultListenAddr
 	}
+	if _, _, err := net.SplitHostPort(addr); err != nil {
+		a.audio.bridgeErr = "监听地址格式不正确（示例 127.0.0.1:17890）"
+		return
+	}
+	if _, err := net.ResolveTCPAddr("tcp", addr); err != nil {
+		a.audio.bridgeErr = "无效的桥接监听地址：" + err.Error()
+		return
+	}
+
 	if a.audio.srv != nil {
 		if err := a.audio.srv.Rebind(addr); err != nil {
 			a.audio.bridgeErr = "监听地址绑定失败：" + err.Error()
 			return
 		}
 		addr = a.audio.srv.Addr()
+	} else if a.audio.desiredMode != "" && a.audio.desiredMode != outputLocal {
+		// Validate that the candidate port actually binds before persisting it!
+		srv, err := newBridgeServer(addr)
+		if err != nil {
+			a.audio.bridgeErr = "启动本地音频桥接服务失败：" + err.Error()
+			return
+		}
+		a.audio.srv = srv
+		addr = srv.Addr()
 	}
 	a.audio.bridgeErr = ""
 	a.audio.listenInput = addr
 	a.settings.BridgeListen = addr
 	if a.settings.OutputMode == outputLocal && a.audio.desiredMode != "" && a.audio.desiredMode != outputLocal {
-		// Automatically retry the external mode that previously failed on a port conflict.
 		a.setOutputMode(a.audio.desiredMode)
 		return
 	}

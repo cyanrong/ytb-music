@@ -170,20 +170,27 @@ func (b *HQPlayerBackend) Disconnect() {
 // DisconnectAsync stops playback if requested on the existing socket and tears it down off the UI thread.
 func (b *HQPlayerBackend) DisconnectAsync(sendStop bool) {
 	hc := b.connPtr.Swap(nil)
-	if hc == nil {
+	if hc == nil && !b.retired.Load() {
 		return
 	}
 	go func() {
-		if sendStop && !hc.closed.Load() {
-			b.cmdMu.Lock()
-			if !hc.closed.Load() {
+		b.cmdMu.Lock()
+		if late := b.connPtr.Swap(nil); late != nil {
+			if hc != nil {
+				hc.closed.Store(true)
+				_ = hc.conn.Close()
+			}
+			hc = late
+		}
+		if hc != nil {
+			if sendStop && !hc.closed.Load() {
 				_ = hc.conn.SetWriteDeadline(time.Now().Add(800 * time.Millisecond))
 				_, _ = hc.conn.Write([]byte(xmlDecl + `<Stop/>`))
 			}
-			b.cmdMu.Unlock()
+			hc.closed.Store(true)
+			_ = hc.conn.Close()
 		}
-		hc.closed.Store(true)
-		_ = hc.conn.Close()
+		b.cmdMu.Unlock()
 		b.emitState(false, "未连接")
 	}()
 }
@@ -244,6 +251,11 @@ func (b *HQPlayerBackend) ensureConnLocked(ctx context.Context) (*hqpConn, error
 		_ = hc.conn.Close()
 		return nil, err
 	}
+	if b.retired.Load() {
+		hc.closed.Store(true)
+		_ = hc.conn.Close()
+		return nil, errors.New("hqplayer: backend retired")
+	}
 
 	b.connPtr.Store(hc)
 	b.emitState(true, "已连接 "+hc.product)
@@ -286,6 +298,9 @@ func (b *HQPlayerBackend) readLoop(hc *hqpConn) {
 			hc.waitTag = ""
 		}
 		hc.waitMu.Unlock()
+		if tag == "Seek" {
+			b.clearActiveSeekInFlight()
+		}
 		if matched {
 			ch <- xmlReply{tag: tag, attrs: attrs}
 		}
@@ -456,6 +471,17 @@ func (b *HQPlayerBackend) Open(ctx context.Context, src player.TrackSource) (pla
 	return sink, nil
 }
 
+func (b *HQPlayerBackend) clearActiveSeekInFlight() {
+	b.sinkMu.Lock()
+	sink := b.active
+	b.sinkMu.Unlock()
+	if sink != nil {
+		sink.mu.Lock()
+		sink.seekInFlight = false
+		sink.mu.Unlock()
+	}
+}
+
 func (b *HQPlayerBackend) onStatusFrame(attrs map[string]string) {
 	state, err := strconv.Atoi(attrs["state"])
 	if err != nil {
@@ -492,12 +518,13 @@ type hqpSink struct {
 	endedOnce       bool
 
 	// Coalesced ordered desired commands processed by transportWorker.
-	playDirty  bool
-	wantPlay   bool
-	seekDirty  bool
-	seekTarget time.Duration
-	volDirty   bool
-	volTarget  float64
+	playDirty    bool
+	wantPlay     bool
+	seekDirty    bool
+	seekInFlight bool
+	seekTarget   time.Duration
+	volDirty     bool
+	volTarget    float64
 
 	wakeCh chan struct{}
 	stopCh chan struct{}
@@ -667,6 +694,9 @@ func (s *hqpSink) transportWorker() {
 				s.hasPendingSeek = true
 				doSeek = false
 			}
+			if doSeek {
+				s.seekInFlight = true
+			}
 			s.mu.Unlock()
 
 			if !doVol && !doPlay && !doSeek {
@@ -689,6 +719,9 @@ func (s *hqpSink) transportWorker() {
 				cmd := fmt.Sprintf(`<Seek position="%.2f"/>`, seekTo.Seconds())
 				_, _ = s.backend.execForEpoch(ctx, s.epoch, "Seek", cmd, 4*time.Second)
 				cancel()
+				s.mu.Lock()
+				s.seekInFlight = false
+				s.mu.Unlock()
 			}
 		}
 	}
@@ -724,11 +757,11 @@ func (s *hqpSink) updateFromHQP(state int, posSec float64) {
 		if state == 2 {
 			s.sawPlaying = true
 		}
-		if !s.hasPendingSeek && !s.seekDirty && (state == 2 || state == 1) {
+		if !s.hasPendingSeek && !s.seekDirty && !s.seekInFlight && (state == 2 || state == 1) {
 			s.pos = time.Duration(posSec * float64(time.Second))
 			s.posAt = now
 		}
-		if state == 0 && s.sawPlaying && s.playing && !s.endedOnce && now.Sub(s.playRequestedAt) > 500*time.Millisecond {
+		if state == 0 && s.sawPlaying && s.playing && !s.endedOnce && !s.hasPendingSeek && !s.seekDirty && !s.seekInFlight && now.Sub(s.playRequestedAt) > 500*time.Millisecond {
 			s.endedOnce = true
 			s.playing = false
 			s.pos = s.duration

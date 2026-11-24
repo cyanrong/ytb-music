@@ -123,8 +123,8 @@ func TestHQPlayerBackendAndRangeWAV(t *testing.T) {
 				_, _ = conn.Write([]byte(xmlDecl + `<Play result="OK"/>` + xmlDecl + `<Status state="2" position="1.25"/>`))
 				playEvents <- struct{}{}
 			case "Seek":
-				seekPositions <- attrs["position"]
 				_, _ = conn.Write([]byte(xmlDecl + `<Seek result="OK"/>`))
+				seekPositions <- attrs["position"]
 			case "Pause":
 				_, _ = conn.Write([]byte(xmlDecl + `<Pause result="OK"/>`))
 			case "Stop":
@@ -408,8 +408,37 @@ func TestRoonMOOExtensionAndICYStream(t *testing.T) {
 		t.Fatal("timed out waiting for Roon MOO pairing and zones")
 	}
 
-	// Directly verify that a single 882-frame WAV pull accumulates across 142-frame decoder reads.
+	// Directly verify on an unactivated sink (isolated from runRoonClock) that a single 882-frame WAV pull accumulates across 142-frame decoder reads.
 	rb := NewRoonBackend(srv, mgr, "z-hqp")
+	isolatedSink, err := rb.Open(context.Background(), player.TrackSource{
+		Track:    ytm.Track{ID: "iso", Name: "Isolated", Duration: 3000},
+		Duration: 3 * time.Second,
+		Gain:     1.0,
+		OpenPCM: func() (player.PCMDecoder, error) {
+			return &rampPCMDecoder{rate: 44100, frames: 44100 * 3}, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	isoRS := isolatedSink.(*roonSink)
+	isoRS.stateMu.Lock()
+	isoRS.playing = true
+	isoRS.stateMu.Unlock()
+	oneTick := isoRS.pullPCM24(882)
+	isolatedSink.Close()
+	if len(oneTick) != 882*6 {
+		t.Fatalf("pullPCM24(882) returned %d bytes, want %d", len(oneTick), 882*6)
+	}
+	lastOff := 881 * 6
+	lastLeft := int32(uint32(oneTick[lastOff]) | uint32(oneTick[lastOff+1])<<8 | uint32(oneTick[lastOff+2])<<16)
+	if lastLeft&0x800000 != 0 {
+		lastLeft |= ^0xffffff
+	}
+	if lastLeft < 3699370 || lastLeft > 3699382 {
+		t.Fatalf("frame 881 sample = %d, want ~3699376", lastLeft)
+	}
+
 	sink, err := rb.Open(context.Background(), player.TrackSource{
 		Track: ytm.Track{
 			ID:       "t1",
@@ -430,21 +459,6 @@ func TestRoonMOOExtensionAndICYStream(t *testing.T) {
 
 	sink.Activate()
 	sink.Play()
-
-	rs := sink.(*roonSink)
-	oneTick := rs.pullPCM24(882)
-	if len(oneTick) != 882*6 {
-		t.Fatalf("pullPCM24(882) returned %d bytes, want %d", len(oneTick), 882*6)
-	}
-	lastOff := 881 * 6
-	lastLeft := int32(uint32(oneTick[lastOff]) | uint32(oneTick[lastOff+1])<<8 | uint32(oneTick[lastOff+2])<<16)
-	if lastLeft&0x800000 != 0 {
-		lastLeft |= ^0xffffff
-	}
-	// Frame 881 has value (881%1000 + 1)/2000 = 882/2000 = 0.441 -> ~3699376 in 24-bit signed PCM.
-	if lastLeft < 3699370 || lastLeft > 3699382 {
-		t.Fatalf("frame 881 sample = %d, want ~3699376", lastLeft)
-	}
 
 	// Verify Roon station startup actually invoked Play Now ("act-play") on z-hqp BEFORE any HTTP listener connected.
 	select {

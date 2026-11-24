@@ -95,12 +95,13 @@ func (a *app) cancelImport() {
 func (a *app) resolveImportCookie() (string, error) {
 	d := &a.imp
 	raw := strings.TrimSpace(d.musicUInput)
+	wasMasked := d.musicUMasked && raw == maskedCookiePlaceholder
 	var clean string
 	var err error
 	switch {
 	case raw == "":
 		clean = ""
-	case d.musicUMasked && raw == maskedCookiePlaceholder:
+	case wasMasked:
 		decrypted, oerr := openSecret(a.settings.NetEaseMusicU)
 		if oerr != nil {
 			return "", oerr
@@ -113,6 +114,9 @@ func (a *app) resolveImportCookie() (string, error) {
 		return "", err
 	}
 	if d.rememberCookie && clean != "" {
+		if wasMasked {
+			return clean, nil
+		}
 		sealed, serr := sealSecret(clean)
 		if serr != nil {
 			return "", fmt.Errorf("无法安全加密 Cookie: %w", serr)

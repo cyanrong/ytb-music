@@ -118,12 +118,28 @@ func TestImportNetEaseToLocalPlaylist(t *testing.T) {
 		t.Fatalf("route = %+v, want opened local playlist", a.route)
 	}
 
-	// Verify disk persistence across a fresh app instance, plus local rename and delete.
-	a2 := newTestApp()
-	a2.settings = defaultSettings()
+	// Verify disk persistence across a fresh app instance, plus deleting the last local playlist without touching cloud rows.
+	a2 := editTestApp()
 	a2.initLocalPlaylists()
 	if len(a2.localPlaylists) != 1 || a2.localPlaylists[0].Name != "深夜爵士" || len(a2.localPlaylists[0].Tracks) != 1 {
 		t.Fatalf("reloaded local playlists = %+v, want 深夜爵士 with 1 track", a2.localPlaylists)
+	}
+	tt2 := ui.NewTester(a2.view, 1200, 800)
+	tt2.Frame()
+	if err := tt2.RightClick("深夜爵士"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tt2.ChooseMenuItem("删除歌单…"); err != nil {
+		t.Fatal(err)
+	}
+	tt2.Advance(300 * time.Millisecond)
+	tt2.Frame()
+	if err := tt2.Click("删除"); err != nil {
+		t.Fatal(err)
+	}
+	tt2.Frame()
+	if len(a2.localPlaylists) != 0 || len(a2.mine) != 3 {
+		t.Fatalf("after deleting local playlist: local=%d mine=%d, want 0 and 3 cloud playlists intact", len(a2.localPlaylists), len(a2.mine))
 	}
 }
 
