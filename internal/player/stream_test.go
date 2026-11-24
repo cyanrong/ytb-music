@@ -448,3 +448,66 @@ func TestRangeDownloadRefreshesURLAfterRouteChange(t *testing.T) {
 		t.Fatalf("got=%d/%d err=%v refreshes=%d equal=%v", got, total, err, refreshes, bytes.Equal(data, payload))
 	}
 }
+
+// An exhigh stream whose first 256 KB header range succeeds but whose second
+// range returns 403 Forbidden (GVS PO-token cutoff) falls back to cached or
+// remote standard audio instead of failing mid-load.
+func TestExhighChunk2ForbiddenFallsBackToStandard(t *testing.T) {
+	b, err := os.ReadFile("testdata/seek.m4a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bigSize := int64(firstRange + 128<<10)
+	exhighSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rng := r.URL.Query().Get("range")
+		if rng == fmt.Sprintf("0-%d", firstRange-1) {
+			pad := make([]byte, firstRange)
+			copy(pad, b)
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(pad)
+			return
+		}
+		http.Error(w, "po token required", http.StatusForbidden)
+	}))
+	defer exhighSrv.Close()
+
+	stdSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(b)
+	}))
+	defer stdSrv.Close()
+
+	ytm.SetCookies("SAPISID=prem1; SID=xyz")
+	defer ytm.ClearSession()
+
+	was := songURL
+	defer func() { songURL = was }()
+	songURL = func(id, level string) (*ytm.Stream, error) {
+		if level == "exhigh" {
+			return &ytm.Stream{
+				URL:   exhighSrv.URL + "/.googlevideo.com/videoplayback?id=" + id,
+				Size:  bigSize,
+				Type:  "m4a",
+				Level: "exhigh",
+			}, nil
+		}
+		return &ytm.Stream{
+			URL:   stdSrv.URL + "/standard.m4a",
+			Size:  int64(len(b)),
+			Type:  "m4a",
+			Level: "standard",
+		}, nil
+	}
+
+	p := &Player{Cache: NewCache(t.TempDir(), 1<<30)}
+	info, s, err := p.open(ytm.Track{ID: "prem_song"}, "exhigh")
+	if err != nil {
+		t.Fatalf("open(exhigh) failed instead of falling back: %v", err)
+	}
+	defer s.Close()
+	if info.Level != "standard" {
+		t.Fatalf("fallback level = %q, want standard", info.Level)
+	}
+	if n, rerr := s.Read(make([]float32, 4096)); n == 0 || rerr != nil {
+		t.Fatalf("reading fallback stream: n=%d err=%v", n, rerr)
+	}
+}

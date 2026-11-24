@@ -33,13 +33,40 @@ var (
 	fetchWebRemixPlayer = callWebRemixPlayer
 	fetchSafariPlayer   = callSafariPlayer
 	getSolver           = currentSolver
+
+	exhighBlock struct {
+		mu  sync.Mutex
+		sig string
+	}
 )
+
+func exhighRouteKey() string {
+	return RouteSignature() + "|" + authCacheKey()
+}
+
+// MarkExhighForbidden notes that googlevideo.com rejected a WEB_REMIX 256 kbps
+// stream (e.g. GVS PO-token enforcement on the current proxy/account), so
+// subsequent tracks skip WEB_REMIX exhigh until the proxy route or session changes.
+func MarkExhighForbidden() {
+	exhighBlock.mu.Lock()
+	exhighBlock.sig = exhighRouteKey()
+	exhighBlock.mu.Unlock()
+}
+
+func exhighBlocked() bool {
+	exhighBlock.mu.Lock()
+	defer exhighBlock.mu.Unlock()
+	return exhighBlock.sig != "" && exhighBlock.sig == exhighRouteKey()
+}
 
 func clearStreamCaches() {
 	playerCache.clear()
 	tvPlayerCache.clear()
 	webRemixCache.clear()
 	safariPlayerCache.clear()
+	exhighBlock.mu.Lock()
+	exhighBlock.sig = ""
+	exhighBlock.mu.Unlock()
 }
 
 func invalidateStreamSuffix(suffix string) {
@@ -264,38 +291,55 @@ func SongURL(id string, level string) (*Stream, error) {
 		return nil, err
 	}
 	if level == "exhigh" && !notPremium() {
-		type result struct {
-			s   *Stream
+		type tvRes struct {
+			p   *player
 			err error
 		}
-		std := make(chan result, 1)
+		tvCh := make(chan tvRes, 1)
 		go func() {
-			s, err := tvStream(id)
-			std <- result{s, err}
+			p, err := tvPlayerOf(id)
+			tvCh <- tvRes{p, err}
 		}()
-		wr, wrErr := webRemixOf(id)
-		if wrErr == nil && wr.status == "OK" && wr.exhigh != nil {
+
+		var wr *player
+		var wrErr error
+		if !exhighBlocked() {
+			wr, wrErr = webRemixOf(id)
+		}
+
+		tr := <-tvCh
+		if tr.err == nil && tr.p.status == "OK" && tr.p.exhigh != nil {
+			cp := *tr.p.exhigh
+			return &cp, nil
+		}
+		if !exhighBlocked() && wrErr == nil && wr != nil && wr.status == "OK" && wr.exhigh != nil {
 			cp := *wr.exhigh
 			return &cp, nil
 		}
-		r := <-std
-		if r.err == nil {
-			return r.s, nil
+		if tr.err == nil && tr.p.status == "OK" && tr.p.standard != nil {
+			cp := *tr.p.standard
+			return &cp, nil
 		}
-		if wrErr == nil && wr.status == "OK" && wr.standard != nil {
+		if wr != nil && wrErr == nil && wr.status == "OK" && wr.standard != nil {
 			cp := *wr.standard
 			return &cp, nil
 		}
 		if s, vErr := visionStream(id); vErr == nil {
 			return s, nil
 		}
-		if r.err != nil {
-			return nil, r.err
+		if stdErr := func() error {
+			_, e := standardFromPlayer(tr.p, tr.err)
+			return e
+		}(); stdErr != nil {
+			return nil, stdErr
 		}
 		if wrErr != nil {
 			return nil, wrErr
 		}
-		return nil, fmt.Errorf("%w: %s", ErrUnavailable, wr.reason)
+		if wr != nil {
+			return nil, fmt.Errorf("%w: %s", ErrUnavailable, wr.reason)
+		}
+		return nil, ErrUnavailable
 	}
 	tv, tvErr := tvStream(id)
 	if tvErr == nil {

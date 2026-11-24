@@ -83,7 +83,7 @@ func (c *Cache) lookup(id string, level string) (*download, *ytm.Stream, bool) {
 func (c *Cache) download(id string, st *ytm.Stream) *download {
 	var dl *download
 	var refresh func() (string, error)
-	if id != "" && st != nil && st.Size > 0 {
+	if id != "" && st != nil && st.Size > 0 && st.Level != "exhigh" {
 		wantLevel, wantSize := st.Level, st.Size
 		refresh = func() (string, error) {
 			ytm.InvalidateTrackStream(id)

@@ -278,6 +278,26 @@ func (d *download) waitFor(n int64) int64 {
 	return d.n
 }
 
+// probeRange waits until at least want bytes (clamped to d.size) have arrived,
+// or returns the download error if the stream ended early (e.g. 403 on chunk 2).
+func (d *download) probeRange(want int64) error {
+	if d.size > 0 {
+		want = min(want, d.size)
+	}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for d.n < want && !d.done {
+		d.cond.Wait()
+	}
+	if d.n < want {
+		if d.err != nil {
+			return d.err
+		}
+		return io.ErrUnexpectedEOF
+	}
+	return nil
+}
+
 // readAt reads into b what is in from off, as much as fits. Its caller
 // holds the lock.
 func (d *download) readAt(b []byte, off int64) (int, error) {

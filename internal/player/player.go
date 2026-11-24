@@ -5,7 +5,9 @@ import (
 	"errors"
 	"math"
 	"math/rand/v2"
+	"net/http"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/egoist/mygo"
@@ -735,7 +737,7 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 		info, s, err := p.open(t, level)
 		var extOut OutputSink
 		var backendErr error
-		if err == nil && backend != nil {
+		openBackend := func() {
 			if ctx.Err() != nil {
 				s.Close()
 				return
@@ -756,6 +758,17 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 			stopLoad := context.AfterFunc(ctx, func() { _ = s.Close() })
 			extOut, backendErr = backend.Open(ctx, src)
 			stopLoad()
+		}
+		if err == nil && backend != nil {
+			openBackend()
+			if backendErr != nil && ctx.Err() == nil && info != nil && info.Level == "exhigh" && isForbiddenStreamErr(backendErr) {
+				ytm.MarkExhighForbidden()
+				_ = s.Close()
+				extOut, backendErr = nil, nil
+				if info, s, err = p.open(t, "standard"); err == nil {
+					openBackend()
+				}
+			}
 		}
 		p.post(func() {
 			if gen != p.gen {
@@ -846,6 +859,17 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 	}()
 }
 
+func isForbiddenStreamErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	var se httpStatusError
+	if errors.As(err, &se) && se.code == http.StatusForbidden {
+		return true
+	}
+	return strings.Contains(err.Error(), "403")
+}
+
 // open opens track t's audio at level: kept in the cache, or else
 // streamed into it, and kept once it has all come in.
 func (p *Player) open(t ytm.Track, level string) (*ytm.Stream, stream, error) {
@@ -858,8 +882,21 @@ func (p *Player) open(t ytm.Track, level string) (*ytm.Stream, stream, error) {
 		}
 		dl = p.Cache.download(t.ID, info)
 	}
-	s, err := openStream(dl, t.Duration)
+	var err error
+	var s stream
+	// WEB_REMIX 256 kbps streams without a browser PO token often serve the
+	// initial 256 KB header range and reject chunk 2 with 403 Forbidden; probe
+	// past firstRange so we fall back seamlessly to standard before playback.
+	if !ok && info.Level == "exhigh" && info.Size > firstRange {
+		err = dl.probeRange(firstRange + 1)
+	}
+	if err == nil {
+		s, err = openStream(dl, t.Duration)
+	}
 	if err != nil && !ok {
+		if info.Level == "exhigh" && isForbiddenStreamErr(err) {
+			ytm.MarkExhighForbidden()
+		}
 		dl.Close()
 		ytm.InvalidateTrackStream(t.ID)
 		fallback := "standard"
@@ -868,6 +905,14 @@ func (p *Player) open(t ytm.Track, level string) (*ytm.Stream, stream, error) {
 				return nil, nil, err
 			}
 			fallback = "standard_fallback"
+		}
+		if fallback == "standard" {
+			if cdl, cinfo, cok := p.Cache.lookup(t.ID, "standard"); cok {
+				if cs, cerr := openStream(cdl, t.Duration); cerr == nil {
+					return cinfo, cs, nil
+				}
+				cdl.Close()
+			}
 		}
 		if info, err = songURL(t.ID, fallback); err != nil {
 			return nil, nil, err
