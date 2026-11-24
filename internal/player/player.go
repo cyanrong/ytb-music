@@ -800,6 +800,7 @@ func (p *Player) loadSkipping(at, skipped int, play bool, from time.Duration) {
 			p.stream, p.info = s, info
 			p.gain = normGain(info)
 			if extOut != nil {
+				extOut.Activate()
 				p.out = extOut
 			} else {
 				p.out = localSink{Player: audio.NewPlayer(s)}

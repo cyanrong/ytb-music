@@ -61,7 +61,7 @@ func TestImportNetEaseToLocalPlaylist(t *testing.T) {
 		return &netease.Playlist{
 			ID:       "889900",
 			Name:     "深夜爵士",
-			CoverURL: "https://img.example/cover.jpg",
+			CoverURL: "",
 			Tracks: []netease.SourceTrack{
 				{ID: 1, Name: "晴天", Artists: []string{"周杰伦"}, DurationMs: 269000},
 				{ID: 2, Name: "不存在的独白", Artists: []string{"无名氏"}, DurationMs: 180000},
@@ -222,6 +222,41 @@ func TestImportNetEaseToCloudPlaylistBatches(t *testing.T) {
 	}
 	if len(batches) != 2 || len(batches[0]) != 50 || len(batches[1]) != 5 {
 		t.Fatalf("batches = %d (%v), want 2 batches of 50 and 5", len(batches), len(batches))
+	}
+}
+
+// A NetEase fetch failure clears busy state and surfaces the error message in the dialog instead of hanging on deferred context cancellation.
+func TestImportNetEaseFailureClearsBusy(t *testing.T) {
+	realFetch := fetchNetEasePlaylist
+	defer func() { fetchNetEasePlaylist = realFetch }()
+
+	fetchNetEasePlaylist = func(_ context.Context, _, _ string) (*netease.Playlist, error) {
+		return nil, netease.ErrNeedMusicU
+	}
+
+	posts := make(chan func(), 8)
+	a := newTestApp()
+	a.settings = defaultSettings()
+	a.postHook = func(fn func()) { posts <- fn }
+
+	tt := ui.NewTester(a.view, 1200, 800)
+	tt.Frame()
+	if err := tt.Click("导入网易云歌单"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Advance(300 * time.Millisecond)
+	tt.Frame()
+
+	a.imp.input = "123456"
+	tt.Frame()
+	if err := tt.Click("开始导入"); err != nil {
+		t.Fatal(err)
+	}
+	drainPosts(t, posts, func() bool { return !a.imp.busy })
+	tt.Frame()
+
+	if a.imp.busy || !strings.Contains(a.imp.err, "MUSIC_U") {
+		t.Fatalf("busy=%v err=%q, want non-busy MUSIC_U error", a.imp.busy, a.imp.err)
 	}
 }
 

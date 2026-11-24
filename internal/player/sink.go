@@ -43,6 +43,7 @@ type TrackSource struct {
 // OutputSink controls playback of a single loaded track on either the built-in
 // OS audio mixer or an external audiophile transport.
 type OutputSink interface {
+	Activate()
 	Play()
 	Pause()
 	Playing() bool
@@ -81,6 +82,7 @@ func (s localSink) OnSinkEnd(fn func()) {
 	}
 }
 
+func (localSink) Activate()             {}
 func (localSink) DirectTransport() bool { return false }
 
 func openSharedWithSpec(dl *download, spec *spectrum) (PCMDecoder, error) {
@@ -93,10 +95,11 @@ func openSharedWithSpec(dl *download, spec *spectrum) (PCMDecoder, error) {
 		return nil, err
 	}
 	return &m4aStream{
-		dl:   dl,
-		dec:  dec,
-		spec: spec,
-		drop: dl.release,
+		dl:     dl,
+		dec:    dec,
+		spec:   spec,
+		writer: newSpecWriter(spec),
+		drop:   dl.release,
 	}, nil
 }
 

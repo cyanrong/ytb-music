@@ -84,7 +84,10 @@ func (a *app) syncAudioInputs() {
 func (a *app) initAudioChain() {
 	a.syncAudioInputs()
 	if a.settings.OutputMode != outputLocal {
-		a.applyOutputMode(a.settings.OutputMode)
+		if err := a.applyOutputMode(a.settings.OutputMode); err != nil {
+			a.settings.OutputMode = outputLocal
+			a.toast = err.Error()
+		}
 	}
 }
 
@@ -92,16 +95,25 @@ func (a *app) closeAudioChain() {
 	if a.pl != nil {
 		a.pl.Stop()
 	}
-	if a.audio.hqp != nil {
-		a.audio.hqp.Disconnect()
+	a.stopUnusedServices(outputLocal)
+}
+
+func (a *app) stopUnusedServices(keepMode string) {
+	if keepMode != outputHQPlayer && a.audio.hqp != nil {
+		hqp := a.audio.hqp
+		a.audio.hqp = nil
+		hqp.DisconnectAsync(false)
 	}
-	if a.audio.roonMgr != nil {
-		a.audio.roonMgr.Close()
+	if keepMode != outputRoon && a.audio.roonMgr != nil {
+		mgr := a.audio.roonMgr
 		a.audio.roonMgr = nil
+		a.audio.roon = nil
+		go mgr.Close()
 	}
-	if a.audio.srv != nil {
-		_ = a.audio.srv.Close()
+	if keepMode == outputLocal && a.audio.srv != nil {
+		srv := a.audio.srv
 		a.audio.srv = nil
+		go func() { _ = srv.Close() }()
 	}
 }
 
@@ -233,37 +245,40 @@ func (a *app) setOutputMode(mode string) {
 	if a.settings.OutputMode == mode && ((mode == outputLocal && a.pl.Backend() == nil) || (mode != outputLocal && a.pl.Backend() != nil && a.pl.Backend().Name() == mode)) {
 		return
 	}
+	if err := a.applyOutputMode(mode); err != nil {
+		a.toast = err.Error()
+		return
+	}
 	a.settings.OutputMode = mode
-	a.applyOutputMode(mode)
 	a.changed()
 }
 
-func (a *app) applyOutputMode(mode string) {
+func (a *app) applyOutputMode(mode string) error {
 	mode = normalizeOutputMode(mode)
 	switch mode {
 	case outputLocal:
-		if a.audio.hqp != nil {
-			a.audio.hqp.Disconnect()
-		}
+		// Cancel any in-flight external load FIRST before disconnecting sockets.
 		a.pl.SetBackend(nil)
+		a.stopUnusedServices(outputLocal)
+		return nil
 	case outputHQPlayer:
 		b, err := a.ensureHQPlayerBackend()
 		if err != nil {
-			a.toast = err.Error()
-			return
+			return err
 		}
 		a.pl.SetBackend(b)
+		a.stopUnusedServices(outputHQPlayer)
+		return nil
 	case outputRoon:
-		if a.audio.hqp != nil {
-			a.audio.hqp.Disconnect()
-		}
 		b, err := a.ensureRoonBackend()
 		if err != nil {
-			a.toast = err.Error()
-			return
+			return err
 		}
 		a.pl.SetBackend(b)
+		a.stopUnusedServices(outputRoon)
+		return nil
 	}
+	return nil
 }
 
 func (a *app) applyHQPlayerAddr() {
@@ -271,10 +286,20 @@ func (a *app) applyHQPlayerAddr() {
 	if addr == "" {
 		addr = bridge.DefaultHQPlayerAddr
 	}
+	prev := a.settings.HQPlayerAddr
 	a.audio.hqpInput = addr
 	a.settings.HQPlayerAddr = addr
-	if a.audio.hqp != nil {
-		a.audio.hqp.SetAddr(addr)
+
+	if addr != prev && a.audio.hqp != nil {
+		oldHQP := a.audio.hqp
+		a.audio.hqp = nil
+		if a.settings.OutputMode == outputHQPlayer {
+			if newHQP, err := a.ensureHQPlayerBackend(); err == nil {
+				// Reopen any active track on the new HQPlayer endpoint before stopping the old one.
+				a.pl.SetBackend(newHQP)
+			}
+		}
+		oldHQP.DisconnectAsync(true)
 	}
 	a.changed()
 	a.testHQPlayerConn()
@@ -333,7 +358,7 @@ func (a *app) testHQPlayerConn() {
 func (a *app) currentRoonStreamURL() string {
 	a.syncAudioInputs()
 	peer := a.audio.roonStatus.CoreAddr
-	if srv, err := a.ensureBridgeServer(); err == nil {
+	if srv := a.audio.srv; srv != nil {
 		if a.settings.RoonStreamFormat == "aac" {
 			return srv.RoonAACURL(peer)
 		}
@@ -560,7 +585,7 @@ func (a *app) audioChainSettings(c *ui.Context, group func(string, func()), row 
 				})
 			}
 
-			row("电台流格式", "WAV 24-bit 传输原生 44.1kHz PCM；AAC 传输零重编码 ADTS 帧（均支持 ICY 曲目显示）", func() {
+			row("电台流格式", "WAV 24-bit 传输原生 44.1kHz PCM；AAC 传输零重编码比特直通帧（静音联动，音量由 Roon 控制）", func() {
 				fmts := []string{"wav", "aac"}
 				fIdx := 0
 				if s.RoonStreamFormat == "aac" {

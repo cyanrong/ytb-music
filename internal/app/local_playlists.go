@@ -2,6 +2,7 @@ package app
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"slices"
@@ -83,22 +84,27 @@ func sidebarLocalCopy(pl ytm.Playlist) ytm.Playlist {
 	return pl
 }
 
-// saveLocalPlaylists atomically persists local playlists when a.localPath is set.
-func (a *app) saveLocalPlaylists() {
+// saveLocalPlaylistsList atomically writes candidate to disk when a.localPath is set.
+func (a *app) saveLocalPlaylistsList(candidate []ytm.Playlist) error {
 	if a.localPath == "" {
-		return
+		return nil
 	}
-	b, err := json.MarshalIndent(a.localPlaylists, "", "  ")
+	b, err := json.MarshalIndent(candidate, "", "  ")
 	if err != nil {
-		return
+		return err
 	}
-	if os.MkdirAll(filepath.Dir(a.localPath), 0o700) != nil {
-		return
+	if err := os.MkdirAll(filepath.Dir(a.localPath), 0o700); err != nil {
+		return err
 	}
 	tmp := a.localPath + ".part"
-	if os.WriteFile(tmp, b, 0o600) == nil {
-		_ = os.Rename(tmp, a.localPath)
+	if err := os.WriteFile(tmp, b, 0o600); err != nil {
+		return err
 	}
+	if err := os.Rename(tmp, a.localPath); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }
 
 // withLocalPlaylists returns cloud playlists merged with the listener's local playlists.
@@ -131,7 +137,7 @@ func (a *app) syncLocalPlaylists() {
 	}
 }
 
-func (a *app) createLocalPlaylist(name, desc, coverURL string, tracks []ytm.Track) *ytm.Playlist {
+func (a *app) createLocalPlaylist(name, desc, coverURL string, tracks []ytm.Track) (*ytm.Playlist, error) {
 	pl := ytm.Playlist{
 		ID:          newLocalPlaylistID(),
 		Name:        name,
@@ -140,46 +146,57 @@ func (a *app) createLocalPlaylist(name, desc, coverURL string, tracks []ytm.Trac
 		Tracks:      slices.Clone(tracks),
 	}
 	normalizeLocalPlaylist(&pl)
-	a.localPlaylists = slices.Insert(a.localPlaylists, 0, pl)
+	next := slices.Insert(slices.Clone(a.localPlaylists), 0, pl)
+	if err := a.saveLocalPlaylistsList(next); err != nil {
+		return nil, err
+	}
+	a.localPlaylists = next
 	a.syncLocalPlaylists()
-	a.saveLocalPlaylists()
-	return a.playlists[pl.ID]
+	return a.playlists[pl.ID], nil
 }
 
-func (a *app) renameLocalPlaylist(id, name string) bool {
+func (a *app) renameLocalPlaylist(id, name string) error {
 	i := slices.IndexFunc(a.localPlaylists, func(pl ytm.Playlist) bool { return pl.ID == id })
 	if i < 0 {
-		return false
+		return errors.New("本地歌单不存在")
 	}
-	a.localPlaylists[i].Name = name
+	next := slices.Clone(a.localPlaylists)
+	next[i].Name = name
+	if err := a.saveLocalPlaylistsList(next); err != nil {
+		return err
+	}
+	a.localPlaylists = next
 	a.syncLocalPlaylists()
-	a.saveLocalPlaylists()
-	return true
+	return nil
 }
 
-func (a *app) deleteLocalPlaylist(id string) bool {
+func (a *app) deleteLocalPlaylist(id string) error {
 	i := slices.IndexFunc(a.localPlaylists, func(pl ytm.Playlist) bool { return pl.ID == id })
 	if i < 0 {
-		return false
+		return errors.New("本地歌单不存在")
 	}
-	a.localPlaylists = slices.Delete(slices.Clone(a.localPlaylists), i, i+1)
+	next := slices.Delete(slices.Clone(a.localPlaylists), i, i+1)
+	if err := a.saveLocalPlaylistsList(next); err != nil {
+		return err
+	}
+	a.localPlaylists = next
 	delete(a.playlists, id)
 	a.syncLocalPlaylists()
-	a.saveLocalPlaylists()
-	return true
+	return nil
 }
 
-func (a *app) addTracksToLocalPlaylist(id string, tracks ...ytm.Track) (added int, duplicate bool) {
+func (a *app) addTracksToLocalPlaylist(id string, tracks ...ytm.Track) (added int, duplicate bool, err error) {
 	i := slices.IndexFunc(a.localPlaylists, func(pl ytm.Playlist) bool { return pl.ID == id })
 	if i < 0 {
-		return 0, false
+		return 0, false, errors.New("本地歌单不存在")
 	}
-	pl := &a.localPlaylists[i]
+	nextList := slices.Clone(a.localPlaylists)
+	pl := &nextList[i]
 	existing := make(map[string]bool, len(pl.Tracks))
 	for _, t := range pl.Tracks {
 		existing[t.ID] = true
 	}
-	next := slices.Clone(pl.Tracks)
+	nextTracks := slices.Clone(pl.Tracks)
 	for _, tr := range tracks {
 		if tr.ID == "" {
 			continue
@@ -189,32 +206,42 @@ func (a *app) addTracksToLocalPlaylist(id string, tracks ...ytm.Track) (added in
 			continue
 		}
 		existing[tr.ID] = true
-		next = append(next, tr)
+		nextTracks = append(nextTracks, tr)
 		added++
 	}
-	pl.Tracks = next
+	if added == 0 {
+		return 0, duplicate, nil
+	}
+	pl.Tracks = nextTracks
 	normalizeLocalPlaylist(pl)
+	if err := a.saveLocalPlaylistsList(nextList); err != nil {
+		return 0, duplicate, err
+	}
+	a.localPlaylists = nextList
 	a.syncLocalPlaylists()
-	a.saveLocalPlaylists()
-	return added, duplicate
+	return added, duplicate, nil
 }
 
-func (a *app) removeTrackFromLocalPlaylist(id, trackID string) bool {
+func (a *app) removeTrackFromLocalPlaylist(id, trackID string) error {
 	i := slices.IndexFunc(a.localPlaylists, func(pl ytm.Playlist) bool { return pl.ID == id })
 	if i < 0 {
-		return false
+		return errors.New("本地歌单不存在")
 	}
 	before := a.localPlaylists[i].Tracks
 	after := slices.DeleteFunc(slices.Clone(before), func(t ytm.Track) bool { return t.ID == trackID })
 	if len(after) == len(before) {
-		return false
+		return nil
 	}
-	a.localPlaylists[i].Tracks = after
-	if a.localPlaylists[i].CoverURL != "" && len(after) == 0 {
-		a.localPlaylists[i].CoverURL = ""
+	nextList := slices.Clone(a.localPlaylists)
+	nextList[i].Tracks = after
+	if nextList[i].CoverURL != "" && len(after) == 0 {
+		nextList[i].CoverURL = ""
 	}
-	normalizeLocalPlaylist(&a.localPlaylists[i])
+	normalizeLocalPlaylist(&nextList[i])
+	if err := a.saveLocalPlaylistsList(nextList); err != nil {
+		return err
+	}
+	a.localPlaylists = nextList
 	a.syncLocalPlaylists()
-	a.saveLocalPlaylists()
-	return true
+	return nil
 }

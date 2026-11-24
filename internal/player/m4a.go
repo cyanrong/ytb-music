@@ -25,6 +25,7 @@ type m4aStream struct {
 	dec     audio.Decoder
 	pos     int64 // the frame decoded next
 	spec    *spectrum
+	writer  *specWriter
 	drop    func() // lets the download go, as the stream closes
 	closeMu sync.Once
 }
@@ -34,8 +35,8 @@ func openM4AStream(dl *download) (*m4aStream, error) {
 	if err != nil {
 		return nil, err
 	}
-	s := &m4aStream{dl: dl, dec: dec, drop: dl.Close}
-	s.spec = newSpectrum(dec.SampleRate(), max(dec.Len(), 0))
+	spec := newSpectrum(dec.SampleRate(), max(dec.Len(), 0))
+	s := &m4aStream{dl: dl, dec: dec, spec: spec, writer: newSpecWriter(spec), drop: dl.Close}
 	return s, nil
 }
 
@@ -46,7 +47,7 @@ func (s *m4aStream) Len() int64      { return s.dec.Len() }
 func (s *m4aStream) Read(dst []float32) (int, error) {
 	n, err := s.dec.Read(dst)
 	if n > 0 {
-		s.spec.feed(s.pos, dst[:n])
+		s.writer.feed(s.pos, dst[:n])
 		s.pos += int64(n / 2)
 	}
 	return n, err

@@ -52,6 +52,7 @@ type roonSubscriber struct {
 type Server struct {
 	mu         sync.RWMutex
 	listenAddr string
+	lanIP      string
 	ln         net.Listener
 	httpSrv    *http.Server
 	secret     string
@@ -86,29 +87,69 @@ func NewServer(listenAddr string) (*Server, error) {
 	return s, nil
 }
 
-// Rebind restarts the HTTP listener on a new host:port if changed.
+// Rebind restarts the HTTP listener on a new host:port if changed, handling
+// overlapping same-port loopback <-> wildcard transitions and restoring the
+// previous listener if binding the replacement fails.
 func (s *Server) Rebind(listenAddr string) error {
 	listenAddr = strings.TrimSpace(listenAddr)
 	if listenAddr == "" {
 		listenAddr = DefaultListenAddr
 	}
-	if _, _, err := net.SplitHostPort(listenAddr); err != nil {
+	newHost, newPort, err := net.SplitHostPort(listenAddr)
+	if err != nil {
 		return fmt.Errorf("无效的桥接监听地址 %q: %w", listenAddr, err)
 	}
+	if _, err := net.ResolveTCPAddr("tcp", listenAddr); err != nil {
+		return fmt.Errorf("无效的桥接监听地址 %q: %w", listenAddr, err)
+	}
+	_ = newHost
 
 	s.mu.Lock()
 	if s.ln != nil && s.listenAddr == listenAddr {
 		s.mu.Unlock()
 		return nil
 	}
+	oldAddr := s.listenAddr
 	oldSrv := s.httpSrv
 	oldLn := s.ln
+	_, oldPort, _ := net.SplitHostPort(oldAddr)
+	overlapSamePort := oldLn != nil && newPort != "0" && oldPort == newPort
+	if overlapSamePort {
+		s.httpSrv = nil
+		s.ln = nil
+	}
 	s.mu.Unlock()
+
+	if overlapSamePort {
+		if oldSrv != nil {
+			_ = oldSrv.Close()
+		} else if oldLn != nil {
+			_ = oldLn.Close()
+		}
+	}
 
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
+		if overlapSamePort && oldAddr != "" {
+			if restoredLn, rerr := net.Listen("tcp", oldAddr); rerr == nil {
+				s.installListener(restoredLn)
+			}
+		}
 		return err
 	}
+
+	if !overlapSamePort {
+		if oldSrv != nil {
+			_ = oldSrv.Close()
+		} else if oldLn != nil {
+			_ = oldLn.Close()
+		}
+	}
+	s.installListener(ln)
+	return nil
+}
+
+func (s *Server) installListener(ln net.Listener) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/hqp/", s.handleHQP)
 	mux.HandleFunc("/roon/live.wav", s.handleRoonWAV)
@@ -121,23 +162,16 @@ func (s *Server) Rebind(listenAddr string) error {
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
-
+	lanIP := outboundIPFor("")
 	s.mu.Lock()
 	s.listenAddr = ln.Addr().String()
+	s.lanIP = lanIP
 	s.ln = ln
 	s.httpSrv = srv
 	s.mu.Unlock()
-
-	if oldSrv != nil {
-		_ = oldSrv.Close()
-	} else if oldLn != nil {
-		_ = oldLn.Close()
-	}
-
 	go func() {
 		_ = srv.Serve(ln)
 	}()
-	return nil
 }
 
 func (s *Server) Close() error {
@@ -175,14 +209,21 @@ func (s *Server) SetOnListeners(fn func(int)) {
 
 // BaseURL returns the HTTP origin reachable by peerAddr (e.g. HQPlayer's host:port).
 func (s *Server) BaseURL(peerAddr string) string {
-	addr := s.Addr()
+	s.mu.RLock()
+	addr := s.listenAddr
+	cachedLAN := s.lanIP
+	s.mu.RUnlock()
+
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		return "http://" + DefaultListenAddr
 	}
 	ip := net.ParseIP(host)
 	if host == "" || host == "0.0.0.0" || host == "::" || (ip != nil && ip.IsUnspecified()) {
-		resolved := outboundIPFor(peerAddr)
+		resolved := cachedLAN
+		if peerAddr != "" || resolved == "" {
+			resolved = outboundIPFor(peerAddr)
+		}
 		return "http://" + net.JoinHostPort(resolved, port)
 	}
 	return "http://" + net.JoinHostPort(host, port)
@@ -209,6 +250,31 @@ func outboundIPFor(peerAddr string) string {
 			defer c.Close()
 			if ua, ok := c.LocalAddr().(*net.UDPAddr); ok && ua.IP != nil && !ua.IP.IsUnspecified() {
 				return ua.IP.String()
+			}
+		}
+	}
+	// When bound to 0.0.0.0 without a discovered Core, determine the primary LAN IPv4 address.
+	if c, err := net.DialTimeout("udp4", "192.0.2.1:80", 200*time.Millisecond); err == nil {
+		defer c.Close()
+		if ua, ok := c.LocalAddr().(*net.UDPAddr); ok && ua.IP != nil && !ua.IP.IsLoopback() && !ua.IP.IsUnspecified() {
+			return ua.IP.String()
+		}
+	}
+	if ifaces, err := net.Interfaces(); err == nil {
+		for _, iface := range ifaces {
+			if iface.Flags&net.FlagUp == 0 || iface.Flags&net.FlagLoopback != 0 {
+				continue
+			}
+			addrs, aerr := iface.Addrs()
+			if aerr != nil {
+				continue
+			}
+			for _, a := range addrs {
+				if ipn, ok := a.(*net.IPNet); ok && ipn.IP != nil {
+					if ip4 := ipn.IP.To4(); ip4 != nil && !ip4.IsLoopback() && !ip4.IsLinkLocalUnicast() {
+						return ip4.String()
+					}
+				}
 			}
 		}
 	}
@@ -579,10 +645,9 @@ func (s *Server) currentStreamTitle() string {
 
 func (s *Server) runRoonClock() {
 	const (
-		tickDur        = 20 * time.Millisecond
-		wavFramesTick  = roonTargetRate / 50 // 882 frames per 20ms
-		wavBytesTick   = wavFramesTick * 6   // 5292 bytes of 24-bit stereo
-		aacFrameDurNs  = int64(1024*1e9) / roonTargetRate
+		tickDur       = 20 * time.Millisecond
+		wavFramesTick = roonTargetRate / 50 // 882 frames per 20ms
+		wavBytesTick  = wavFramesTick * 6   // 5292 bytes of 24-bit stereo
 	)
 	silencePCM := make([]byte, wavBytesTick)
 	ticker := time.NewTicker(tickDur)
@@ -630,11 +695,22 @@ func (s *Server) runRoonClock() {
 			}
 
 			var aacFrames [][]byte
-			for aacAccumNs >= aacFrameDurNs {
-				aacAccumNs -= aacFrameDurNs
+			aacRate := roonTargetRate
+			if rs != nil {
+				if sr := rs.aacSampleRate(); sr > 0 {
+					aacRate = sr
+				}
+			}
+			frameDurNs := int64(1024*1e9) / int64(aacRate)
+			for aacAccumNs >= frameDurNs {
+				aacAccumNs -= frameDurNs
 				if rs != nil && hasAAC {
 					if pkt := rs.pullADTS(!hasWAV); len(pkt) > 0 {
 						aacFrames = append(aacFrames, pkt)
+						if sr := rs.aacSampleRate(); sr > 0 && sr != aacRate {
+							aacRate = sr
+							frameDurNs = int64(1024*1e9) / int64(aacRate)
+						}
 						continue
 					}
 				}

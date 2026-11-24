@@ -44,6 +44,7 @@ type SourceTrack struct {
 	Album      string
 	CoverURL   string
 	DurationMs int64
+	Missing    bool // omitted by NetEase song/detail (taken down or unavailable)
 }
 
 func (t SourceTrack) DisplayArtist() string {
@@ -82,7 +83,15 @@ func newNetEaseClient() *http.Client {
 			if req.Context().Err() != nil {
 				return nil, err
 			}
-			return ytm.Transport().RoundTrip(req)
+			retryReq := req.Clone(req.Context())
+			if req.GetBody != nil {
+				body, berr := req.GetBody()
+				if berr != nil {
+					return nil, err
+				}
+				retryReq.Body = body
+			}
+			return ytm.Transport().RoundTrip(retryReq)
 		}),
 	}
 }
@@ -154,27 +163,35 @@ func isNetEaseMusicHost(host string) bool {
 	return host == "music.163.com" || strings.HasSuffix(host, ".music.163.com")
 }
 
+func isPlaylistRoute(path string) bool {
+	p := strings.Trim(strings.ToLower(path), "/")
+	return p == "playlist" || p == "m/playlist" || p == "my/m/music/playlist" || strings.HasSuffix(p, "/playlist")
+}
+
 func extractIDFromURL(u *url.URL) string {
 	if u == nil {
 		return ""
 	}
-	if id := u.Query().Get("id"); digitsOnlyRe.MatchString(id) {
-		return id
-	}
 	if m := playlistPathRe.FindStringSubmatch(u.Path); m != nil {
 		return m[1]
 	}
+	if isPlaylistRoute(u.Path) {
+		if id := u.Query().Get("id"); digitsOnlyRe.MatchString(id) {
+			return id
+		}
+	}
 	if u.Fragment != "" {
 		frag := u.Fragment
-		if _, q, ok := strings.Cut(frag, "?"); ok {
-			if vals, err := url.ParseQuery(q); err == nil {
+		fragPath, fragQuery, hasQ := strings.Cut(frag, "?")
+		if m := playlistPathRe.FindStringSubmatch(fragPath); m != nil {
+			return m[1]
+		}
+		if hasQ && isPlaylistRoute(fragPath) {
+			if vals, err := url.ParseQuery(fragQuery); err == nil {
 				if id := vals.Get("id"); digitsOnlyRe.MatchString(id) {
 					return id
 				}
 			}
-		}
-		if m := playlistPathRe.FindStringSubmatch(frag); m != nil {
-			return m[1]
 		}
 	}
 	return ""
@@ -324,12 +341,20 @@ func FetchPlaylist(ctx context.Context, rawInput, rawMusicU string) (*Playlist, 
 	}
 
 	tracks := make([]SourceTrack, 0, len(order))
+	resolved := 0
 	for _, tid := range order {
 		if st, ok := byID[tid]; ok && st.Name != "" {
 			tracks = append(tracks, st)
+			resolved++
+		} else {
+			tracks = append(tracks, SourceTrack{
+				ID:      tid,
+				Name:    fmt.Sprintf("未知曲目 #%d", tid),
+				Missing: true,
+			})
 		}
 	}
-	if len(tracks) == 0 && len(order) > 0 && musicU == "" {
+	if resolved == 0 && len(order) > 0 && musicU == "" {
 		return nil, ErrNeedMusicU
 	}
 

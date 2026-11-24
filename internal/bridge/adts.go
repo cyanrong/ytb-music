@@ -8,14 +8,14 @@ import (
 	"github.com/egoist/mygo/audio/mp4"
 )
 
-// adtsPacket is a single raw AAC-LC frame wrapped in a 7-byte ADTS header.
-type adtsPacket struct {
-	data []byte
+type packetLoc struct {
+	offset int64
+	size   uint32
 }
 
 // aacADTSReader extracts raw AAC frames from either a standard MP4 (`stbl`) or
-// a fragmented DASH MP4 (`moof`/`trun`/`mdat`, as YouTube serves itag 140/141)
-// and wraps each frame in an ADTS header without transcoding.
+// a fragmented DASH MP4 (`moof`/`trun`/`mdat`, as YouTube serves itag 140/141),
+// supports O(1)/indexed sample seeking, and wraps each frame in an ADTS header.
 type aacADTSReader struct {
 	r          io.ReaderAt
 	size       int64
@@ -24,9 +24,11 @@ type aacADTSReader struct {
 	chanCfg    int
 	sampleRate int
 
-	fragmented  bool
-	scanOffset  int64
-	pendingPkts [][]byte
+	fragmented bool
+	scanOffset int64
+	allScanned bool
+	packets    []packetLoc
+	pktCursor  int
 }
 
 var adtsSampleRates = [16]int{
@@ -46,8 +48,6 @@ func openAACADTSReader(r io.ReaderAt, size int64) (*aacADTSReader, error) {
 	freqIdx := int((tr.Config[0]&0x07)<<1 | (tr.Config[1] >> 7))
 	chanCfg := int((tr.Config[1] >> 3) & 0x0f)
 	if aot == 5 || aot == 29 {
-		// SBR / PS AudioSpecificConfig puts extension sampling index next;
-		// base AAC-LC object type is 2.
 		aot = 2
 	}
 	if freqIdx >= 13 || adtsSampleRates[freqIdx] == 0 || chanCfg == 0 {
@@ -63,29 +63,61 @@ func openAACADTSReader(r io.ReaderAt, size int64) (*aacADTSReader, error) {
 		fragmented: tr.Fragmented,
 	}
 	if !tr.Fragmented {
-		pkts, err := extractNonFragmentedAAC(r, size)
+		locs, err := indexNonFragmentedAAC(r, size)
 		if err != nil {
 			return nil, err
 		}
-		ar.pendingPkts = pkts
+		ar.packets = locs
+		ar.allScanned = true
 	}
 	return ar, nil
 }
 
 func (ar *aacADTSReader) SampleRate() int { return ar.sampleRate }
 
+func (ar *aacADTSReader) SilentFrame() []byte {
+	return silentADTSForFreqIdx(ar.freqIdx)
+}
+
+// SeekToSample positions the ADTS cursor at the 1024-sample AAC packet containing sample.
+func (ar *aacADTSReader) SeekToSample(sample int64) error {
+	if sample < 0 {
+		sample = 0
+	}
+	targetIdx := int(sample / 1024)
+	for !ar.allScanned && len(ar.packets) <= targetIdx {
+		if err := ar.indexNextFragment(); err != nil {
+			if errors.Is(err, io.EOF) {
+				ar.allScanned = true
+				break
+			}
+			return err
+		}
+	}
+	ar.pktCursor = min(targetIdx, len(ar.packets))
+	return nil
+}
+
 // NextFrame returns the next ADTS-wrapped AAC frame (1024 PCM samples).
 func (ar *aacADTSReader) NextFrame() ([]byte, error) {
-	for len(ar.pendingPkts) == 0 {
-		if !ar.fragmented {
-			return nil, io.EOF
-		}
-		if err := ar.readNextFragment(); err != nil {
+	for !ar.allScanned && len(ar.packets) <= ar.pktCursor {
+		if err := ar.indexNextFragment(); err != nil {
+			if errors.Is(err, io.EOF) {
+				ar.allScanned = true
+				break
+			}
 			return nil, err
 		}
 	}
-	raw := ar.pendingPkts[0]
-	ar.pendingPkts = ar.pendingPkts[1:]
+	if ar.pktCursor >= len(ar.packets) {
+		return nil, io.EOF
+	}
+	loc := ar.packets[ar.pktCursor]
+	ar.pktCursor++
+	raw := make([]byte, loc.size)
+	if _, err := readFullAt(ar.r, raw, loc.offset); err != nil {
+		return nil, err
+	}
 	return wrapADTS(ar.profile, ar.freqIdx, ar.chanCfg, raw), nil
 }
 
@@ -103,18 +135,25 @@ func wrapADTS(profile, freqIdx, chanCfg int, raw []byte) []byte {
 	return out
 }
 
-// silentADTSFrame44kStereo is a valid MPEG-4 AAC-LC 44.1kHz stereo silent
-// access unit (SCE/CPE + END syntax element) wrapped in a 7-byte ADTS header.
-var silentADTSFrame44kStereo = wrapADTS(1, 4, 2, []byte{0x21, 0x00, 0x49, 0x90, 0x02, 0x19, 0x00, 0x23, 0x80})
+var silentAACPayload = []byte{0x21, 0x00, 0x49, 0x90, 0x02, 0x19, 0x00, 0x23, 0x80}
 
-func (ar *aacADTSReader) readNextFragment() error {
+var silentADTSFrame44kStereo = silentADTSForFreqIdx(4)
+
+func silentADTSForFreqIdx(freqIdx int) []byte {
+	if freqIdx < 0 || freqIdx >= 13 {
+		freqIdx = 4
+	}
+	return wrapADTS(1, freqIdx, 2, silentAACPayload)
+}
+
+func (ar *aacADTSReader) indexNextFragment() error {
 	var hdr [16]byte
 	var moofOff, moofEnd int64
 	for {
 		if ar.size > 0 && ar.scanOffset >= ar.size {
 			return io.EOF
 		}
-		boxType, boxSize, headerLen, err := readMP4BoxHeader(ar.r, ar.scanOffset, ar.size, hdr[:])
+		boxType, boxSize, _, err := readMP4BoxHeader(ar.r, ar.scanOffset, ar.size, hdr[:])
 		if err != nil {
 			return err
 		}
@@ -126,7 +165,6 @@ func (ar *aacADTSReader) readNextFragment() error {
 			break
 		}
 		ar.scanOffset = nextOff
-		_ = headerLen
 	}
 
 	sizes, dataOffset, hasDataOffset, err := parseMoofTrun(ar.r, moofOff, moofEnd)
@@ -137,7 +175,6 @@ func (ar *aacADTSReader) readNextFragment() error {
 		return nil
 	}
 
-	// Locate mdat payload if trun did not specify data_offset relative to moof.
 	payloadPos := moofOff + dataOffset
 	if !hasDataOffset {
 		for {
@@ -156,7 +193,6 @@ func (ar *aacADTSReader) readNextFragment() error {
 			ar.scanOffset += boxSize
 		}
 	} else {
-		// Advance scanOffset past mdat box so next call lands on the next moof.
 		for ar.size <= 0 || ar.scanOffset < ar.size {
 			boxType, boxSize, _, err := readMP4BoxHeader(ar.r, ar.scanOffset, ar.size, hdr[:])
 			if err != nil {
@@ -169,26 +205,18 @@ func (ar *aacADTSReader) readNextFragment() error {
 		}
 	}
 
-	pkts := make([][]byte, 0, len(sizes))
 	off := payloadPos
 	for _, sz := range sizes {
-		if sz <= 0 || sz > 1<<20 {
-			continue
+		if sz > 0 && sz <= 1<<20 {
+			ar.packets = append(ar.packets, packetLoc{offset: off, size: sz})
 		}
-		buf := make([]byte, sz)
-		if _, err := readFullAt(ar.r, buf, off); err != nil {
-			return err
-		}
-		pkts = append(pkts, buf)
 		off += int64(sz)
 	}
-	ar.pendingPkts = pkts
 	return nil
 }
 
 func parseMoofTrun(r io.ReaderAt, moofOff, moofEnd int64) (sizes []uint32, dataOffset int64, hasDataOffset bool, err error) {
 	var hdr [16]byte
-	// Walk children of moof -> traf -> trun.
 	pos := moofOff + 8
 	for pos+8 <= moofEnd {
 		boxType, boxSize, headerLen, berr := readMP4BoxHeader(r, pos, moofEnd, hdr[:])
@@ -213,16 +241,16 @@ func parseMoofTrun(r io.ReaderAt, moofOff, moofEnd int64) (sizes []uint32, dataO
 					if len(cBody) >= 8 {
 						flags := uint32(cBody[1])<<16 | uint32(cBody[2])<<8 | uint32(cBody[3])
 						idx := 8
-						if flags&0x000001 != 0 { // base-data-offset-present
+						if flags&0x000001 != 0 {
 							idx += 8
 						}
-						if flags&0x000002 != 0 { // sample-description-index-present
+						if flags&0x000002 != 0 {
 							idx += 4
 						}
-						if flags&0x000008 != 0 { // default-sample-duration-present
+						if flags&0x000008 != 0 {
 							idx += 4
 						}
-						if flags&0x000010 != 0 && idx+4 <= len(cBody) { // default-sample-size-present
+						if flags&0x000010 != 0 && idx+4 <= len(cBody) {
 							defaultSampleSize = binary.BigEndian.Uint32(cBody[idx : idx+4])
 						}
 					}
@@ -270,8 +298,7 @@ func parseMoofTrun(r io.ReaderAt, moofOff, moofEnd int64) (sizes []uint32, dataO
 	return sizes, dataOffset, hasDataOffset, nil
 }
 
-func extractNonFragmentedAAC(r io.ReaderAt, size int64) ([][]byte, error) {
-	// Fallback: non-fragmented MP4s are decoded cleanly via WAV; if needed we scan stbl.
+func indexNonFragmentedAAC(r io.ReaderAt, size int64) ([]packetLoc, error) {
 	var hdr [16]byte
 	var walk func(start, end int64) (stsz []uint32, chunks []int64, stsc [][3]uint32)
 	walk = func(start, end int64) (stsz []uint32, chunks []int64, stsc [][3]uint32) {
@@ -351,7 +378,7 @@ func extractNonFragmentedAAC(r io.ReaderAt, size int64) ([][]byte, error) {
 	if len(stsz) == 0 || len(chunks) == 0 || len(stsc) == 0 {
 		return nil, errors.New("bridge: incomplete MP4 sample table")
 	}
-	var pkts [][]byte
+	locs := make([]packetLoc, 0, len(stsz))
 	sampleIdx := 0
 	for chunkIdx, chunkOff := range chunks {
 		chunkNum := uint32(chunkIdx + 1)
@@ -370,15 +397,13 @@ func extractNonFragmentedAAC(r io.ReaderAt, size int64) ([][]byte, error) {
 			}
 			sz := stsz[sampleIdx]
 			sampleIdx++
-			buf := make([]byte, sz)
-			if _, err := readFullAt(r, buf, off); err != nil {
-				return pkts, err
+			if sz > 0 {
+				locs = append(locs, packetLoc{offset: off, size: sz})
 			}
-			pkts = append(pkts, buf)
 			off += int64(sz)
 		}
 	}
-	return pkts, nil
+	return locs, nil
 }
 
 func readMP4BoxHeader(r io.ReaderAt, off, limit int64, hdr []byte) (boxType string, boxSize, headerLen int64, err error) {

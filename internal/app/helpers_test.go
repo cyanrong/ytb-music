@@ -2,7 +2,11 @@ package app
 
 import (
 	"errors"
+	"time"
+
 	"github.com/egoist/mygo/ui"
+
+	"ytb-music/internal/bridge"
 	"ytb-music/internal/browsercookies"
 	"ytb-music/internal/player"
 	"ytb-music/internal/ytm"
@@ -21,9 +25,10 @@ func newTestApp() *app {
 	return a
 }
 
-// Tests never read the Chrome of the machine they run on.
+// Tests never read the Chrome of the machine they run on or multicast SOOD on the LAN.
 func init() {
 	browserProfiles = func() ([]browsercookies.Profile, error) { return nil, nil }
 	browserIcon = func(string) *ui.Bitmap { return nil }
 	videoURLFor = func(string, int, int) (string, error) { return "", errors.New("offline") }
+	bridge.DiscoverSOODFunc = func(time.Duration) (string, string, error) { return "", "", errors.New("offline") }
 }

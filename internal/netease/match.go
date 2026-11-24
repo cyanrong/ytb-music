@@ -79,6 +79,9 @@ func MatchTracks(ctx context.Context, src []SourceTrack, workers int, search Sea
 
 func matchOne(ctx context.Context, idx int, st SourceTrack, search SearchFunc) MatchResult {
 	res := MatchResult{Index: idx, Source: st}
+	if st.Missing || strings.TrimSpace(st.Name) == "" {
+		return res
+	}
 	queries := buildQueries(st)
 	var best ytm.Track
 	bestScore := -1000
@@ -92,10 +95,13 @@ func matchOne(ctx context.Context, idx int, st SourceTrack, search SearchFunc) M
 			continue
 		}
 		for _, c := range cands {
-			if c.ID == "" {
+			if !c.Playable() {
 				continue
 			}
-			sc := scoreCandidate(st, c)
+			sc, hasTitle := scoreCandidate(st, c)
+			if !hasTitle {
+				continue
+			}
 			if sc > bestScore {
 				bestScore = sc
 				best = c
@@ -105,7 +111,7 @@ func matchOne(ctx context.Context, idx int, st SourceTrack, search SearchFunc) M
 			break
 		}
 	}
-	if bestScore >= minAcceptScore && best.ID != "" {
+	if bestScore >= minAcceptScore && best.Playable() {
 		res.Track = best
 		res.Matched = true
 		res.Score = bestScore
@@ -149,7 +155,7 @@ var (
 	remixRe   = regexp.MustCompile(`(?i)\bremix\b|混音|DJ版`)
 )
 
-func scoreCandidate(src SourceTrack, cand ytm.Track) int {
+func scoreCandidate(src SourceTrack, cand ytm.Track) (int, bool) {
 	score := 0
 	srcFull := src.Name + " " + src.Alias
 	candFull := cand.Name + " " + cand.Album.Name
@@ -170,15 +176,20 @@ func scoreCandidate(src SourceTrack, cand ytm.Track) int {
 	sAlias := normText(stripBenignBrackets(src.Alias))
 	cTitle := normText(stripBenignBrackets(cand.Name))
 
+	titleMatched := false
 	switch {
 	case sTitle != "" && cTitle == sTitle:
 		score += 55
+		titleMatched = true
 	case sAlias != "" && cTitle == sAlias:
 		score += 50
-	case sTitle != "" && (strings.Contains(cTitle, sTitle) || strings.Contains(sTitle, cTitle)):
+		titleMatched = true
+	case sTitle != "" && cTitle != "" && (strings.Contains(cTitle, sTitle) || strings.Contains(sTitle, cTitle)):
 		score += 32
-	case sAlias != "" && (strings.Contains(cTitle, sAlias) || strings.Contains(sAlias, cTitle)):
+		titleMatched = true
+	case sAlias != "" && cTitle != "" && (strings.Contains(cTitle, sAlias) || strings.Contains(sAlias, cTitle)):
 		score += 28
+		titleMatched = true
 	default:
 		score -= 15
 	}
@@ -231,7 +242,7 @@ func scoreCandidate(src SourceTrack, cand ytm.Track) int {
 	if cand.VideoType == ytm.VideoATV {
 		score += 12
 	}
-	return score
+	return score, titleMatched
 }
 
 func stripBenignBrackets(s string) string {

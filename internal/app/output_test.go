@@ -57,6 +57,9 @@ func TestPlayerBarOutputPopoverSwitchesBackends(t *testing.T) {
 	if a.settings.OutputMode != outputLocal || a.pl.Backend() != nil {
 		t.Fatalf("mode=%q backend=%v, want local nil backend", a.settings.OutputMode, a.pl.Backend())
 	}
+	if a.audio.srv != nil || a.audio.roonMgr != nil || a.audio.hqp != nil {
+		t.Fatalf("switching back to local left external services running: srv=%v roon=%v hqp=%v", a.audio.srv, a.audio.roonMgr, a.audio.hqp)
+	}
 }
 
 // Probing HQPlayer and copying the Roon Live Radio stream URL in Settings update status and clipboard off the UI thread.

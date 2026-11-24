@@ -103,8 +103,8 @@ type HQPlayerBackend struct {
 	addr    string
 	onState func(connected bool, detail string)
 
-	cmdMu sync.Mutex
-	conn  *hqpConn
+	cmdMu   sync.Mutex
+	connPtr atomic.Pointer[hqpConn]
 
 	sinkMu sync.Mutex
 	epoch  atomic.Uint64
@@ -134,20 +134,36 @@ func (b *HQPlayerBackend) SetAddr(addr string) {
 	b.addr = norm
 	b.cfgMu.Unlock()
 	if changed {
-		b.Disconnect()
+		b.DisconnectAsync(true)
 	}
 }
 
+// Disconnect closes any active TCP control socket immediately without waiting
+// on cmdMu so callers never block behind an in-flight <PlaylistAdd>.
 func (b *HQPlayerBackend) Disconnect() {
-	b.cmdMu.Lock()
-	c := b.conn
-	b.conn = nil
-	b.cmdMu.Unlock()
-	if c != nil {
-		c.closed.Store(true)
-		_ = c.conn.Close()
+	hc := b.connPtr.Swap(nil)
+	if hc != nil {
+		hc.closed.Store(true)
+		_ = hc.conn.Close()
 	}
 	b.emitState(false, "未连接")
+}
+
+// DisconnectAsync stops playback if requested and tears down the control socket off the UI thread.
+func (b *HQPlayerBackend) DisconnectAsync(sendStop bool) {
+	hc := b.connPtr.Swap(nil)
+	if hc == nil {
+		return
+	}
+	go func() {
+		if sendStop && !hc.closed.Load() {
+			_ = hc.conn.SetWriteDeadline(time.Now().Add(800 * time.Millisecond))
+			_, _ = hc.conn.Write([]byte(xmlDecl + `<Stop/>`))
+		}
+		hc.closed.Store(true)
+		_ = hc.conn.Close()
+		b.emitState(false, "未连接")
+	}()
 }
 
 func (b *HQPlayerBackend) emitState(ok bool, detail string) {
@@ -162,8 +178,8 @@ func (b *HQPlayerBackend) emitState(ok bool, detail string) {
 // ensureConnLocked establishes and initializes the persistent TCP 4321 session.
 // Caller must hold b.cmdMu.
 func (b *HQPlayerBackend) ensureConnLocked(ctx context.Context) (*hqpConn, error) {
-	if b.conn != nil && !b.conn.closed.Load() {
-		return b.conn, nil
+	if cur := b.connPtr.Load(); cur != nil && !cur.closed.Load() {
+		return cur, nil
 	}
 	addr := b.Addr()
 	d := net.Dialer{Timeout: 3 * time.Second}
@@ -198,9 +214,13 @@ func (b *HQPlayerBackend) ensureConnLocked(ctx context.Context) (*hqpConn, error
 			hc.volMaxDB = min(0.0, mx)
 		}
 	}
-	_, _ = b.sendLocked(ctx, hc, "Status", `<Status subscribe="1"/>`, 3*time.Second)
+	if _, err := b.sendLocked(ctx, hc, "Status", `<Status subscribe="1"/>`, 3*time.Second); err != nil {
+		hc.closed.Store(true)
+		_ = hc.conn.Close()
+		return nil, err
+	}
 
-	b.conn = hc
+	b.connPtr.Store(hc)
 	b.emitState(true, "已连接 "+hc.product)
 	return hc, nil
 }
@@ -212,6 +232,7 @@ func (b *HQPlayerBackend) readLoop(hc *hqpConn) {
 		if err != nil {
 			hc.closed.Store(true)
 			_ = hc.conn.Close()
+			b.connPtr.CompareAndSwap(hc, nil)
 			hc.waitMu.Lock()
 			ch := hc.waitCh
 			hc.waitCh = nil
@@ -231,7 +252,6 @@ func (b *HQPlayerBackend) readLoop(hc *hqpConn) {
 			tag = parsedTag
 		}
 
-		// Deliver solicited command response if a waiter matches.
 		hc.waitMu.Lock()
 		ch := hc.waitCh
 		wTag := hc.waitTag
@@ -245,7 +265,6 @@ func (b *HQPlayerBackend) readLoop(hc *hqpConn) {
 			ch <- xmlReply{tag: tag, attrs: attrs}
 		}
 
-		// Always route <Status .../> frames to active sink position/EOF tracking.
 		if tag == "Status" {
 			b.onStatusFrame(attrs)
 		}
@@ -273,6 +292,13 @@ func (b *HQPlayerBackend) sendLocked(ctx context.Context, hc *hqpConn, expectTag
 		hc.waitMu.Unlock()
 	}()
 
+	stopCancel := context.AfterFunc(ctx, func() {
+		// Unblock any stalled socket write/read immediately upon context cancellation.
+		hc.closed.Store(true)
+		_ = hc.conn.Close()
+	})
+	defer stopCancel()
+
 	_ = hc.conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
 	if _, err := hc.conn.Write([]byte(xmlDecl + xmlBody)); err != nil {
 		hc.closed.Store(true)
@@ -289,6 +315,9 @@ func (b *HQPlayerBackend) sendLocked(ctx context.Context, hc *hqpConn, expectTag
 		return xmlReply{}, fmt.Errorf("HQPlayer 指令 <%s> 响应超时", expectTag)
 	case rep := <-ch:
 		if rep.err != nil {
+			if ctx.Err() != nil {
+				return xmlReply{}, ctx.Err()
+			}
 			return xmlReply{}, rep.err
 		}
 		if strings.EqualFold(rep.attrs["result"], "Error") || rep.tag == "Error" {
@@ -296,7 +325,6 @@ func (b *HQPlayerBackend) sendLocked(ctx context.Context, hc *hqpConn, expectTag
 			if errText == "" {
 				errText = rep.attrs["error"]
 			}
-			// HQPlayer returns GetAlbumGain error on <Volume> when playlist is empty.
 			if expectTag == "Volume" && strings.Contains(errText, "GetAlbumGain") {
 				return rep, nil
 			}
@@ -309,17 +337,19 @@ func (b *HQPlayerBackend) sendLocked(ctx context.Context, hc *hqpConn, expectTag
 	}
 }
 
-// execWithReconnect runs one command, reconnecting once if an idle TCP socket dropped.
 func (b *HQPlayerBackend) execWithReconnect(ctx context.Context, expectTag, xmlBody string, timeout time.Duration) (xmlReply, error) {
 	b.cmdMu.Lock()
 	defer b.cmdMu.Unlock()
+	if ctx.Err() != nil {
+		return xmlReply{}, ctx.Err()
+	}
 	hc, err := b.ensureConnLocked(ctx)
 	if err != nil {
 		return xmlReply{}, err
 	}
 	rep, err := b.sendLocked(ctx, hc, expectTag, xmlBody, timeout)
 	if err != nil && ctx.Err() == nil && hc.closed.Load() {
-		b.conn = nil
+		b.connPtr.CompareAndSwap(hc, nil)
 		hc, err = b.ensureConnLocked(ctx)
 		if err != nil {
 			return xmlReply{}, err
@@ -371,14 +401,10 @@ func (b *HQPlayerBackend) Open(ctx context.Context, src player.TrackSource) (pla
 		epoch:    epoch,
 		duration: src.Duration,
 		posAt:    time.Now(),
-		volCh:    make(chan float64, 1),
+		wakeCh:   make(chan struct{}, 1),
 		stopCh:   make(chan struct{}),
 	}
-	b.sinkMu.Lock()
-	b.active = sink
-	b.sinkMu.Unlock()
-
-	go sink.volWorker()
+	go sink.transportWorker()
 	sink.SetSinkVolume(src.Gain)
 	return sink, nil
 }
@@ -416,12 +442,26 @@ type hqpSink struct {
 	onEnd           func()
 	endedOnce       bool
 
-	volCh  chan float64
+	// Coalesced ordered desired commands processed by transportWorker.
+	playDirty  bool
+	wantPlay   bool
+	seekDirty  bool
+	seekTarget time.Duration
+	volDirty   bool
+	volTarget  float64
+
+	wakeCh chan struct{}
 	stopCh chan struct{}
 }
 
 func (s *hqpSink) isCurrent() bool {
 	return s.backend.epoch.Load() == s.epoch
+}
+
+func (s *hqpSink) Activate() {
+	s.backend.sinkMu.Lock()
+	s.backend.active = s
+	s.backend.sinkMu.Unlock()
 }
 
 func (s *hqpSink) DirectTransport() bool { return true }
@@ -459,6 +499,13 @@ func (s *hqpSink) OnSinkEnd(fn func()) {
 	s.mu.Unlock()
 }
 
+func (s *hqpSink) wakeWorker() {
+	select {
+	case s.wakeCh <- struct{}{}:
+	default:
+	}
+}
+
 func (s *hqpSink) Play() {
 	s.mu.Lock()
 	if s.closed {
@@ -466,25 +513,19 @@ func (s *hqpSink) Play() {
 		return
 	}
 	s.playing = true
+	s.endedOnce = false
+	s.sawPlaying = false
 	s.playRequestedAt = time.Now()
 	s.posAt = time.Now()
-	seek := s.pendingSeek
-	doSeek := s.hasPendingSeek
-	s.hasPendingSeek = false
+	s.playDirty = true
+	s.wantPlay = true
+	if s.hasPendingSeek {
+		s.seekDirty = true
+		s.seekTarget = s.pendingSeek
+		s.hasPendingSeek = false
+	}
 	s.mu.Unlock()
-
-	go func() {
-		if !s.isCurrent() {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 6*time.Second)
-		defer cancel()
-		_, err := s.backend.execWithReconnect(ctx, "Play", `<Play/>`, 5*time.Second)
-		if err == nil && doSeek && seek > 0 && s.isCurrent() {
-			cmd := fmt.Sprintf(`<Seek position="%.2f"/>`, seek.Seconds())
-			_, _ = s.backend.execWithReconnect(ctx, "Seek", cmd, 5*time.Second)
-		}
-	}()
+	s.wakeWorker()
 }
 
 func (s *hqpSink) Pause() {
@@ -498,16 +539,10 @@ func (s *hqpSink) Pause() {
 	}
 	s.playing = false
 	s.hqState = 1
+	s.playDirty = true
+	s.wantPlay = false
 	s.mu.Unlock()
-
-	go func() {
-		if !s.isCurrent() {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-		defer cancel()
-		_, _ = s.backend.execWithReconnect(ctx, "Pause", `<Pause/>`, 3*time.Second)
-	}()
+	s.wakeWorker()
 }
 
 func (s *hqpSink) Seek(t time.Duration) {
@@ -521,51 +556,78 @@ func (s *hqpSink) Seek(t time.Duration) {
 	}
 	s.pos = t
 	s.posAt = time.Now()
+	s.endedOnce = false
+	s.sawPlaying = false
 	if !s.playing {
 		s.pendingSeek = t
 		s.hasPendingSeek = true
+		s.seekDirty = false
 		s.mu.Unlock()
 		return
 	}
 	s.hasPendingSeek = false
+	s.seekDirty = true
+	s.seekTarget = t
 	s.mu.Unlock()
-
-	go func() {
-		if !s.isCurrent() {
-			return
-		}
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		cmd := fmt.Sprintf(`<Seek position="%.2f"/>`, t.Seconds())
-		_, _ = s.backend.execWithReconnect(ctx, "Seek", cmd, 4*time.Second)
-	}()
+	s.wakeWorker()
 }
 
 func (s *hqpSink) SetSinkVolume(v float64) {
-	select {
-	case s.volCh <- v:
-	default:
-		select {
-		case <-s.volCh:
-		default:
-		}
-		select {
-		case s.volCh <- v:
-		default:
-		}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return
 	}
+	s.volDirty = true
+	s.volTarget = v
+	s.mu.Unlock()
+	s.wakeWorker()
 }
 
-func (s *hqpSink) volWorker() {
+// transportWorker executes volume, play/pause, and seek commands strictly in
+// causal order while coalescing rapid scrubs or play/pause toggles.
+func (s *hqpSink) transportWorker() {
 	for {
 		select {
 		case <-s.stopCh:
 			return
-		case g := <-s.volCh:
-			if !s.isCurrent() {
+		case <-s.wakeCh:
+		}
+		for {
+			s.mu.Lock()
+			if s.closed || !s.isCurrent() {
+				s.mu.Unlock()
 				return
 			}
-			s.sendVolume(g)
+			doVol, vol := s.volDirty, s.volTarget
+			s.volDirty = false
+			doPlay, wantPlay := s.playDirty, s.wantPlay
+			s.playDirty = false
+			doSeek, seekTo := s.seekDirty, s.seekTarget
+			s.seekDirty = false
+			s.mu.Unlock()
+
+			if !doVol && !doPlay && !doSeek {
+				break
+			}
+			if doVol {
+				s.sendVolume(vol)
+			}
+			if doPlay {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				if wantPlay {
+					_, _ = s.backend.execWithReconnect(ctx, "Play", `<Play/>`, 4*time.Second)
+				} else {
+					_, _ = s.backend.execWithReconnect(ctx, "Pause", `<Pause/>`, 3*time.Second)
+				}
+				cancel()
+			}
+			if doSeek && (!doPlay || wantPlay) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				cmd := fmt.Sprintf(`<Seek position="%.2f"/>`, seekTo.Seconds())
+				_, _ = s.backend.execWithReconnect(ctx, "Seek", cmd, 4*time.Second)
+				cancel()
+			}
 		}
 	}
 }
@@ -573,7 +635,7 @@ func (s *hqpSink) volWorker() {
 func (s *hqpSink) sendVolume(gain float64) {
 	s.backend.cmdMu.Lock()
 	defer s.backend.cmdMu.Unlock()
-	hc := s.backend.conn
+	hc := s.backend.connPtr.Load()
 	if hc == nil || hc.closed.Load() || !s.isCurrent() {
 		return
 	}
@@ -596,7 +658,7 @@ func (s *hqpSink) updateFromHQP(state int, posSec float64) {
 		if state == 2 {
 			s.sawPlaying = true
 		}
-		if !s.hasPendingSeek && (state == 2 || state == 1) {
+		if !s.hasPendingSeek && !s.seekDirty && (state == 2 || state == 1) {
 			s.pos = time.Duration(posSec * float64(time.Second))
 			s.posAt = time.Now()
 		}
@@ -631,7 +693,6 @@ func (s *hqpSink) Close() {
 	}
 	s.backend.sinkMu.Unlock()
 
-	// Only send <Stop/> if no newer track superseded this sink.
 	if wasPlaying && s.isCurrent() {
 		go func() {
 			if !s.isCurrent() {

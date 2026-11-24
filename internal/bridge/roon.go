@@ -29,6 +29,10 @@ const (
 	roonExtensionID   = "com.ytbmusic.bridge"
 )
 
+// DiscoverSOODFunc locates a Roon Core on the network; tests replace it so UI
+// tests never emit multicast/broadcast UDP traffic.
+var DiscoverSOODFunc = discoverRoonSOOD
+
 // RoonZone describes an output zone reported by Roon Core (such as an HQPlayer zone).
 type RoonZone struct {
 	ZoneID      string `json:"zone_id"`
@@ -38,20 +42,20 @@ type RoonZone struct {
 
 // RoonStatus summarizes the current Roon Core pairing and Live Radio state.
 type RoonStatus struct {
-	Discovered  bool
-	Paired      bool
-	CoreID      string
-	CoreName    string
-	CoreAddr    string
-	Zones       []RoonZone
-	Listeners   int
-	Detail      string
+	Discovered bool
+	Paired     bool
+	CoreID     string
+	CoreName   string
+	CoreAddr   string
+	Zones      []RoonZone
+	Listeners  int
+	Detail     string
 }
 
 type RoonCallbacks struct {
-	GetToken func(coreID string) string
+	GetToken  func(coreID string) string
 	SaveToken func(coreID, token string)
-	OnChange func(RoonStatus)
+	OnChange  func(RoonStatus)
 }
 
 // RoonManager discovers Roon Core via SOOD UDP multicast/localhost, registers
@@ -61,11 +65,14 @@ type RoonManager struct {
 	srv *Server
 	cb  RoonCallbacks
 
-	mu         sync.RWMutex
-	directAddr string // optional host:port override (used in tests or manual setups)
-	status     RoonStatus
-	zonesMap   map[string]RoonZone
-	moo        *mooSession
+	mu            sync.RWMutex
+	directAddr    string
+	status        RoonStatus
+	zonesMap      map[string]RoonZone
+	moo           *mooSession
+	wantPlaying   bool
+	wantZoneID    string
+	startedZoneID string
 
 	stopOnce sync.Once
 	stopCh   chan struct{}
@@ -122,7 +129,11 @@ func (m *RoonManager) Wake() {
 func (m *RoonManager) Close() {
 	m.stopOnce.Do(func() {
 		close(m.stopCh)
+		if m.srv != nil {
+			m.srv.SetOnListeners(nil)
+		}
 		m.mu.Lock()
+		m.wantPlaying = false
 		sess := m.moo
 		m.moo = nil
 		m.mu.Unlock()
@@ -130,6 +141,49 @@ func (m *RoonManager) Close() {
 			sess.Close()
 		}
 	})
+}
+
+// SetPlaybackIntent records whether YTB Music wants Roon's selected zone to be
+// playing our Live Radio station, retrying automatically when pairing/zones arrive.
+func (m *RoonManager) SetPlaybackIntent(wantPlay bool, zoneID string) {
+	m.mu.Lock()
+	zoneChanged := zoneID != "" && zoneID != m.wantZoneID
+	m.wantPlaying = wantPlay
+	if zoneID != "" {
+		m.wantZoneID = zoneID
+	}
+	if !wantPlay {
+		m.mu.Unlock()
+		return
+	}
+	if zoneChanged {
+		m.startedZoneID = ""
+	}
+	zid := m.wantZoneID
+	m.mu.Unlock()
+
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		_ = m.EnsureStationPlaying(ctx, zid)
+	}()
+}
+
+func (m *RoonManager) maybeRetryPendingPlay() {
+	m.mu.RLock()
+	want := m.wantPlaying
+	zid := m.wantZoneID
+	paired := m.status.Paired
+	hasZones := len(m.zonesMap) > 0
+	m.mu.RUnlock()
+	if !want || !paired || !hasZones {
+		return
+	}
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
+		defer cancel()
+		_ = m.EnsureStationPlaying(ctx, zid)
+	}()
 }
 
 func (m *RoonManager) Status() RoonStatus {
@@ -173,7 +227,7 @@ func (m *RoonManager) loop() {
 
 		var coreName string
 		if addr == "" {
-			discAddr, name, err := discoverRoonSOOD(2500 * time.Millisecond)
+			discAddr, name, err := DiscoverSOODFunc(2500 * time.Millisecond)
 			if err != nil || discAddr == "" {
 				m.mu.Lock()
 				m.status.Discovered = false
@@ -228,6 +282,7 @@ func (m *RoonManager) runSession(addr, hintName string) {
 	sess := newMOOSession(ws, m.handleIncomingRequest)
 	m.mu.Lock()
 	m.moo = sess
+	m.startedZoneID = ""
 	m.status.Discovered = true
 	m.status.CoreAddr = addr
 	if hintName != "" {
@@ -244,6 +299,7 @@ func (m *RoonManager) runSession(addr, hintName string) {
 			m.moo = nil
 		}
 		m.status.Paired = false
+		m.startedZoneID = ""
 		m.zonesMap = make(map[string]RoonZone)
 		m.mu.Unlock()
 		m.emit()
@@ -277,11 +333,11 @@ func (m *RoonManager) runSession(addr, hintName string) {
 	}
 
 	regPayload := map[string]any{
-		"extension_id":     roonExtensionID,
-		"display_name":     "YTB Music Bridge",
-		"display_version":  "0.2.0",
-		"publisher":        "YTB Music",
-		"email":            "bridge@ytbmusic.local",
+		"extension_id":      roonExtensionID,
+		"display_name":      "YTB Music Bridge",
+		"display_version":   "0.2.0",
+		"publisher":         "YTB Music",
+		"email":             "bridge@ytbmusic.local",
 		"required_services": []string{"com.roonlabs.transport:2", "com.roonlabs.browse:1"},
 		"provided_services": []string{"com.roonlabs.ping:1", "com.roonlabs.pairing:1"},
 	}
@@ -319,6 +375,8 @@ func (m *RoonManager) runSession(addr, hintName string) {
 
 			if needSub {
 				m.subscribeZones(sess)
+			} else {
+				m.maybeRetryPendingPlay()
 			}
 		}
 	})
@@ -357,9 +415,13 @@ func (m *RoonManager) subscribeZones(sess *mooSession) {
 		}
 		for _, id := range payload.ZonesRemoved {
 			delete(m.zonesMap, id)
+			if m.startedZoneID == id {
+				m.startedZoneID = ""
+			}
 		}
 		m.mu.Unlock()
 		m.emit()
+		m.maybeRetryPendingPlay()
 	})
 }
 
@@ -387,16 +449,15 @@ func (m *RoonManager) handleIncomingRequest(sess *mooSession, msg mooMessage) {
 }
 
 // EnsureStationPlaying locates the "YTB Music" station in Roon's My Live Radio
-// hierarchy and starts playback on zoneID if Roon is not already pulling our stream.
+// hierarchy and starts playback on the resolved target zone when needed.
 func (m *RoonManager) EnsureStationPlaying(ctx context.Context, zoneID string) error {
-	if m.srv != nil && m.srv.ActiveListeners() > 0 {
-		return nil
-	}
 	m.mu.RLock()
 	sess := m.moo
 	paired := m.status.Paired
 	if zoneID == "" {
-		// Pick an HQPlayer zone if available, else the first zone.
+		zoneID = m.wantZoneID
+	}
+	if zoneID == "" {
 		for _, z := range m.zonesMap {
 			if strings.Contains(strings.ToLower(z.DisplayName), "hqplayer") || strings.Contains(strings.ToLower(z.DisplayName), "hqp") {
 				zoneID = z.ZoneID
@@ -407,9 +468,11 @@ func (m *RoonManager) EnsureStationPlaying(ctx context.Context, zoneID string) e
 			}
 		}
 	}
+	zoneInfo, zoneKnown := m.zonesMap[zoneID]
+	alreadyStarted := m.startedZoneID == zoneID && zoneKnown && zoneInfo.State == "playing" && m.srv != nil && m.srv.ActiveListeners() > 0
 	m.mu.RUnlock()
 
-	if sess == nil || !paired || zoneID == "" {
+	if alreadyStarted || sess == nil || !paired || zoneID == "" {
 		return nil
 	}
 
@@ -453,7 +516,6 @@ func (m *RoonManager) EnsureStationPlaying(ctx context.Context, zoneID string) e
 		return nil
 	}
 
-	// Select station item -> if action_list is returned, load and click "Play Now".
 	brMsg, err := sess.Request(ctx, "com.roonlabs.browse:1/browse", map[string]any{
 		"hierarchy":         "internet_radio",
 		"item_key":          stationKey,
@@ -464,9 +526,6 @@ func (m *RoonManager) EnsureStationPlaying(ctx context.Context, zoneID string) e
 	}
 	var brRes struct {
 		Action string `json:"action"`
-		List   *struct {
-			Hint string `json:"hint"`
-		} `json:"list"`
 	}
 	_ = json.Unmarshal(brMsg.Body, &brRes)
 	if brRes.Action == "list" {
@@ -483,14 +542,30 @@ func (m *RoonManager) EnsureStationPlaying(ctx context.Context, zoneID string) e
 				} `json:"items"`
 			}
 			if json.Unmarshal(actLoad.Body, &acts) == nil && len(acts.Items) > 0 {
-				_, _ = sess.Request(ctx, "com.roonlabs.browse:1/browse", map[string]any{
+				playKey := acts.Items[0].ItemKey
+				for _, act := range acts.Items {
+					al := strings.ToLower(act.Title)
+					if strings.Contains(al, "play") || strings.Contains(al, "播放") {
+						playKey = act.ItemKey
+						break
+					}
+				}
+				if _, err := sess.Request(ctx, "com.roonlabs.browse:1/browse", map[string]any{
 					"hierarchy":         "internet_radio",
-					"item_key":          acts.Items[0].ItemKey,
+					"item_key":          playKey,
 					"zone_or_output_id": zoneID,
-				})
+				}); err != nil {
+					return err
+				}
 			}
 		}
 	}
+
+	m.mu.Lock()
+	if m.wantPlaying {
+		m.startedZoneID = zoneID
+	}
+	m.mu.Unlock()
 	return nil
 }
 
@@ -533,11 +608,11 @@ func discoverRoonSOOD(timeout time.Duration) (addr, name string, err error) {
 		if !ok {
 			continue
 		}
-		if props["service_id"] != roonRegistrySvcID && props["http_port"] == "" {
+		if props["service_id"] != roonRegistrySvcID || strings.TrimSpace(props["http_port"]) == "" {
 			continue
 		}
 		port := strings.TrimSpace(props["http_port"])
-		if port == "" {
+		if _, perr := strconv.Atoi(port); perr != nil {
 			continue
 		}
 		host := from.IP.String()
@@ -803,9 +878,20 @@ func NewRoonBackend(srv *Server, mgr *RoonManager, zoneID string) *RoonBackend {
 func (b *RoonBackend) Name() string { return "roon" }
 
 func (b *RoonBackend) SetZoneID(id string) {
+	id = strings.TrimSpace(id)
 	b.mu.Lock()
-	b.zoneID = strings.TrimSpace(id)
+	changed := b.zoneID != id
+	b.zoneID = id
 	b.mu.Unlock()
+	if changed && b.mgr != nil {
+		// If currently playing on Roon, route playback to the newly selected zone.
+		b.srv.hubMu.Lock()
+		rs := b.srv.activeSink
+		b.srv.hubMu.Unlock()
+		if rs != nil && rs.Playing() {
+			b.mgr.SetPlaybackIntent(true, id)
+		}
+	}
 }
 
 func (b *RoonBackend) ZoneID() string {
@@ -822,6 +908,10 @@ func (b *RoonBackend) Open(ctx context.Context, src player.TrackSource) (player.
 	if err != nil {
 		return nil, err
 	}
+	if ctx.Err() != nil {
+		_ = dec.Close()
+		return nil, ctx.Err()
+	}
 	sr := dec.SampleRate()
 	if sr <= 0 {
 		sr = roonTargetRate
@@ -836,35 +926,47 @@ func (b *RoonBackend) Open(ctx context.Context, src player.TrackSource) (player.
 		src:      src,
 		dec:      dec,
 		srcRate:  sr,
+		aacRate:  sr,
 		duration: src.Duration,
 		gain:     src.Gain,
 		title:    title,
 	}
-	b.srv.setActiveRoonSink(rs)
 	return rs, nil
 }
 
 type roonSink struct {
 	backend  *RoonBackend
 	src      player.TrackSource
+	srcRate  int
 	duration time.Duration
 
-	mu        sync.Mutex
-	dec       player.PCMDecoder
-	raw       player.RawStream
-	adts      *aacADTSReader
-	adtsTried bool
-	srcRate   int
-	posFrames int64 // in srcRate frames
-	playing   bool
-	closed    bool
-	gain      float64
-	title     string
-	onEnd     func()
-	endedOnce bool
+	// stateMu guards lightweight playback state accessed on the UI thread;
+	// it is NEVER held across blocking decoder or network reads.
+	stateMu        sync.Mutex
+	posFrames      int64 // in srcRate frames
+	seekGen        uint64
+	seekTarget     int64 // in srcRate frames
+	playing        bool
+	closed         bool
+	gain           float64
+	aacRate        int
+	title          string
+	onEnd          func()
+	endedOnce      bool
 
-	floatBuf []float32
-	pcmBuf   []byte
+	// ioMu guards dec, raw, adts, and decode buffers on the background clock goroutine.
+	ioMu           sync.Mutex
+	dec            player.PCMDecoder
+	raw            player.RawStream
+	adts           *aacADTSReader
+	adtsTried      bool
+	appliedPCMSeek uint64
+	appliedAACSeek uint64
+	floatBuf       []float32
+}
+
+func (s *roonSink) Activate() {
+	s.backend.srv.setActiveRoonSink(s)
 }
 
 func (s *roonSink) DirectTransport() bool { return false }
@@ -872,14 +974,14 @@ func (s *roonSink) DirectTransport() bool { return false }
 func (s *roonSink) Duration() time.Duration { return s.duration }
 
 func (s *roonSink) Playing() bool {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	return s.playing && !s.closed
 }
 
 func (s *roonSink) Position() time.Duration {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	if s.srcRate <= 0 {
 		return 0
 	}
@@ -891,73 +993,97 @@ func (s *roonSink) Position() time.Duration {
 }
 
 func (s *roonSink) Play() {
-	s.mu.Lock()
+	s.stateMu.Lock()
 	if s.closed {
-		s.mu.Unlock()
+		s.stateMu.Unlock()
 		return
 	}
 	s.playing = true
-	s.mu.Unlock()
+	s.endedOnce = false
+	s.stateMu.Unlock()
 
 	if s.backend.mgr != nil {
-		zid := s.backend.ZoneID()
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 4*time.Second)
-			defer cancel()
-			_ = s.backend.mgr.EnsureStationPlaying(ctx, zid)
-		}()
+		s.backend.mgr.SetPlaybackIntent(true, s.backend.ZoneID())
 	}
 }
 
 func (s *roonSink) Pause() {
-	s.mu.Lock()
+	s.stateMu.Lock()
 	s.playing = false
-	s.mu.Unlock()
+	s.stateMu.Unlock()
+
+	if s.backend.mgr != nil {
+		s.backend.mgr.SetPlaybackIntent(false, "")
+	}
 }
 
 func (s *roonSink) Seek(t time.Duration) {
 	if t < 0 {
 		t = 0
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.closed || s.dec == nil {
-		return
-	}
-	target := int64(t.Seconds() * float64(s.srcRate))
-	if s.dec.SetPosition(target) == nil {
+	s.stateMu.Lock()
+	if !s.closed {
+		target := int64(t.Seconds() * float64(s.srcRate))
 		s.posFrames = target
+		s.seekTarget = target
+		s.seekGen++
 		s.endedOnce = false
 	}
+	s.stateMu.Unlock()
 }
 
 func (s *roonSink) SetSinkVolume(v float64) {
-	s.mu.Lock()
+	s.stateMu.Lock()
 	s.gain = v
-	s.mu.Unlock()
+	s.stateMu.Unlock()
 }
 
 func (s *roonSink) OnSinkEnd(fn func()) {
-	s.mu.Lock()
+	s.stateMu.Lock()
 	s.onEnd = fn
-	s.mu.Unlock()
+	s.stateMu.Unlock()
 }
 
 func (s *roonSink) streamTitle() string {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
 	if !s.playing {
 		return "YTB Music (已暂停)"
 	}
 	return s.title
 }
 
+func (s *roonSink) aacSampleRate() int {
+	s.stateMu.Lock()
+	defer s.stateMu.Unlock()
+	if s.aacRate > 0 {
+		return s.aacRate
+	}
+	return roonTargetRate
+}
+
+// pullPCM24 accumulates a full 20ms tick across partial MP4/AAC packet reads
+// without holding stateMu during decoder I/O.
 func (s *roonSink) pullPCM24(outFrames int) []byte {
-	var fireEnd func()
-	s.mu.Lock()
-	if s.closed || !s.playing || s.dec == nil {
-		s.mu.Unlock()
+	s.stateMu.Lock()
+	if s.closed || !s.playing {
+		s.stateMu.Unlock()
 		return nil
+	}
+	wantSeekGen := s.seekGen
+	seekTarget := s.seekTarget
+	gain := s.gain
+	s.stateMu.Unlock()
+
+	s.ioMu.Lock()
+	dec := s.dec
+	if dec == nil {
+		s.ioMu.Unlock()
+		return nil
+	}
+	if s.appliedPCMSeek != wantSeekGen {
+		_ = dec.SetPosition(seekTarget)
+		s.appliedPCMSeek = wantSeekGen
 	}
 
 	needSrc := outFrames
@@ -968,30 +1094,54 @@ func (s *roonSink) pullPCM24(outFrames int) []byte {
 		s.floatBuf = make([]float32, needSrc*2)
 	}
 	buf := s.floatBuf[:needSrc*2]
-	nFloats, err := s.dec.Read(buf)
-	gotSrcFrames := nFloats / 2
-	s.posFrames += int64(gotSrcFrames)
 
-	var out []byte
+	// Loop across decoder reads so packet boundaries never produce short ticks.
+	filledFloats := 0
+	var readErr error
+	for filledFloats < len(buf) {
+		n, err := dec.Read(buf[filledFloats:])
+		filledFloats += n
+		if err != nil {
+			readErr = err
+			break
+		}
+		if n == 0 {
+			readErr = io.EOF
+			break
+		}
+	}
+	gotSrcFrames := filledFloats / 2
+	if filledFloats < len(buf) {
+		clear(buf[filledFloats:])
+	}
+	var samples []float32
 	if gotSrcFrames > 0 {
-		samples := buf[:gotSrcFrames*2]
-		if s.srcRate != roonTargetRate {
-			samples = resampleLinearStereo(samples, gotSrcFrames, outFrames)
+		if s.srcRate == roonTargetRate {
+			samples = buf // full outFrames*2 with zero-padded tail on EOF
+		} else {
+			samples = resampleLinearStereo(buf, needSrc, outFrames)
 		}
-		byteLen := len(samples) / 2 * 6
-		if cap(s.pcmBuf) < byteLen {
-			s.pcmBuf = make([]byte, byteLen)
-		}
-		out = make([]byte, byteLen)
-		encodePCM24LE(out, samples, s.gain)
 	}
+	var out []byte
+	if len(samples) > 0 {
+		out = make([]byte, (len(samples)/2)*6)
+		encodePCM24LE(out, samples, gain)
+	}
+	s.ioMu.Unlock()
 
-	if errors.Is(err, io.EOF) && !s.endedOnce {
-		s.endedOnce = true
-		s.playing = false
-		fireEnd = s.onEnd
+	var fireEnd func()
+	s.stateMu.Lock()
+	if !s.closed {
+		if s.seekGen == wantSeekGen {
+			s.posFrames += int64(gotSrcFrames)
+		}
+		if errors.Is(readErr, io.EOF) && s.seekGen == wantSeekGen && !s.endedOnce {
+			s.endedOnce = true
+			s.playing = false
+			fireEnd = s.onEnd
+		}
 	}
-	s.mu.Unlock()
+	s.stateMu.Unlock()
 
 	if fireEnd != nil {
 		go fireEnd()
@@ -1000,19 +1150,35 @@ func (s *roonSink) pullPCM24(outFrames int) []byte {
 }
 
 func (s *roonSink) pullADTS(advancePos bool) []byte {
-	var fireEnd func()
-	s.mu.Lock()
+	s.stateMu.Lock()
 	if s.closed || !s.playing {
-		s.mu.Unlock()
+		s.stateMu.Unlock()
 		return nil
 	}
+	wantSeekGen := s.seekGen
+	seekTarget := s.seekTarget
+	curFrames := s.posFrames
+	gain := s.gain
+	s.stateMu.Unlock()
+
+	s.ioMu.Lock()
 	if !s.adtsTried && s.src.OpenRaw != nil {
 		s.adtsTried = true
 		if raw, err := s.src.OpenRaw(); err == nil {
 			if sz, serr := raw.Size(); serr == nil && sz > 0 {
 				if ar, aerr := openAACADTSReader(raw, sz); aerr == nil {
+					// Align newly opened ADTS cursor with current track position!
+					initSample := curFrames
+					if s.srcRate > 0 && ar.SampleRate() != s.srcRate {
+						initSample = curFrames * int64(ar.SampleRate()) / int64(s.srcRate)
+					}
+					_ = ar.SeekToSample(initSample)
 					s.raw = raw
 					s.adts = ar
+					s.appliedAACSeek = wantSeekGen
+					s.stateMu.Lock()
+					s.aacRate = ar.SampleRate()
+					s.stateMu.Unlock()
 				} else {
 					_ = raw.Close()
 				}
@@ -1021,20 +1187,46 @@ func (s *roonSink) pullADTS(advancePos bool) []byte {
 			}
 		}
 	}
-	if s.adts == nil {
-		s.mu.Unlock()
+	ar := s.adts
+	if ar == nil {
+		s.ioMu.Unlock()
 		return nil
 	}
-	pkt, err := s.adts.NextFrame()
-	if len(pkt) > 0 && advancePos {
-		s.posFrames += 1024
+	if s.appliedAACSeek != wantSeekGen {
+		sample := seekTarget
+		if s.srcRate > 0 && ar.SampleRate() != s.srcRate {
+			sample = seekTarget * int64(ar.SampleRate()) / int64(s.srcRate)
+		}
+		_ = ar.SeekToSample(sample)
+		s.appliedAACSeek = wantSeekGen
 	}
-	if errors.Is(err, io.EOF) && advancePos && !s.endedOnce {
-		s.endedOnce = true
-		s.playing = false
-		fireEnd = s.onEnd
+
+	pkt, err := ar.NextFrame()
+	if len(pkt) > 0 && gain <= 0.0001 {
+		// Honor mute on passthrough AAC stream while keeping packet cursor aligned.
+		pkt = ar.SilentFrame()
 	}
-	s.mu.Unlock()
+	arRate := ar.SampleRate()
+	s.ioMu.Unlock()
+
+	var fireEnd func()
+	s.stateMu.Lock()
+	if !s.closed {
+		if len(pkt) > 0 && advancePos && s.seekGen == wantSeekGen {
+			step := int64(1024)
+			if arRate > 0 && s.srcRate != arRate {
+				step = int64(1024) * int64(s.srcRate) / int64(arRate)
+			}
+			s.posFrames += step
+		}
+		if errors.Is(err, io.EOF) && advancePos && s.seekGen == wantSeekGen && !s.endedOnce {
+			s.endedOnce = true
+			s.playing = false
+			fireEnd = s.onEnd
+		}
+	}
+	s.stateMu.Unlock()
+
 	if fireEnd != nil {
 		go fireEnd()
 	}
@@ -1064,24 +1256,33 @@ func resampleLinearStereo(in []float32, inFrames, outFrames int) []float32 {
 
 func (s *roonSink) Close() {
 	s.backend.srv.clearActiveRoonSink(s)
-	s.mu.Lock()
+	s.stateMu.Lock()
 	if s.closed {
-		s.mu.Unlock()
+		s.stateMu.Unlock()
 		return
 	}
 	s.closed = true
 	s.playing = false
-	dec := s.dec
-	raw := s.raw
-	s.dec = nil
-	s.raw = nil
-	s.adts = nil
-	s.mu.Unlock()
+	s.stateMu.Unlock()
 
-	if dec != nil {
-		_ = dec.Close()
+	if s.backend.mgr != nil {
+		s.backend.mgr.SetPlaybackIntent(false, "")
 	}
-	if raw != nil {
-		_ = raw.Close()
-	}
+
+	// Release decoders off the UI thread so Close() never blocks behind stalled I/O.
+	go func() {
+		s.ioMu.Lock()
+		dec := s.dec
+		raw := s.raw
+		s.dec = nil
+		s.raw = nil
+		s.adts = nil
+		s.ioMu.Unlock()
+		if dec != nil {
+			_ = dec.Close()
+		}
+		if raw != nil {
+			_ = raw.Close()
+		}
+	}()
 }

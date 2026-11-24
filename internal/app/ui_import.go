@@ -101,7 +101,11 @@ func (a *app) resolveImportCookie() (string, error) {
 	case raw == "":
 		clean = ""
 	case d.musicUMasked && raw == maskedCookiePlaceholder:
-		clean, err = netease.SanitizeMusicU(a.settings.NetEaseMusicU)
+		decrypted, oerr := openSecret(a.settings.NetEaseMusicU)
+		if oerr != nil {
+			return "", oerr
+		}
+		clean, err = netease.SanitizeMusicU(decrypted)
 	default:
 		clean, err = netease.SanitizeMusicU(raw)
 	}
@@ -109,15 +113,16 @@ func (a *app) resolveImportCookie() (string, error) {
 		return "", err
 	}
 	if d.rememberCookie && clean != "" {
-		if a.settings.NetEaseMusicU != clean {
-			a.settings.NetEaseMusicU = clean
-			a.settings.save()
+		sealed, serr := sealSecret(clean)
+		if serr == nil && a.settings.NetEaseMusicU != sealed {
+			a.settings.NetEaseMusicU = sealed
+			_ = a.settings.save()
 		}
 		d.musicUInput = maskedCookiePlaceholder
 		d.musicUMasked = true
 	} else if !d.rememberCookie && a.settings.NetEaseMusicU != "" {
 		a.settings.NetEaseMusicU = ""
-		a.settings.save()
+		_ = a.settings.save()
 	}
 	return clean, nil
 }
@@ -170,7 +175,7 @@ func (a *app) startImport() {
 		src, err := fetchNetEasePlaylist(ctx, rawInput, musicU)
 		if err != nil {
 			a.post(func() {
-				if d.gen != gen || ctx.Err() != nil {
+				if d.gen != gen {
 					return
 				}
 				d.busy = false
@@ -278,9 +283,13 @@ func (a *app) startImport() {
 					return
 				}
 				desc := fmt.Sprintf("导入自网易云歌单 #%s", src.ID)
-				pl := a.createLocalPlaylist(finalName, desc, src.CoverURL, matched)
+				pl, perr := a.createLocalPlaylist(finalName, desc, src.CoverURL, matched)
 				d.busy = false
 				d.cancel = nil
+				if perr != nil {
+					d.err = "保存本地歌单失败：" + perr.Error()
+					return
+				}
 				d.finished = true
 				d.resultID = pl.ID
 				d.resultName = pl.Name
@@ -303,7 +312,7 @@ func (a *app) startImport() {
 		created, err := createPlaylist(finalName)
 		if err != nil {
 			a.post(func() {
-				if d.gen != gen || ctx.Err() != nil {
+				if d.gen != gen {
 					return
 				}
 				d.busy = false
@@ -334,7 +343,7 @@ func (a *app) startImport() {
 			})
 			if err := addToPlaylist(created.ID, ids[start:end]...); err != nil && !errors.Is(err, ytm.ErrInPlaylist) {
 				a.post(func() {
-					if d.gen != gen || ctx.Err() != nil {
+					if d.gen != gen {
 						return
 					}
 					d.busy = false
@@ -498,8 +507,12 @@ func (a *app) importDialog(c *ui.Context) {
 				if in.Changed() {
 					d.musicUMasked = false
 				}
+				rememberLabel := "在本机记住此 Cookie（保存在本地配置）"
+				if secretStorageSupported {
+					rememberLabel = "在本机记住此 Cookie（系统凭据加密存储）"
+				}
 				ui.Row(c).AlignItems(ui.Center).Children(func() {
-					ui.Text(c, "在本机记住此 Cookie（脱敏保存）").FontSize(12).TextColor(p.muted).Grow(1)
+					ui.Text(c, rememberLabel).FontSize(12).TextColor(p.muted).Grow(1)
 					ui.Switch(c.Key("remember-cookie"), &d.rememberCookie).Label("记住 Cookie")
 				})
 			})

@@ -178,7 +178,9 @@ func (a *app) submitName() {
 			return
 		}
 		if isLocalPlaylist(id) {
-			a.renameLocalPlaylist(id, name)
+			if err := a.renameLocalPlaylist(id, name); err != nil {
+				a.toast = "重命名失败，请检查磁盘空间"
+			}
 			return
 		}
 		old := pl.Name
@@ -195,12 +197,16 @@ func (a *app) submitName() {
 		return
 	}
 	if a.profile == nil {
-		d.open = false
 		var tracks []ytm.Track
 		if d.add != nil {
 			tracks = []ytm.Track{*d.add}
 		}
-		pl := a.createLocalPlaylist(name, "", "", tracks)
+		pl, err := a.createLocalPlaylist(name, "", "", tracks)
+		if err != nil {
+			a.toast = "创建本地歌单失败，请检查磁盘空间"
+			return
+		}
+		d.open = false
 		a.open(route{page: pagePlaylist, id: pl.ID})
 		a.toast = "已创建本地歌单"
 		return
@@ -261,7 +267,11 @@ func (a *app) deleteChosen() {
 		a.show(r)
 	}
 	if isLocalPlaylist(id) {
-		a.deleteLocalPlaylist(id)
+		if err := a.deleteLocalPlaylist(id); err != nil {
+			a.mine = slices.Insert(a.mine, min(i, len(a.mine)), pl)
+			a.toast = "删除失败，请检查磁盘权限"
+			return
+		}
 		a.toast = "已删除歌单"
 		return
 	}
@@ -291,8 +301,10 @@ func (a *app) setPlaylistName(id string, name string) {
 // addTo adds tr to the listener's playlist pid; a toast says how it went.
 func (a *app) addTo(pid string, tr *ytm.Track) {
 	if isLocalPlaylist(pid) {
-		added, dup := a.addTracksToLocalPlaylist(pid, *tr)
+		added, dup, err := a.addTracksToLocalPlaylist(pid, *tr)
 		switch {
+		case err != nil:
+			a.toast = "保存失败，请检查磁盘空间"
 		case added == 0 && dup:
 			a.toast = "歌曲已在歌单中"
 		case added > 0:
@@ -323,7 +335,9 @@ func (a *app) addTo(pid string, tr *ytm.Track) {
 // app and then with NetEase, which may refuse: the song comes back then.
 func (a *app) removeFrom(pid string, tr *ytm.Track) {
 	if isLocalPlaylist(pid) {
-		a.removeTrackFromLocalPlaylist(pid, tr.ID)
+		if err := a.removeTrackFromLocalPlaylist(pid, tr.ID); err != nil {
+			a.toast = "移除失败，请检查磁盘空间"
+		}
 		return
 	}
 	id := tr.ID

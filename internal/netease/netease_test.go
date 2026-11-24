@@ -26,6 +26,8 @@ func TestParsePlaylistInput(t *testing.T) {
 		{"https://music.163.com/#/playlist?id=24381616", "24381616", false, true},
 		{"https://y.music.163.com/m/playlist?id=88991122&userid=1", "88991122", false, true},
 		{"分享创建的歌单「爵士精选」: http://163cn.tv/AbCdEf (来自@网易云音乐)", "", true, true},
+		{"https://music.163.com/song?id=24381616", "", false, false},
+		{"https://music.163.com/#/album?id=24381616", "", false, false},
 		{"https://evil.example.com/playlist?id=24381616", "", false, false},
 		{"not-a-playlist", "", false, false},
 	}
@@ -120,13 +122,15 @@ func TestMatchTracksPrefersStudioATV(t *testing.T) {
 	fakeSearch := func(query string, limit int) ([]ytm.Track, error) {
 		if strings.Contains(query, "晴天") {
 			return []ytm.Track{
+				{ID: "unplay", Name: "晴天", Artists: []ytm.Artist{{Name: "周杰伦"}}, Duration: 269000, VideoType: ytm.VideoATV, Unplayable: true},
 				{ID: "live1", Name: "晴天 (Live)", Artists: []ytm.Artist{{Name: "周杰伦"}}, Duration: 290000, VideoType: ytm.VideoOMV},
 				{ID: "inst1", Name: "晴天 (伴奏)", Artists: []ytm.Artist{{Name: "周杰伦"}}, Duration: 269000, VideoType: ytm.VideoATV},
 				{ID: "atv1", Name: "晴天", Artists: []ytm.Artist{{Name: "周杰伦"}}, Duration: 269500, VideoType: ytm.VideoATV},
 			}, nil
 		}
+		// Same artist and identical duration, but completely different title must be rejected.
 		return []ytm.Track{
-			{ID: "wrong", Name: "Completely Different", Artists: []ytm.Artist{{Name: "Other"}}, Duration: 90000},
+			{ID: "wrong", Name: "Different Song", Artists: []ytm.Artist{{Name: "UnknownArtist"}}, Duration: 180000, VideoType: ytm.VideoATV},
 		}, nil
 	}
 

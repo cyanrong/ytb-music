@@ -309,7 +309,7 @@ func openShared(dl *download, durationMs int64) (stream, error) {
 		return nil, err
 	}
 	if s, ok := s.(*m4aStream); ok {
-		s.spec, s.drop = nil, dl.release
+		s.spec, s.writer, s.drop = nil, nil, dl.release
 	}
 	return s, nil
 }
@@ -329,15 +329,19 @@ type spectrum struct {
 	chunks [][Bands]float32
 	have   []bool
 	window [fftSize]float32
+	edges  [Bands + 1]int
+}
+
+type specWriter struct {
+	target *spectrum
 	acc    []float32 // mono samples of the chunk being filled
 	accAt  int64     // its first frame
-	edges  [Bands + 1]int
 	fft    []complex128
 }
 
 func newSpectrum(rate int, frames int64) *spectrum {
 	n := int(frames/fftSize) + 2
-	s := &spectrum{rate: rate, chunks: make([][Bands]float32, n), have: make([]bool, n), accAt: -1}
+	s := &spectrum{rate: rate, chunks: make([][Bands]float32, n), have: make([]bool, n)}
 	for i := range s.window {
 		s.window[i] = float32(0.5 - 0.5*math.Cos(2*math.Pi*float64(i)/float64(fftSize-1)))
 	}
@@ -350,51 +354,69 @@ func newSpectrum(rate int, frames int64) *spectrum {
 	for i := 1; i < len(s.edges); i++ {
 		s.edges[i] = max(s.edges[i], s.edges[i-1]+1)
 	}
-	s.fft = make([]complex128, fftSize)
 	return s
 }
 
+func newSpecWriter(target *spectrum) *specWriter {
+	if target == nil {
+		return nil
+	}
+	return &specWriter{
+		target: target,
+		accAt:  -1,
+		fft:    make([]complex128, fftSize),
+	}
+}
+
 // feed takes stereo samples decoded from frame at, unless the stream
-// measures no spectrum.
-func (s *spectrum) feed(at int64, stereo []float32) {
-	if s == nil {
+// measures no spectrum. Each decoder owns its own specWriter so concurrent
+// HTTP Range decoders never share mutable FFT scratch buffers.
+func (w *specWriter) feed(at int64, stereo []float32) {
+	if w == nil || w.target == nil {
 		return
 	}
-	if s.accAt < 0 || at != s.accAt+int64(len(s.acc)) {
+	if w.accAt < 0 || at != w.accAt+int64(len(w.acc)) {
 		// The start, or a seek: begin a chunk at a chunk's boundary.
-		s.acc = s.acc[:0]
+		w.acc = w.acc[:0]
 		skip := (fftSize - at%fftSize) % fftSize
 		if int(skip)*2 >= len(stereo) {
-			s.accAt = -1
+			w.accAt = -1
 			return
 		}
 		stereo = stereo[skip*2:]
 		at += skip
-		s.accAt = at
+		w.accAt = at
 	}
 	for i := 0; i+1 < len(stereo); i += 2 {
-		s.acc = append(s.acc, (stereo[i]+stereo[i+1])/2)
-		if len(s.acc) == fftSize {
-			s.analyze(s.accAt / fftSize)
-			s.accAt += fftSize
-			s.acc = s.acc[:0]
+		w.acc = append(w.acc, (stereo[i]+stereo[i+1])/2)
+		if len(w.acc) == fftSize {
+			w.analyze(w.accAt / fftSize)
+			w.accAt += fftSize
+			w.acc = w.acc[:0]
 		}
 	}
 }
 
-func (s *spectrum) analyze(chunk int64) {
+func (w *specWriter) analyze(chunk int64) {
+	s := w.target
 	if chunk < 0 || chunk >= int64(len(s.chunks)) {
 		return
 	}
-	for i, v := range s.acc {
-		s.fft[i] = complex(float64(v*s.window[i]), 0)
+	s.mu.RLock()
+	already := s.have[chunk]
+	s.mu.RUnlock()
+	if already {
+		return
 	}
-	fft(s.fft)
+	for i, v := range w.acc {
+		w.fft[i] = complex(float64(v*s.window[i]), 0)
+	}
+	fft(w.fft)
 	var bands [Bands]float32
 	for b := range Bands {
 		var sum float64
 		for k := s.edges[b]; k < s.edges[b+1]; k++ {
-			sum += cmplx.Abs(s.fft[k])
+			sum += cmplx.Abs(w.fft[k])
 		}
 		mag := sum / float64(s.edges[b+1]-s.edges[b]) / (fftSize / 4)
 		// Higher bands carry less energy: tilt them up, as the ear hears.
