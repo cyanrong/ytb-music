@@ -213,15 +213,9 @@ func TestJapaneseChineseAndRomajiMatching(t *testing.T) {
 	}
 
 	// Verify rawSong ignores "原曲：..." as a song title alias while normalizing NFD Kana.
-	parsed := (rawSong{
-		ID:   1366518623,
-		Name: "ファンキーハ\u3099ックタ\u3099ンサース\u3099", // NFD decomposed dakuten
-		Alia: []string{"原曲：クレイジーバックダンサーズ"},
-		Dt:   316000,
-		No:   9,
-		Ar:   []struct{ Name string `json:"name"`; Tns []string `json:"tns"`; Alias []string `json:"alias"` }{{Name: "オーライフジャパン"}},
-		Al:   struct{ ID int64 `json:"id"`; Name string `json:"name"`; PicURL string `json:"picUrl"`; Tns []string `json:"tns"`; Alias []string `json:"alias"` }{ID: 79257706, Name: "四季音方陣"},
-	}).toSourceTrack()
+	var raw rawSong
+	_ = json.Unmarshal([]byte(`{"id":1366518623,"name":"ファンキーハ\u3099ックタ\u3099ンサース\u3099","alia":["原曲：クレイジーバックダンサーズ"],"dt":316000,"no":9,"ar":[{"id":20927,"name":"オーライフジャパン"}],"al":{"id":79257706,"name":"四季音方陣"}}`), &raw)
+	parsed := raw.toSourceTrack()
 	if parsed.Alias != "" || len(parsed.Aliases) != 0 {
 		t.Fatalf("expected 原曲 annotation ignored, got Alias=%q Aliases=%v", parsed.Alias, parsed.Aliases)
 	}
@@ -288,5 +282,62 @@ func TestJapaneseChineseAndRomajiMatching(t *testing.T) {
 			t.Errorf("track %d (%q): matched=%v id=%q score=%d, want %q",
 				i, src[i].Name, got[i].Matched, got[i].Track.ID, got[i].Score, want)
 		}
+	}
+}
+
+// Same-title songs by different artists (including singles whose album title
+// repeats the song name and short-name substring collisions) are rejected, while
+// official bilingual artist aliases ("周杰伦" -> "Jay Chou") still match.
+func TestStrictArtistRejectsSameTitleDifferentArtist(t *testing.T) {
+	origArtistFn := FetchArtistAliasesFn
+	defer func() { FetchArtistAliasesFn = origArtistFn }()
+
+	FetchArtistAliasesFn = func(_ context.Context, artistID int64) ([]string, error) {
+		if artistID == 6452 {
+			return []string{"Jay Chou", "周董"}, nil
+		}
+		return nil, nil
+	}
+
+	src := []SourceTrack{
+		// 0: Same title + same duration + single album name == song name, but DIFFERENT artist -> must reject!
+		{ID: 10, Name: "花火", Artists: []string{"独立乐队X"}, Album: "花火", DurationMs: 260000},
+		// 1: Short Latin artist "Eve" vs "Steve Vai" with identical title -> must reject!
+		{ID: 11, Name: "Dramaturgy", Artists: []string{"Eve"}, DurationMs: 240000},
+		// 2: Chinese artist "周杰伦" (id 6452) vs English credit "Jay Chou" on YTM -> must match via alias!
+		{ID: 12, Name: "晴天", Artists: []string{"周杰伦"}, ArtistIDs: []int64{6452}, DurationMs: 269000},
+	}
+
+	fakeSearch := func(query string, _ int) ([]ytm.Track, error) {
+		switch {
+		case strings.Contains(query, "花火"):
+			return []ytm.Track{
+				{ID: "wrong-aiko", Name: "花火", Artists: []ytm.Artist{{Name: "aiko"}}, Album: ytm.Album{Name: "花火"}, Duration: 260000, VideoType: ytm.VideoATV},
+				{ID: "wrong-daoko", Name: "花火", Artists: []ytm.Artist{{Name: "DAOKO & 米津玄師"}}, Duration: 260000, VideoType: ytm.VideoATV},
+			}, nil
+		case strings.Contains(query, "Dramaturgy"):
+			return []ytm.Track{
+				{ID: "wrong-steve", Name: "Dramaturgy", Artists: []ytm.Artist{{Name: "Steve Vai"}}, Duration: 240000, VideoType: ytm.VideoATV},
+			}, nil
+		case strings.Contains(query, "晴天"):
+			return []ytm.Track{
+				{ID: "jay-qingtian", Name: "晴天", Artists: []ytm.Artist{{Name: "Jay Chou"}}, Album: ytm.Album{Name: "Ye Hui Mei"}, Duration: 269500, VideoType: ytm.VideoATV},
+			}, nil
+		}
+		return nil, nil
+	}
+
+	got, err := MatchTracks(context.Background(), src, 3, fakeSearch, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got[0].Matched {
+		t.Fatalf("same-title song by different artist should be rejected, got %+v", got[0].Track)
+	}
+	if got[1].Matched {
+		t.Fatalf("short artist 'Eve' matched unrelated 'Steve Vai': %+v", got[1].Track)
+	}
+	if !got[2].Matched || got[2].Track.ID != "jay-qingtian" {
+		t.Fatalf("bilingual artist alias should match jay-qingtian, got %+v", got[2])
 	}
 }

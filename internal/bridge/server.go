@@ -30,10 +30,11 @@ const (
 )
 
 type hqpTrackEntry struct {
-	seq       uint64
-	src       player.TrackSource
-	coverOnce sync.Once
-	coverData []byte
+	seq          uint64
+	src          player.TrackSource
+	eofDelivered atomic.Bool
+	coverOnce    sync.Once
+	coverData    []byte
 }
 
 type streamChunk struct {
@@ -386,6 +387,20 @@ func (s *Server) lookupHQP(seq uint64) *hqpTrackEntry {
 	return s.hqpTracks[seq]
 }
 
+// HQPTrackEOFDelivered reports whether the WAV HTTP handler for seq has
+// finished streaming the final PCM frame of the track.
+func (s *Server) HQPTrackEOFDelivered(seq uint64) bool {
+	entry := s.lookupHQP(seq)
+	return entry != nil && entry.eofDelivered.Load()
+}
+
+// ResetHQPTrackEOF clears the EOF flag before a seek or RepeatOne stream reload.
+func (s *Server) ResetHQPTrackEOF(seq uint64) {
+	if entry := s.lookupHQP(seq); entry != nil {
+		entry.eofDelivered.Store(false)
+	}
+}
+
 func (s *Server) serveHQPCover(w http.ResponseWriter, r *http.Request, seq uint64) {
 	entry := s.lookupHQP(seq)
 	if entry == nil || entry.src.Track.Album.PicURL == "" {
@@ -435,67 +450,50 @@ func (s *Server) serveHQPWAV(w http.ResponseWriter, r *http.Request, seq uint64)
 		frames = int64(sr * 300)
 	}
 
+	var startFrame int64
+	if rawMs := r.URL.Query().Get("start_ms"); rawMs != "" {
+		if ms, perr := strconv.ParseInt(rawMs, 10, 64); perr == nil && ms > 0 {
+			startFrame = min(frames-1, max(0, ms*int64(sr)/1000))
+		}
+	}
+
 	const (
 		channels      = 2
 		bytesPerSamp  = 3 // 24-bit signed LE PCM
 		blockAlign    = channels * bytesPerSamp
 		wavHeaderSize = 44
 	)
-	dataBytes := frames * blockAlign
+	remFrames := max(int64(1), frames-startFrame)
+	dataBytes := remFrames * blockAlign
 	totalSize := wavHeaderSize + dataBytes
 	hdr := buildWAVHeader(sr, channels, 24, dataBytes)
 
-	start, end := int64(0), totalSize-1
-	partial := false
-	if rng := r.Header.Get("Range"); rng != "" {
-		rs, re, ok := parseHTTPRange(rng, totalSize)
-		if !ok {
-			w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", totalSize))
-			http.Error(w, "invalid range", http.StatusRequestedRangeNotSatisfiable)
-			return
-		}
-		start, end, partial = rs, re, true
-	}
-
-	contentLen := end - start + 1
+	// Serve as a continuous single-connection 200 OK WAV stream without
+	// advertising Accept-Ranges. Advertising byte ranges causes HQPlayer 5's
+	// clStreamReaderHTTP::RequestOffset() to issue thousands of short-lived
+	// Range connections per second and exhaust Windows's ephemeral TCP ports.
 	w.Header().Set("Content-Type", "audio/wav")
-	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Content-Length", strconv.FormatInt(contentLen, 10))
-	if partial {
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, totalSize))
-		w.WriteHeader(http.StatusPartialContent)
-	} else {
-		w.WriteHeader(http.StatusOK)
-	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("Content-Length", strconv.FormatInt(totalSize, 10))
+	w.WriteHeader(http.StatusOK)
 	if r.Method == http.MethodHead {
 		return
 	}
 
-	remaining := contentLen
-	pos := start
-	if pos < wavHeaderSize {
-		n := min(remaining, wavHeaderSize-pos)
-		written, werr := w.Write(hdr[pos : pos+n])
-		if werr != nil {
-			return
-		}
-		pos += int64(written)
-		remaining -= int64(written)
-	}
-	if remaining <= 0 {
+	written, werr := w.Write(hdr[:])
+	if werr != nil || written < wavHeaderSize {
 		return
 	}
+	remaining := dataBytes
 
-	pcmByteOffset := pos - wavHeaderSize
-	startFrame := pcmByteOffset / blockAlign
-	skipFrameBytes := int(pcmByteOffset % blockAlign)
 	if startFrame > 0 {
 		if err := dec.SetPosition(startFrame); err != nil {
 			return
 		}
 	}
 
-	const chunkFrames = 4096
+	const chunkFrames = 8192
 	floatBuf := make([]float32, chunkFrames*channels)
 	pcmBuf := make([]byte, chunkFrames*blockAlign)
 
@@ -505,21 +503,12 @@ func (s *Server) serveHQPWAV(w http.ResponseWriter, r *http.Request, seq uint64)
 		if nFrames > 0 {
 			nBytes := encodePCM24LE(pcmBuf, floatBuf[:nFrames*channels], 1.0)
 			slice := pcmBuf[:nBytes]
-			if skipFrameBytes > 0 {
-				if skipFrameBytes >= len(slice) {
-					skipFrameBytes -= len(slice)
-					slice = nil
-				} else {
-					slice = slice[skipFrameBytes:]
-					skipFrameBytes = 0
-				}
-			}
 			if int64(len(slice)) > remaining {
 				slice = slice[:remaining]
 			}
 			if len(slice) > 0 {
-				written, werr := w.Write(slice)
-				remaining -= int64(written)
+				nw, werr := w.Write(slice)
+				remaining -= int64(nw)
 				if werr != nil {
 					return
 				}
@@ -532,15 +521,21 @@ func (s *Server) serveHQPWAV(w http.ResponseWriter, r *http.Request, seq uint64)
 				zero := make([]byte, min(remaining, int64(len(pcmBuf))))
 				for remaining > 0 {
 					step := min(remaining, int64(len(zero)))
-					written, werr := w.Write(zero[:step])
-					remaining -= int64(written)
-					if werr != nil || written == 0 {
+					nw, werr := w.Write(zero[:step])
+					remaining -= int64(nw)
+					if werr != nil || nw == 0 {
 						return
 					}
 				}
 			}
+			if errors.Is(derr, io.EOF) && remaining == 0 {
+				entry.eofDelivered.Store(true)
+			}
 			return
 		}
+	}
+	if remaining == 0 {
+		entry.eofDelivered.Store(true)
 	}
 }
 
@@ -586,46 +581,6 @@ func encodePCM24LE(dst []byte, samples []float32, gain float64) int {
 		j += 3
 	}
 	return j
-}
-
-func parseHTTPRange(hdr string, size int64) (start, end int64, ok bool) {
-	if size <= 0 || !strings.HasPrefix(hdr, "bytes=") {
-		return 0, 0, false
-	}
-	spec := strings.TrimSpace(strings.TrimPrefix(hdr, "bytes="))
-	if i := strings.IndexByte(spec, ','); i >= 0 {
-		spec = strings.TrimSpace(spec[:i])
-	}
-	a, b, found := strings.Cut(spec, "-")
-	if !found {
-		return 0, 0, false
-	}
-	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
-	if a == "" {
-		suffix, err := strconv.ParseInt(b, 10, 64)
-		if err != nil || suffix <= 0 {
-			return 0, 0, false
-		}
-		if suffix > size {
-			suffix = size
-		}
-		return size - suffix, size - 1, true
-	}
-	s, err := strconv.ParseInt(a, 10, 64)
-	if err != nil || s < 0 || s >= size {
-		return 0, 0, false
-	}
-	if b == "" {
-		return s, size - 1, true
-	}
-	e, err := strconv.ParseInt(b, 10, 64)
-	if err != nil || e < s {
-		return 0, 0, false
-	}
-	if e >= size {
-		e = size - 1
-	}
-	return s, e, true
 }
 
 // --- Roon Live Radio Continuous Broadcaster (WAV & ADTS-AAC + ICY) ---

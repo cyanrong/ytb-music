@@ -18,12 +18,13 @@ type SearchFunc func(query string, limit int) ([]ytm.Track, error)
 type AlbumResolveFunc func(ctx context.Context, query string) (*ytm.AlbumProfile, error)
 
 // Optional hooks overridden in offline unit tests; when nil in live mode
-// (search == nil), MatchTracks uses NetEase album metadata, Japanese-locale
-// YouTube Music search, and YouTube Music album track-index resolution.
+// (search == nil), MatchTracks uses NetEase artist/album metadata, Japanese
+// locale YouTube Music search, and YouTube Music album track-index resolution.
 var (
-	FetchAlbumMetaFn   func(ctx context.Context, albumID int64) (*AlbumMeta, error)
-	SearchJapaneseFn   SearchFunc
-	ResolveYTMAlbumFn  AlbumResolveFunc
+	FetchAlbumMetaFn     func(ctx context.Context, albumID int64) (*AlbumMeta, error)
+	FetchArtistAliasesFn func(ctx context.Context, artistID int64) ([]string, error)
+	SearchJapaneseFn     SearchFunc
+	ResolveYTMAlbumFn    AlbumResolveFunc
 )
 
 // MatchResult records how a single NetEase track resolved on YouTube Music.
@@ -43,6 +44,12 @@ type neAlbumCacheEntry struct {
 	meta *AlbumMeta
 }
 
+type neArtistCacheEntry struct {
+	mu      sync.Mutex
+	done    bool
+	aliases []string
+}
+
 type ytmAlbumCacheEntry struct {
 	mu   sync.Mutex
 	done bool
@@ -53,10 +60,12 @@ type matchSession struct {
 	search       SearchFunc
 	jaSearch     SearchFunc
 	fetchNEMeta  func(ctx context.Context, albumID int64) (*AlbumMeta, error)
+	fetchNEArt   func(ctx context.Context, artistID int64) ([]string, error)
 	resolveAlbum AlbumResolveFunc
 
-	neMu     sync.Mutex
-	neAlbums map[int64]*neAlbumCacheEntry
+	neMu      sync.Mutex
+	neAlbums  map[int64]*neAlbumCacheEntry
+	neArtists map[int64]*neArtistCacheEntry
 
 	ytmMu     sync.Mutex
 	ytmAlbums map[string]*ytmAlbumCacheEntry
@@ -70,14 +79,19 @@ func newMatchSession(search SearchFunc) *matchSession {
 	s := &matchSession{
 		search:       search,
 		fetchNEMeta:  FetchAlbumMetaFn,
+		fetchNEArt:   FetchArtistAliasesFn,
 		jaSearch:     SearchJapaneseFn,
 		resolveAlbum: ResolveYTMAlbumFn,
 		neAlbums:     map[int64]*neAlbumCacheEntry{},
+		neArtists:    map[int64]*neArtistCacheEntry{},
 		ytmAlbums:    map[string]*ytmAlbumCacheEntry{},
 	}
 	if live {
 		if s.fetchNEMeta == nil {
 			s.fetchNEMeta = FetchAlbumMeta
+		}
+		if s.fetchNEArt == nil {
+			s.fetchNEArt = FetchArtistAliases
 		}
 		if s.jaSearch == nil {
 			s.jaSearch = func(q string, limit int) ([]ytm.Track, error) {
@@ -114,39 +128,66 @@ func defaultResolveYTMAlbum(ctx context.Context, query string) (*ytm.AlbumProfil
 	return nil, nil
 }
 
-func (ms *matchSession) enrichFromNetEaseAlbum(ctx context.Context, st *SourceTrack) bool {
-	if ms.fetchNEMeta == nil || st.AlbumID <= 0 {
-		return false
-	}
-	ms.neMu.Lock()
-	ent := ms.neAlbums[st.AlbumID]
-	if ent == nil {
-		ent = &neAlbumCacheEntry{}
-		ms.neAlbums[st.AlbumID] = ent
-	}
-	ms.neMu.Unlock()
-
-	ent.mu.Lock()
-	if !ent.done {
-		meta, err := ms.fetchNEMeta(ctx, st.AlbumID)
-		if err == nil {
-			ent.meta = meta
-		}
-		ent.done = true
-	}
-	meta := ent.meta
-	ent.mu.Unlock()
-
-	if meta == nil {
-		return false
-	}
+func (ms *matchSession) enrichAliases(ctx context.Context, st *SourceTrack) bool {
 	beforeA := len(st.ArtistAliases)
 	beforeAl := len(st.AlbumAliases)
-	st.ArtistAliases = appendUniqueTrimmed(st.ArtistAliases, meta.ArtistAliases...)
-	st.AlbumAliases = appendUniqueTrimmed(st.AlbumAliases, meta.AlbumAliases...)
-	if st.AlbumSize == 0 && meta.Size > 0 {
-		st.AlbumSize = meta.Size
+
+	if ms.fetchNEArt != nil {
+		for _, aid := range st.ArtistIDs {
+			if aid <= 0 || ctx.Err() != nil {
+				continue
+			}
+			ms.neMu.Lock()
+			ent := ms.neArtists[aid]
+			if ent == nil {
+				ent = &neArtistCacheEntry{}
+				ms.neArtists[aid] = ent
+			}
+			ms.neMu.Unlock()
+
+			ent.mu.Lock()
+			if !ent.done {
+				aliases, err := ms.fetchNEArt(ctx, aid)
+				if err == nil {
+					ent.aliases = aliases
+				}
+				ent.done = true
+			}
+			aliases := ent.aliases
+			ent.mu.Unlock()
+			st.ArtistAliases = appendUniqueTrimmed(st.ArtistAliases, aliases...)
+		}
 	}
+
+	if ms.fetchNEMeta != nil && st.AlbumID > 0 && ctx.Err() == nil {
+		ms.neMu.Lock()
+		ent := ms.neAlbums[st.AlbumID]
+		if ent == nil {
+			ent = &neAlbumCacheEntry{}
+			ms.neAlbums[st.AlbumID] = ent
+		}
+		ms.neMu.Unlock()
+
+		ent.mu.Lock()
+		if !ent.done {
+			meta, err := ms.fetchNEMeta(ctx, st.AlbumID)
+			if err == nil {
+				ent.meta = meta
+			}
+			ent.done = true
+		}
+		meta := ent.meta
+		ent.mu.Unlock()
+
+		if meta != nil {
+			st.ArtistAliases = appendUniqueTrimmed(st.ArtistAliases, meta.ArtistAliases...)
+			st.AlbumAliases = appendUniqueTrimmed(st.AlbumAliases, meta.AlbumAliases...)
+			if st.AlbumSize == 0 && meta.Size > 0 {
+				st.AlbumSize = meta.Size
+			}
+		}
+	}
+
 	return len(st.ArtistAliases) > beforeA || len(st.AlbumAliases) > beforeAl
 }
 
@@ -279,11 +320,10 @@ func (ms *matchSession) matchOne(ctx context.Context, idx int, st SourceTrack) M
 		}
 	}
 
-	// Cross-script Japanese / CJK disambiguation: enrich artist/album Romaji
-	// aliases from NetEase, re-evaluate already-fetched candidates, and try
-	// Japanese-locale search + album track-index resolution when needed.
-	if bestScore < 65 && hasCJKOrKana(st.Name+" "+st.Alias+" "+st.DisplayArtist()+" "+st.Album) {
-		if ms.enrichFromNetEaseAlbum(ctx, &st) {
+	// Enrich bilingual / Romaji artist & album aliases (e.g. "周杰伦" -> "Jay Chou",
+	// "オーライフジャパン" -> "O-LIFE.JP") whenever initial strict scoring fell short.
+	if bestScore < 65 {
+		if ms.enrichAliases(ctx, &st) {
 			for _, fq := range history {
 				evalCands(fq.cands)
 			}
@@ -303,10 +343,12 @@ func (ms *matchSession) matchOne(ctx context.Context, idx int, st SourceTrack) M
 				}
 			}
 		}
+	}
 
-		// When signed-in cookies or English locale romanized YTM titles, query
-		// YouTube Music with hl="ja" so Japanese tracks return Kanji/Kana titles.
-		if bestScore < minAcceptScore && ms.jaSearch != nil {
+	// Cross-script Japanese / CJK fallbacks: Japanese-locale YTM search + album
+	// track-index resolution.
+	if bestScore < minAcceptScore && hasCJKOrKana(st.Name+" "+st.Alias+" "+st.DisplayArtist()+" "+st.Album) {
+		if ms.jaSearch != nil {
 			jaLimit := min(len(queries), 2)
 			for _, q := range queries[:jaLimit] {
 				if ctx.Err() != nil {
@@ -323,9 +365,6 @@ func (ms *matchSession) matchOne(ctx context.Context, idx int, st SourceTrack) M
 			}
 		}
 
-		// Final fallback for Chinese-translated Japanese album tracks whose
-		// YouTube Music counterparts are pure Romaji: locate the album on YTM
-		// and match by 1-based track index + duration agreement.
 		if bestScore < minAcceptScore && st.Album != "" && st.TrackNo > 0 {
 			if tr, sc, ok := ms.matchViaAlbum(ctx, st); ok && sc > bestScore {
 				best = tr
@@ -371,17 +410,15 @@ func (ms *matchSession) matchViaAlbum(ctx context.Context, st SourceTrack) (ytm.
 		}
 		add(alAlias)
 	}
-	add(st.Album)
+	if len(st.Artists) == 0 {
+		add(st.Album)
+	}
 
 	cacheKey := st.Album
 	if st.AlbumID > 0 {
-		cacheKey = "ne:" + string(rune(st.AlbumID)) + ":" + st.Album
+		cacheKey = formatAlbumKey(st.AlbumID)
 	} else if len(st.Artists) > 0 {
 		cacheKey = st.Artists[0] + "|" + st.Album
-	}
-	// Use explicit numeric string for AlbumID cache key.
-	if st.AlbumID > 0 {
-		cacheKey = formatAlbumKey(st.AlbumID)
 	}
 	al := ms.lookupYTMAlbum(ctx, cacheKey, qs)
 	if al == nil || len(al.Songs) == 0 {
@@ -391,28 +428,32 @@ func (ms *matchSession) matchViaAlbum(ctx context.Context, st SourceTrack) (ytm.
 		return ytm.Track{}, 0, false
 	}
 
-	// Primary check: exact 1-based track position on the album + duration within ±5s.
+	// Strictly verify that the resolved YTM album belongs to the expected artist
+	// (either on the album credits or on the candidate song's credits), preventing
+	// same-named albums by unrelated artists from matching.
+	albumArtistOK := len(st.Artists) == 0 || anyArtistMatch(st, al.Artists)
+
 	targetIdx := st.TrackNo - 1
 	if targetIdx >= 0 && targetIdx < len(al.Songs) {
 		cand := al.Songs[targetIdx]
-		if cand.Playable() && !hasVersionConflict(st, cand) && cand.Duration > 0 && absInt64(st.DurationMs-cand.Duration) <= 5000 {
+		candArtistOK := albumArtistOK || anyArtistMatch(st, cand.Artists)
+		if candArtistOK && cand.Playable() && !hasVersionConflict(st, cand) && cand.Duration > 0 && absInt64(st.DurationMs-cand.Duration) <= 5000 {
 			return cand, 68, true
 		}
 	}
 
-	// Secondary check: allow ±1 index shift (e.g. digital intro/bonus track)
-	// only when a single nearby track matches duration within ±2s.
 	lo := max(0, targetIdx-1)
 	hi := min(len(al.Songs)-1, targetIdx+1)
 	matchedIdx := -1
 	for i := lo; i <= hi; i++ {
 		cand := al.Songs[i]
-		if !cand.Playable() || hasVersionConflict(st, cand) || cand.Duration <= 0 {
+		candArtistOK := albumArtistOK || anyArtistMatch(st, cand.Artists)
+		if !candArtistOK || !cand.Playable() || hasVersionConflict(st, cand) || cand.Duration <= 0 {
 			continue
 		}
 		if absInt64(st.DurationMs-cand.Duration) <= 2000 {
 			if matchedIdx >= 0 {
-				return ytm.Track{}, 0, false // ambiguous duration
+				return ytm.Track{}, 0, false
 			}
 			matchedIdx = i
 		}
@@ -475,10 +516,12 @@ func buildQueries(st SourceTrack) []string {
 			add(primaryArtist + " " + al)
 		}
 	}
-	if st.Album != "" && hasCJKOrKana(st.Name) {
-		add(st.Album + " " + st.Name)
+	if st.Album != "" && hasCJKOrKana(st.Name) && primaryArtist != "" {
+		add(primaryArtist + " " + st.Album + " " + st.Name)
 	}
-	add(st.Name)
+	if primaryArtist == "" {
+		add(st.Name)
+	}
 	return out
 }
 
@@ -529,11 +572,12 @@ func allTrackAliases(st SourceTrack) []string {
 }
 
 var (
-	bracketRe = regexp.MustCompile(`[(\[【（「]([^)\]】）」]*)[)\]】）」]`)
-	liveRe    = regexp.MustCompile(`(?i)\blive\b|现场|演唱会`)
-	instRe    = regexp.MustCompile(`(?i)\b(instrumental|karaoke|off\s*vocal|backing\s*track)\b|伴奏|纯音乐版|卡拉ok`)
-	coverRe   = regexp.MustCompile(`(?i)\bcover\b|翻唱`)
-	remixRe   = regexp.MustCompile(`(?i)\bremix\b|混音|DJ版`)
+	bracketRe   = regexp.MustCompile(`[(\[【（「]([^)\]】）」]*)[)\]】）」]`)
+	liveRe      = regexp.MustCompile(`(?i)\blive\b|现场|演唱会`)
+	instRe      = regexp.MustCompile(`(?i)\b(instrumental|karaoke|off\s*vocal|backing\s*track)\b|伴奏|纯音乐版|卡拉ok`)
+	coverRe     = regexp.MustCompile(`(?i)\bcover\b|翻唱`)
+	remixRe     = regexp.MustCompile(`(?i)\bremix\b|混音|DJ版`)
+	wordSplitRe = regexp.MustCompile(`[^a-z0-9\p{Han}\p{Hiragana}\p{Katakana}]+`)
 )
 
 func hasVersionConflict(src SourceTrack, cand ytm.Track) bool {
@@ -542,6 +586,100 @@ func hasVersionConflict(src SourceTrack, cand ytm.Track) bool {
 	for _, mod := range []*regexp.Regexp{liveRe, instRe, coverRe, remixRe} {
 		if mod.MatchString(candFull) && !mod.MatchString(srcFull) {
 			return true
+		}
+	}
+	return false
+}
+
+// artistPairMatches checks whether a single source artist name/alias matches a
+// candidate artist name without short-substring false positives (e.g. "Li" or
+// "Eve" inside "Billie Eilish" / "Steve Vai").
+func artistPairMatches(sa, ca string) bool {
+	nsa := normText(sa)
+	nca := normText(ca)
+	if nsa == "" || nca == "" {
+		return false
+	}
+	if nsa == nca {
+		return true
+	}
+	if ok, strong := kanaMatchesRomaji(sa, ca); ok && strong {
+		return true
+	}
+	if hasCJKOrKana(sa) && hasCJKOrKana(ca) {
+		saRunes := len([]rune(nsa))
+		caRunes := len([]rune(nca))
+		if min(saRunes, caRunes) >= 2 && (strings.Contains(nca, nsa) || strings.Contains(nsa, nca)) {
+			return true
+		}
+		return false
+	}
+	// For Latin artist names, require either a long multi-word normalized match
+	// (>= 6 chars, e.g. "kenshiyonezu") or an exact token-sequence match on
+	// multi-character tokens (>= 3 chars) so collaborations like "DAOKO & Kenshi Yonezu"
+	// match "Kenshi Yonezu" while "Eve" never matches "Steve".
+	if min(len(nsa), len(nca)) >= 6 && (strings.Contains(nca, nsa) || strings.Contains(nsa, nca)) {
+		return true
+	}
+	return hasWholeTokenSequence(ca, sa) || hasWholeTokenSequence(sa, ca)
+}
+
+func hasWholeTokenSequence(haystack, needle string) bool {
+	hTokens := splitAlphaNumTokens(haystack)
+	nTokens := splitAlphaNumTokens(needle)
+	if len(nTokens) == 0 || len(nTokens) > len(hTokens) {
+		return false
+	}
+	totalLen := 0
+	for _, t := range nTokens {
+		totalLen += len(t)
+	}
+	if totalLen < 3 {
+		return false
+	}
+	for i := 0; i <= len(hTokens)-len(nTokens); i++ {
+		match := true
+		for j := range nTokens {
+			if hTokens[i+j] != nTokens[j] {
+				match = false
+				break
+			}
+		}
+		if match {
+			return true
+		}
+	}
+	return false
+}
+
+func splitAlphaNumTokens(s string) []string {
+	s = strings.ToLower(composeKana(s))
+	var clean strings.Builder
+	for _, r := range s {
+		if r >= 0xFF01 && r <= 0xFF5E {
+			r -= 0xFEE0
+		}
+		clean.WriteRune(foldRune(r))
+	}
+	parts := wordSplitRe.Split(clean.String(), -1)
+	var out []string
+	for _, p := range parts {
+		if p != "" {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+func anyArtistMatch(src SourceTrack, candArtists []ytm.Artist) bool {
+	allSrc := make([]string, 0, len(src.Artists)+len(src.ArtistAliases))
+	allSrc = append(allSrc, src.Artists...)
+	allSrc = append(allSrc, src.ArtistAliases...)
+	for _, sa := range allSrc {
+		for _, ca := range candArtists {
+			if artistPairMatches(sa, ca.Name) {
+				return true
+			}
 		}
 	}
 	return false
@@ -610,37 +748,26 @@ func scoreCandidate(src SourceTrack, cand ytm.Track, candIdx int) (int, bool) {
 	}
 	score += bestTitleBonus
 
-	// Artist overlap (including English / Romaji / Traditional aliases).
-	artistMatched := false
-	cTitleRaw := normText(cand.Name)
-	allSrcArtists := make([]string, 0, len(src.Artists)+len(src.ArtistAliases))
-	allSrcArtists = append(allSrcArtists, src.Artists...)
-	allSrcArtists = append(allSrcArtists, src.ArtistAliases...)
-	for _, sa := range allSrcArtists {
-		nsa := normText(sa)
-		if nsa == "" {
-			continue
-		}
-		for _, ca := range cand.Artists {
-			nca := normText(ca.Name)
-			if nca != "" && (nca == nsa || (len([]rune(nsa)) >= 2 && len([]rune(nca)) >= 2 && (strings.Contains(nca, nsa) || strings.Contains(nsa, nca)))) {
-				score += 35
+	// Artist overlap (strictly verified against source artists and their official aliases).
+	artistMatched := anyArtistMatch(src, cand.Artists)
+	if artistMatched {
+		score += 35
+	} else if cand.VideoType != ytm.VideoATV {
+		// User/video uploads ("Artist - Song") sometimes credit a generic channel
+		// rather than structured Artist metadata; check whole-token / CJK prefix in title.
+		allSrc := append(append([]string(nil), src.Artists...), src.ArtistAliases...)
+		for _, sa := range allSrc {
+			nsa := normText(sa)
+			if hasCJKOrKana(sa) && len([]rune(nsa)) >= 2 && strings.Contains(cTitle, nsa) && nsa != normText(stripBenignBrackets(src.Name)) {
+				score += 20
 				artistMatched = true
 				break
 			}
-			if ok, _ := kanaMatchesRomaji(sa, ca.Name); ok {
-				score += 35
+			if !hasCJKOrKana(sa) && len(nsa) >= 4 && hasWholeTokenSequence(cand.Name, sa) && !hasWholeTokenSequence(src.Name, sa) {
+				score += 20
 				artistMatched = true
 				break
 			}
-		}
-		if artistMatched {
-			break
-		}
-		if len([]rune(nsa)) >= 2 && strings.Contains(cTitleRaw, nsa) {
-			score += 20
-			artistMatched = true
-			break
 		}
 	}
 
@@ -680,14 +807,28 @@ func scoreCandidate(src SourceTrack, cand ytm.Track, candIdx int) (int, bool) {
 		}
 	}
 
-	// Cross-script Knowledge-Graph Rank-0 match: when NetEase holds a Chinese
-	// translation or Kanji title (e.g. "青鸟", "静寂の一人歩き") and YouTube
-	// Music's #1 result is in Kana/Romaji ("ブルーバード - Blue Bird",
-	// "Seijaku no hitori aruki") by the same artist/album with identical
-	// duration (±2.5s), trust YouTube's cross-language top hit.
+	// STRICT ARTIST GATE: never accept a song with the same title by a different
+	// artist! The sole exception is an anime/game/OST album where YouTube Music
+	// credits the series franchise instead of the vocalist, verified by a
+	// distinct album title (not just repeating the single's own song title) AND
+	// tight duration agreement (±2.5s).
+	if len(src.Artists) > 0 && !artistMatched {
+		normSrcAlbum := normText(stripBenignBrackets(src.Album))
+		normSrcTitle := normText(stripBenignBrackets(src.Name))
+		distinctAlbumMatched := albumMatched &&
+			normSrcAlbum != "" &&
+			normSrcAlbum != normSrcTitle &&
+			len([]rune(normSrcAlbum)) >= 3
+		if !distinctAlbumMatched || durDiff > 2500 || versionConflict {
+			return -100, false
+		}
+	}
+
+	// Cross-script Knowledge-Graph Rank-0 match: requires artistMatched (or
+	// distinct OST album match above), ±2.5s duration, and non-overlapping script.
 	if !titleMatched && candIdx == 0 && !versionConflict && durDiff <= 2500 &&
-		(artistMatched || albumMatched) && isCrossScriptPair(src.Name, cand.Name) {
-		score += 25 // offsets the -15 title miss and adds +10 Rank-0 confidence
+		artistMatched && isCrossScriptPair(src.Name, cand.Name) {
+		score += 25
 		titleMatched = true
 	}
 
@@ -707,7 +848,6 @@ func isCrossScriptPair(srcTitle, candTitle string) bool {
 	if isPureLatinTitle(candTitle) {
 		return true
 	}
-	// Pure Han Chinese title on NetEase (e.g. "青鸟") vs Kana/Romaji title on YTM ("ブルーバード - Blue Bird").
 	if !hasKana(srcTitle) && hasKana(candTitle) {
 		return true
 	}
@@ -727,7 +867,6 @@ func normText(s string) string {
 	s = composeKana(s)
 	var b strings.Builder
 	for _, r := range strings.ToLower(s) {
-		// Convert fullwidth ASCII to halfwidth.
 		if r >= 0xFF01 && r <= 0xFF5E {
 			r -= 0xFEE0
 		}

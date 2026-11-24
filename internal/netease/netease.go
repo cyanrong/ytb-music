@@ -42,6 +42,7 @@ type SourceTrack struct {
 	Alias         string
 	Aliases       []string
 	Artists       []string
+	ArtistIDs     []int64
 	ArtistAliases []string
 	Album         string
 	AlbumID       int64
@@ -397,11 +398,13 @@ type rawSong struct {
 		Name string `json:"name"`
 	} `json:"originSongSimpleData"`
 	Ar []struct {
+		ID    int64    `json:"id"`
 		Name  string   `json:"name"`
 		Tns   []string `json:"tns"`
 		Alias []string `json:"alias"`
 	} `json:"ar"`
 	Artists []struct {
+		ID    int64    `json:"id"`
 		Name  string   `json:"name"`
 		Tns   []string `json:"tns"`
 		Alias []string `json:"alias"`
@@ -480,7 +483,19 @@ func (s rawSong) toSourceTrack() SourceTrack {
 		st.Alias = st.Aliases[0]
 	}
 
+	addArtistID := func(id int64) {
+		if id <= 0 {
+			return
+		}
+		for _, existing := range st.ArtistIDs {
+			if existing == id {
+				return
+			}
+		}
+		st.ArtistIDs = append(st.ArtistIDs, id)
+	}
 	for _, a := range s.Ar {
+		addArtistID(a.ID)
 		if n := strings.TrimSpace(composeKana(a.Name)); n != "" {
 			st.Artists = appendUniqueTrimmed(st.Artists, n)
 		}
@@ -489,6 +504,7 @@ func (s rawSong) toSourceTrack() SourceTrack {
 	}
 	if len(st.Artists) == 0 {
 		for _, a := range s.Artists {
+			addArtistID(a.ID)
 			if n := strings.TrimSpace(composeKana(a.Name)); n != "" {
 				st.Artists = appendUniqueTrimmed(st.Artists, n)
 			}
@@ -582,6 +598,48 @@ func FetchAlbumMeta(ctx context.Context, albumID int64) (*AlbumMeta, error) {
 		meta.ArtistAliases = appendUniqueTrimmed(meta.ArtistAliases, ar.Alias...)
 	}
 	return meta, nil
+}
+
+// FetchArtistAliases queries NetEase's lightweight artist header endpoint for
+// official English / Romaji / alternate artist names (e.g. "周杰伦" -> "Jay Chou").
+func FetchArtistAliases(ctx context.Context, artistID int64) ([]string, error) {
+	if artistID <= 0 {
+		return nil, nil
+	}
+	req, err := http.NewRequestWithContext(ctx, "GET", fmt.Sprintf("%s/api/artist/head/info/get?id=%d", APIBase, artistID), nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Referer", "https://music.163.com/")
+	req.Header.Set("User-Agent", neteaseUA)
+	res, err := HTTPClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("netease: artist HTTP %d", res.StatusCode)
+	}
+	body, err := io.ReadAll(io.LimitReader(res.Body, 2<<20))
+	if err != nil {
+		return nil, err
+	}
+	var payload struct {
+		Code int `json:"code"`
+		Data *struct {
+			Artist *struct {
+				TransNames []string `json:"transNames"`
+				Alias      []string `json:"alias"`
+			} `json:"artist"`
+		} `json:"data"`
+	}
+	if err := json.Unmarshal(body, &payload); err != nil || payload.Code != 200 || payload.Data == nil || payload.Data.Artist == nil {
+		return nil, errors.New("netease: invalid artist response")
+	}
+	var out []string
+	out = appendUniqueTrimmed(out, payload.Data.Artist.TransNames...)
+	out = appendUniqueTrimmed(out, payload.Data.Artist.Alias...)
+	return out, nil
 }
 
 func fetchSongBatch(ctx context.Context, ids []int64, musicU string) ([]SourceTrack, error) {

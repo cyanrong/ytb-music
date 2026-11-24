@@ -55,8 +55,11 @@ func (d *rampPCMDecoder) Read(dst []float32) (int, error) {
 	return avail * 2, nil
 }
 
-// HQPlayerbackend loads a track over TCP 4321 despite interleaved <Status/> pushes, serves range-seekable 24-bit WAV, and fires OnSinkEnd when playback finishes.
-func TestHQPlayerBackendAndRangeWAV(t *testing.T) {
+// HQPlayerBackend streams continuous 200 OK 24-bit WAV without Accept-Ranges
+// (avoiding HQPlayer 5's RequestOffset short-connection storm), supports
+// ?start_ms seek reloads, ignores premature mid-track stops, and fires
+// OnSinkEnd once the track finishes.
+func TestHQPlayerBackendAndContinuousWAV(t *testing.T) {
 	srv, err := NewServer("127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -75,8 +78,8 @@ func TestHQPlayerBackendAndRangeWAV(t *testing.T) {
 		addedURI string
 		hqpConn  net.Conn
 	)
-	playEvents := make(chan struct{}, 4)
-	seekPositions := make(chan string, 4)
+	playEvents := make(chan struct{}, 8)
+	addedURIs := make(chan string, 8)
 
 	go func() {
 		conn, aerr := ln.Accept()
@@ -114,6 +117,10 @@ func TestHQPlayerBackendAndRangeWAV(t *testing.T) {
 				mu.Lock()
 				addedURI = attrs["uri"]
 				mu.Unlock()
+				select {
+				case addedURIs <- attrs["uri"]:
+				default:
+				}
 				// Coalesce an unsolicited <Status/> frame immediately ahead of <PlaylistAdd result="OK"/> in one TCP write.
 				coalesced := xmlDecl + `<Status state="0" position="0.0"/>` + xmlDecl + `<PlaylistAdd result="OK"/>`
 				_, _ = conn.Write([]byte(coalesced))
@@ -122,9 +129,6 @@ func TestHQPlayerBackendAndRangeWAV(t *testing.T) {
 			case "Play":
 				_, _ = conn.Write([]byte(xmlDecl + `<Play result="OK"/>` + xmlDecl + `<Status state="2" position="1.25"/>`))
 				playEvents <- struct{}{}
-			case "Seek":
-				_, _ = conn.Write([]byte(xmlDecl + `<Seek result="OK"/>`))
-				seekPositions <- attrs["position"]
 			case "Pause":
 				_, _ = conn.Write([]byte(xmlDecl + `<Pause result="OK"/>`))
 			case "Stop":
@@ -148,16 +152,16 @@ func TestHQPlayerBackendAndRangeWAV(t *testing.T) {
 	}
 	defer backend.Disconnect()
 
-	const totalFrames = 44100 * 4
+	const totalFrames = 44100 * 10
 	src := player.TrackSource{
 		Track: ytm.Track{
 			ID:       "vid1",
 			Name:     "晴天",
 			Artists:  []ytm.Artist{{Name: "周杰伦"}},
 			Album:    ytm.Album{Name: "叶惠美"},
-			Duration: 4000,
+			Duration: 10000,
 		},
-		Duration: 4 * time.Second,
+		Duration: 10 * time.Second,
 		Gain:     0.64,
 		OpenPCM: func() (player.PCMDecoder, error) {
 			return &rampPCMDecoder{rate: 44100, frames: totalFrames}, nil
@@ -170,41 +174,50 @@ func TestHQPlayerBackendAndRangeWAV(t *testing.T) {
 	}
 	defer sink.Close()
 
-	mu.Lock()
-	wavURL := addedURI
-	mu.Unlock()
+	wavURL := <-addedURIs
 	if wavURL == "" {
 		t.Fatal("HQPlayer did not receive PlaylistAdd URI")
 	}
 
-	// Verify HTTP Range seeking into frame 500 of the 24-bit WAV stream.
-	const targetFrame = 500
-	byteStart := int64(44 + targetFrame*6)
-	byteEnd := byteStart + 6 - 1
-	req, err := http.NewRequest(http.MethodGet, wavURL, nil)
+	// Verify HEAD omits Accept-Ranges so HQPlayer 5 uses a single continuous stream.
+	headResp, err := http.Head(wavURL)
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Range", fmt.Sprintf("bytes=%d-%d", byteStart, byteEnd))
+	headResp.Body.Close()
+	if ar := headResp.Header.Get("Accept-Ranges"); ar != "" {
+		t.Fatalf("HEAD Accept-Ranges = %q, want empty", ar)
+	}
+
+	// Verify ?start_ms=1000 seeks cleanly to frame 44100 in a single 200 OK response.
+	req, err := http.NewRequest(http.MethodGet, wavURL+"?start_ms=1000", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Range", "bytes=0-100") // ignored in favor of continuous 200 OK
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
 	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusPartialContent || len(body) != 6 {
-		t.Fatalf("Range status=%d len=%d, want 206 len=6", resp.StatusCode, len(body))
+	firstSample := make([]byte, 50)
+	if _, err := io.ReadFull(resp.Body, firstSample); err != nil {
+		resp.Body.Close()
+		t.Fatal(err)
 	}
-	// Left channel at frame 500 has value (500%1000 + 1)/2000 = 501/2000 = 0.2505 -> ~2101346 in 24-bit signed PCM.
-	gotLeft := int32(uint32(body[0]) | uint32(body[1])<<8 | uint32(body[2])<<16)
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status=%d, want 200 OK", resp.StatusCode)
+	}
+	// Frame 44100 has value (44100%1000 + 1)/2000 = 101/2000 = 0.0505 -> ~423625 in 24-bit signed PCM.
+	gotLeft := int32(uint32(firstSample[44]) | uint32(firstSample[45])<<8 | uint32(firstSample[46])<<16)
 	if gotLeft&0x800000 != 0 {
 		gotLeft |= ^0xffffff
 	}
-	if gotLeft < 2101340 || gotLeft > 2101352 {
-		t.Fatalf("frame 500 24-bit sample = %d, want ~2101346", gotLeft)
+	if gotLeft < 423620 || gotLeft > 423630 {
+		t.Fatalf("frame 44100 24-bit sample = %d, want ~423625", gotLeft)
 	}
 
-	ended := make(chan struct{}, 1)
+	ended := make(chan struct{}, 2)
 	sink.Activate()
 	sink.OnSinkEnd(func() { ended <- struct{}{} })
 	sink.Play()
@@ -214,35 +227,60 @@ func TestHQPlayerBackendAndRangeWAV(t *testing.T) {
 		t.Fatal("timed out waiting for first <Play/>")
 	}
 
-	// Deterministically advance controllable clock past the 500ms start grace window (zero wall-clock sleep).
+	// Premature stop at 1.25s of a 10s track (before WAV EOF) must NOT fire OnSinkEnd.
 	advanceClock(600 * time.Millisecond)
 	mu.Lock()
 	conn := hqpConn
 	mu.Unlock()
-	_, _ = conn.Write([]byte(xmlDecl + `<Status state="0" position="0.0"/>`))
+	_, _ = conn.Write([]byte(xmlDecl + `<Status state="0" position="1.25"/>`))
+	time.Sleep(40 * time.Millisecond)
+	select {
+	case <-ended:
+		t.Fatal("premature mid-track stop falsely triggered OnSinkEnd")
+	default:
+	}
 
+	// Resume, read full WAV to EOF, and verify natural state=0 fires OnSinkEnd.
+	sink.Play()
+	<-playEvents
+	fullResp, err := http.Get(wavURL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = io.Copy(io.Discard, fullResp.Body)
+	fullResp.Body.Close()
+
+	advanceClock(600 * time.Millisecond)
+	_, _ = conn.Write([]byte(xmlDecl + `<Status state="0" position="0.0"/>`))
 	select {
 	case <-ended:
 	case <-time.After(2 * time.Second):
-		t.Fatal("HQPlayer natural track end did not trigger OnSinkEnd")
+		t.Fatal("HQPlayer natural track end after WAV EOF did not trigger OnSinkEnd")
 	}
 
-	// Verify RepeatOne replay: Seek(0) while paused followed by Play() sends <Seek position="0.00"/> and rearms OnSinkEnd.
+	// Verify RepeatOne replay: Seek(0) while paused followed by Play() reloads start_ms=0 and rearms OnSinkEnd.
 	sink.Seek(0)
 	sink.Play()
+	select {
+	case reloadURI := <-addedURIs:
+		if !strings.Contains(reloadURI, "start_ms=0") {
+			t.Fatalf("RepeatOne reload URI = %q, want start_ms=0", reloadURI)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("paused Seek(0) followed by Play() did not reload PlaylistAdd")
+	}
 	select {
 	case <-playEvents:
 	case <-time.After(2 * time.Second):
 		t.Fatal("timed out waiting for RepeatOne <Play/>")
 	}
-	select {
-	case pos := <-seekPositions:
-		if pos != "0.00" {
-			t.Fatalf("RepeatOne Seek position = %q, want 0.00", pos)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("paused Seek(0) followed by Play() did not send <Seek position=\"0.00\"/>")
+	fullResp2, err := http.Get(wavURL)
+	if err != nil {
+		t.Fatal(err)
 	}
+	_, _ = io.Copy(io.Discard, fullResp2.Body)
+	fullResp2.Body.Close()
+
 	advanceClock(600 * time.Millisecond)
 	_, _ = conn.Write([]byte(xmlDecl + `<Status state="0" position="0.0"/>`))
 	select {
@@ -250,6 +288,7 @@ func TestHQPlayerBackendAndRangeWAV(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("HQPlayer RepeatOne second pass did not re-trigger OnSinkEnd")
 	}
+	_ = addedURI
 	_ = received
 }
 
