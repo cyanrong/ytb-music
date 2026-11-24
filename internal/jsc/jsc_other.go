@@ -6,10 +6,16 @@ import (
 	"errors"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/dop251/goja"
 	"github.com/dop251/goja/parser"
 )
+
+// evalTimeout bounds any single script execution so a pathological player
+// script cannot stall currentSolver forever and block fallback to standard
+// audio; tests shorten it.
+var evalTimeout = 15 * time.Second
 
 var (
 	runtimes   sync.Map // uintptr -> *goja.Runtime
@@ -36,7 +42,13 @@ func evalIn(ref uintptr, script string) (string, error) {
 		return "", errors.New("jsc: the context is closed")
 	}
 	vm := v.(*goja.Runtime)
+	vm.ClearInterrupt()
+	timer := time.AfterFunc(evalTimeout, func() {
+		vm.Interrupt("execution timed out")
+	})
 	val, err := vm.RunString(script)
+	timer.Stop()
+	vm.ClearInterrupt()
 	if err != nil {
 		var exc *goja.Exception
 		if errors.As(err, &exc) {
@@ -61,7 +73,7 @@ func evalIn(ref uintptr, script string) (string, error) {
 }
 
 // safeString converts val via JavaScript's ToString inside vm.Try so that
-// throwing toString() methods or Symbols never panic the host process.
+// throwing toString() methods never panic the host process.
 func safeString(vm *goja.Runtime, val goja.Value) (string, error) {
 	if val == nil {
 		return "", nil

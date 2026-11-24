@@ -163,6 +163,7 @@ type app struct {
 	settingsWin     *mygo.Window
 	proxyMode       int    // 0: system, 1: custom, 2: direct
 	proxyInput      string // custom proxy address edited in settings
+	proxyMasked     bool   // true while proxyInput holds an unedited RedactedProxy mask
 	lastCustomProxy string // last saved custom proxy URL, kept across mode switches
 	proxyErr        string
 	autoProxyDesc   string // resolved off the UI thread for Follow System mode

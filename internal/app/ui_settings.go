@@ -74,6 +74,15 @@ func (a *app) refreshAutoProxyDesc() {
 	}()
 }
 
+func hasProxyPassword(raw string) bool {
+	u, err := ytm.ParseProxy(raw)
+	if err != nil || u == nil || u.User == nil {
+		return false
+	}
+	_, ok := u.User.Password()
+	return ok
+}
+
 func (a *app) syncProxyState() {
 	a.proxyErr = ""
 	if a.autoProxyDesc == "" {
@@ -86,8 +95,12 @@ func (a *app) syncProxyState() {
 		a.proxyMode = 2
 	default:
 		a.proxyMode = 1
+		if norm, err := ytm.NormalizeProxy(a.settings.Proxy); err == nil {
+			a.settings.Proxy = norm
+		}
 		a.lastCustomProxy = a.settings.Proxy
 		a.proxyInput = ytm.RedactedProxy(a.settings.Proxy)
+		a.proxyMasked = hasProxyPassword(a.settings.Proxy)
 	}
 }
 
@@ -121,7 +134,7 @@ func (a *app) onProxyRouteChanged() {
 	if a.art != nil {
 		a.art.clearFailed()
 	}
-	if a.homeErr != "" {
+	if a.homeErr != "" || a.homeLoading {
 		reloadHome(a)
 	}
 }
@@ -132,23 +145,31 @@ func (a *app) applyCustomProxy() {
 		a.proxyErr = "请输入有效的代理地址，例如 127.0.0.1:7890 或 socks5://127.0.0.1:1080"
 		return
 	}
-	restored, maskErr := restoreRedactedPassword(raw, a.lastCustomProxy)
-	if maskErr != nil {
-		a.proxyErr = "已更改代理服务器或账号，请重新输入完整的代理密码"
+	if a.proxyMasked {
+		restored, maskErr := restoreRedactedPassword(raw, a.lastCustomProxy)
+		if maskErr != nil {
+			a.proxyErr = "已更改代理服务器或账号，请重新输入完整的代理密码"
+			return
+		}
+		raw = restored
+	}
+	norm, err := ytm.NormalizeProxy(raw)
+	if err != nil {
+		a.proxyErr = "代理地址格式不正确，请填写有效的 http:// 或 socks5:// 主机与端口"
 		return
 	}
-	raw = restored
-	prev := a.settings.Proxy
-	if err := setProxy(raw); err != nil {
+	prev, _ := ytm.NormalizeProxy(a.settings.Proxy)
+	if err := setProxy(norm); err != nil {
 		a.proxyErr = "代理地址格式不正确，请填写有效的 http:// 或 socks5:// 主机与端口"
 		return
 	}
 	a.proxyErr = ""
-	a.settings.Proxy = raw
-	a.lastCustomProxy = raw
-	a.proxyInput = ytm.RedactedProxy(raw)
+	a.settings.Proxy = norm
+	a.lastCustomProxy = norm
+	a.proxyInput = ytm.RedactedProxy(norm)
+	a.proxyMasked = hasProxyPassword(norm)
 	a.changed()
-	if prev != raw {
+	if prev != norm {
 		a.onProxyRouteChanged()
 	} else if a.homeErr != "" {
 		reloadHome(a)
@@ -325,7 +346,17 @@ func (a *app) settingsView(c *ui.Context) {
 		})
 
 		group("网络", func() {
-			desc := "作用于目录、音频流、封面与歌词请求（Google 登录窗口需重启应用生效，且不支持带密码代理）"
+			customDesc := "作用于目录、音频流、封面与歌词请求（Google 登录窗口使用系统网络设置）"
+			directDesc := "目录、音频流、封面与歌词直接连接（Google 登录窗口使用系统网络设置）"
+			switch runtime.GOOS {
+			case "windows":
+				customDesc = "作用于目录、音频流、封面与歌词请求（无密码代理在重启应用后对 Google 登录窗口生效）"
+				directDesc = "目录、音频流、封面与歌词直接连接（重启应用后对 Google 登录窗口生效）"
+			case "darwin":
+				customDesc = "作用于目录、音频流、封面与歌词请求（Google 登录窗口与 MV 视频使用 macOS 系统网络设置）"
+				directDesc = "目录、音频流、封面与歌词直接连接（Google 登录窗口与 MV 视频使用 macOS 系统网络设置）"
+			}
+			desc := customDesc
 			switch a.proxyMode {
 			case 0:
 				if a.autoProxyDesc != "" {
@@ -334,7 +365,7 @@ func (a *app) settingsView(c *ui.Context) {
 					desc = defaultAutoProxyDesc()
 				}
 			case 2:
-				desc = "目录、音频流、封面与歌词直接连接（Google 登录窗口需重启应用生效；macOS 视频走系统网络）"
+				desc = directDesc
 			}
 			row("网络代理", desc, func() {
 				mode := a.proxyMode
@@ -356,6 +387,7 @@ func (a *app) settingsView(c *ui.Context) {
 					case 1:
 						if a.proxyInput == "" && a.lastCustomProxy != "" {
 							a.proxyInput = ytm.RedactedProxy(a.lastCustomProxy)
+							a.proxyMasked = hasProxyPassword(a.lastCustomProxy)
 						}
 					case 2:
 						s.Proxy = "direct"
@@ -375,6 +407,9 @@ func (a *app) settingsView(c *ui.Context) {
 						in := ui.TextInput(c.Key("proxy-url"), &a.proxyInput).
 							Placeholder("127.0.0.1:7890 或 socks5://127.0.0.1:1080").
 							Label("代理地址").FontSize(12.5).Grow(1)
+						if in.Changed() {
+							a.proxyMasked = false
+						}
 						if in.Submitted() {
 							a.applyCustomProxy()
 						}

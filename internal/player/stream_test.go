@@ -348,8 +348,8 @@ func TestThroughput(t *testing.T) {
 	}
 }
 
-// A ranged download whose signed URL returns 403 mid-song after an exit-IP
-// switch refreshes the stream URL and resumes from the current byte offset.
+// A ranged download retries transient server errors in place without
+// refreshing the stream URL, and refreshes only when 403/route change occurs.
 func TestRangeDownloadRefreshesURLAfterRouteChange(t *testing.T) {
 	total := int64(firstRange + 64<<10)
 	payload := make([]byte, total)
@@ -368,12 +368,18 @@ func TestRangeDownloadRefreshesURLAfterRouteChange(t *testing.T) {
 		_, _ = w.Write(payload[from : to+1])
 	}
 
+	flakyOnce := false
 	oldSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Query().Get("range") != fmt.Sprintf("0-%d", firstRange-1) {
-			http.Error(w, "ip mismatch", http.StatusForbidden)
+		if r.URL.Query().Get("range") == fmt.Sprintf("0-%d", firstRange-1) {
+			if !flakyOnce {
+				flakyOnce = true
+				http.Error(w, "gateway glitch", http.StatusBadGateway)
+				return
+			}
+			serveRange(w, r)
 			return
 		}
-		serveRange(w, r)
+		http.Error(w, "ip mismatch", http.StatusForbidden)
 	}))
 	defer oldSrv.Close()
 

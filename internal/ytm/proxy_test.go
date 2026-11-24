@@ -1,6 +1,7 @@
 package ytm
 
 import (
+	"context"
 	"net/http"
 	"net/url"
 	"os"
@@ -9,7 +10,7 @@ import (
 
 // Proxy validation rejects malformed endpoints, accepts IPv6 literals with or
 // without explicit ports, honours NO_PROXY ahead of OS fallbacks, and keys
-// stream caches by the effective route.
+// stream caches by the effective route of the target endpoint.
 func TestProxyForRequest(t *testing.T) {
 	realSystem := systemProxyFn
 	defer func() {
@@ -50,11 +51,12 @@ func TestProxyForRequest(t *testing.T) {
 		t.Fatalf("RedactedProxy leaked secret: %q", got)
 	}
 
-	// Changing proxy clears cached signed stream URLs.
-	_, _ = playerCache.get("en/US/vid1", func() (*player, error) {
+	// Changing proxy clears cached signed stream URLs, while reapplying an
+	// equivalent normalized address is a no-op.
+	_, _ = playerCache.get("route|en/US/vid1", func() (*player, error) {
 		return &player{status: "OK", stream: &Stream{URL: "https://old-ip"}}, nil
 	})
-	if err := SetProxy("socks5://127.0.0.1:1080"); err != nil {
+	if err := SetProxy("127.0.0.1:1080"); err != nil {
 		t.Fatal(err)
 	}
 	playerCache.mu.Lock()
@@ -64,9 +66,29 @@ func TestProxyForRequest(t *testing.T) {
 		t.Fatalf("playerCache kept %d entries across proxy change", left)
 	}
 
+	_, _ = playerCache.get("route|en/US/vid2", func() (*player, error) {
+		return &player{status: "OK", stream: &Stream{URL: "https://same-ip"}}, nil
+	})
+	if err := SetProxy("http://127.0.0.1:1080"); err != nil {
+		t.Fatal(err)
+	}
+	playerCache.mu.Lock()
+	kept := len(playerCache.entries)
+	playerCache.mu.Unlock()
+	if kept != 1 {
+		t.Fatalf("reapplying normalized proxy flushed cache: kept=%d", kept)
+	}
+	InvalidateTrackStream("vid2")
+	playerCache.mu.Lock()
+	afterTrack := len(playerCache.entries)
+	playerCache.mu.Unlock()
+	if afterTrack != 0 {
+		t.Fatalf("InvalidateTrackStream left %d entries", afterTrack)
+	}
+
 	extReq, _ := http.NewRequest("GET", "https://music.youtube.com/", nil)
 	got, err := proxyForRequest(extReq)
-	if err != nil || got == nil || got.String() != "socks5://127.0.0.1:1080" {
+	if err != nil || got == nil || got.String() != "http://127.0.0.1:1080" {
 		t.Fatalf("override proxy: %v, %v", got, err)
 	}
 
@@ -82,24 +104,23 @@ func TestProxyForRequest(t *testing.T) {
 		t.Fatalf("direct mode used proxy: %v, %v", got, err)
 	}
 
-	// Deterministic OS fallback: without NO_PROXY it routes through the OS
-	// proxy; with NO_PROXY=music.youtube.com it connects directly; and when the
-	// OS proxy changes externally, routeCacheKey changes automatically.
+	// Deterministic OS fallback: clear both upper- and lowercase env vars so
+	// Linux/macOS runners never inherit external proxies.
 	osProxyURL, _ := url.Parse("http://10.0.0.2:8888")
-	systemProxyFn = func(*url.URL) (*url.URL, ProxySource, error) {
+	systemProxyFn = func(context.Context, *url.URL) (*url.URL, ProxySource, error) {
 		cp := *osProxyURL
 		return &cp, ProxySourceSystem, nil
 	}
 	if err := SetProxy(""); err != nil {
 		t.Fatal(err)
 	}
-	t.Setenv("HTTP_PROXY", "")
-	t.Setenv("HTTPS_PROXY", "")
-	t.Setenv("NO_PROXY", "")
+	for _, k := range []string{"HTTP_PROXY", "http_proxy", "HTTPS_PROXY", "https_proxy", "NO_PROXY", "no_proxy"} {
+		t.Setenv(k, "")
+	}
 	if got, err := proxyForRequest(extReq); err != nil || got == nil || got.String() != "http://10.0.0.2:8888" {
 		t.Fatalf("expected OS fallback proxy, got %v (%v)", got, err)
 	}
-	keyBefore := routeCacheKey()
+	keyBefore := routeCacheKeyFor(playerAPI)
 
 	t.Setenv("NO_PROXY", "music.youtube.com")
 	if got, err := proxyForRequest(extReq); err != nil || got != nil {
@@ -108,7 +129,7 @@ func TestProxyForRequest(t *testing.T) {
 
 	t.Setenv("NO_PROXY", "")
 	osProxyURL, _ = url.Parse("http://10.0.0.3:9999")
-	if keyAfter := routeCacheKey(); keyAfter == keyBefore {
-		t.Fatalf("routeCacheKey did not change after external OS proxy switch: %q", keyAfter)
+	if keyAfter := routeCacheKeyFor(playerAPI); keyAfter == keyBefore {
+		t.Fatalf("routeCacheKeyFor did not change after external OS proxy switch: %q", keyAfter)
 	}
 }

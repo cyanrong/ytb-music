@@ -3,6 +3,7 @@
 package ytm
 
 import (
+	"context"
 	"net"
 	"net/url"
 	"runtime"
@@ -26,6 +27,9 @@ const (
 	winhttpAutoDetectTypeDNSA   = 0x00000002
 
 	maxPACCacheEntries = 64
+	pacSuccessTTL      = 30 * time.Second
+	pacFailureTTL      = 10 * time.Second
+	pacLookupBudget    = 2500 * time.Millisecond
 )
 
 type winhttpIEProxyConfig struct {
@@ -55,9 +59,12 @@ var (
 	modkernel32                          = windows.NewLazySystemDLL("kernel32.dll")
 	procWinHttpGetIEProxyConfigForCurUsr = modwinhttp.NewProc("WinHttpGetIEProxyConfigForCurrentUser")
 	procWinHttpOpen                      = modwinhttp.NewProc("WinHttpOpen")
+	procWinHttpSetTimeouts               = modwinhttp.NewProc("WinHttpSetTimeouts")
 	procWinHttpGetProxyForUrl            = modwinhttp.NewProc("WinHttpGetProxyForUrl")
-	procWinHttpCloseHandle               = modwinhttp.NewProc("WinHttpCloseHandle")
 	procGlobalFree                       = modkernel32.NewProc("GlobalFree")
+
+	pacSessionOnce sync.Once
+	pacSession     uintptr
 )
 
 type winProxyConfig struct {
@@ -76,21 +83,33 @@ var winProxyCache struct {
 }
 
 type pacEntry struct {
-	at  time.Time
-	url *url.URL // nil means PAC explicitly returned DIRECT
+	at      time.Time
+	decided bool     // false caches discovery failure briefly to avoid repeat stalls
+	url     *url.URL // nil when decided && PAC explicitly returned DIRECT
 }
 
-func systemProxy(target *url.URL) (*url.URL, ProxySource, error) {
+func getPACSession() uintptr {
+	pacSessionOnce.Do(func() {
+		ua, _ := windows.UTF16PtrFromString("ytb-music")
+		h, _, _ := procWinHttpOpen.Call(uintptr(unsafe.Pointer(ua)), 1, 0, 0, 0)
+		runtime.KeepAlive(ua)
+		if h != 0 {
+			// Bound DNS/connect/send/receive on PAC fetches to 1.5s each.
+			procWinHttpSetTimeouts.Call(h, 1500, 1500, 1500, 1500)
+			pacSession = h
+		}
+	})
+	return pacSession
+}
+
+func systemProxy(ctx context.Context, target *url.URL) (*url.URL, ProxySource, error) {
 	cfg := readWindowsProxy()
 	scheme := "https"
 	if target != nil && target.Scheme != "" {
 		scheme = strings.ToLower(target.Scheme)
 	}
-	// Windows evaluates automatic proxy configuration (WPAD / PAC) first,
-	// falling back to manual settings only when auto-proxy fails rather than
-	// when a PAC script explicitly chooses DIRECT.
 	if (cfg.autoDetect || cfg.autoConfigURL != "") && target != nil {
-		if u, decided := resolveWindowsPAC(target, cfg.autoDetect, cfg.autoConfigURL); decided {
+		if u, decided := resolveWindowsPAC(ctx, target, cfg.autoDetect, cfg.autoConfigURL); decided {
 			if u == nil {
 				return nil, ProxySourceNone, nil
 			}
@@ -160,7 +179,10 @@ func readWindowsProxy() winProxyConfig {
 	return cfg
 }
 
-func resolveWindowsPAC(target *url.URL, autoDetect bool, autoConfigURL string) (*url.URL, bool) {
+func resolveWindowsPAC(ctx context.Context, target *url.URL, autoDetect bool, autoConfigURL string) (*url.URL, bool) {
+	if ctx != nil && ctx.Err() != nil {
+		return nil, false
+	}
 	sanitized := url.URL{
 		Scheme: strings.ToLower(target.Scheme),
 		Host:   strings.ToLower(target.Host),
@@ -179,24 +201,90 @@ func resolveWindowsPAC(target *url.URL, autoDetect bool, autoConfigURL string) (
 	if winProxyCache.pac == nil {
 		winProxyCache.pac = map[string]pacEntry{}
 	}
-	if e, ok := winProxyCache.pac[key]; ok && time.Since(e.at) < 30*time.Second {
-		winProxyCache.mu.Unlock()
-		if e.url == nil {
-			return nil, true
+	if e, ok := winProxyCache.pac[key]; ok {
+		ttl := pacSuccessTTL
+		if !e.decided {
+			ttl = pacFailureTTL
 		}
-		cp := *e.url
-		return &cp, true
+		if time.Since(e.at) < ttl {
+			winProxyCache.mu.Unlock()
+			if !e.decided {
+				return nil, false
+			}
+			if e.url == nil {
+				return nil, true
+			}
+			cp := *e.url
+			return &cp, true
+		}
 	}
 	winProxyCache.mu.Unlock()
 
-	ua, _ := windows.UTF16PtrFromString("ytb-music")
-	session, _, _ := procWinHttpOpen.Call(uintptr(unsafe.Pointer(ua)), 1, 0, 0, 0)
-	runtime.KeepAlive(ua)
+	session := getPACSession()
 	if session == 0 {
 		return nil, false
 	}
-	defer procWinHttpCloseHandle.Call(session)
 
+	type pacResult struct {
+		url     *url.URL
+		decided bool
+	}
+	ch := make(chan pacResult, 1)
+	targetScheme := target.Scheme
+	go func() {
+		u, dec := queryWinHTTPPAC(session, pacInput, targetScheme, autoDetect, autoConfigURL)
+		storePACCache(key, u, dec)
+		ch <- pacResult{url: u, decided: dec}
+	}()
+
+	timer := time.NewTimer(pacLookupBudget)
+	defer timer.Stop()
+	var done <-chan struct{}
+	if ctx != nil {
+		done = ctx.Done()
+	}
+	select {
+	case res := <-ch:
+		if res.url == nil {
+			return nil, res.decided
+		}
+		cp := *res.url
+		return &cp, res.decided
+	case <-done:
+		return nil, false
+	case <-timer.C:
+		storePACCache(key, nil, false)
+		return nil, false
+	}
+}
+
+func storePACCache(key string, resolved *url.URL, decided bool) {
+	var stored *url.URL
+	if resolved != nil {
+		cp := *resolved
+		stored = &cp
+	}
+	winProxyCache.mu.Lock()
+	if winProxyCache.pac == nil {
+		winProxyCache.pac = map[string]pacEntry{}
+	}
+	if len(winProxyCache.pac) >= maxPACCacheEntries {
+		var oldestKey string
+		var oldestAt time.Time
+		for k, v := range winProxyCache.pac {
+			if oldestKey == "" || v.at.Before(oldestAt) {
+				oldestKey, oldestAt = k, v.at
+			}
+		}
+		if oldestKey != "" {
+			delete(winProxyCache.pac, oldestKey)
+		}
+	}
+	winProxyCache.pac[key] = pacEntry{at: time.Now(), decided: decided, url: stored}
+	winProxyCache.mu.Unlock()
+}
+
+func queryWinHTTPPAC(session uintptr, pacInput, targetScheme string, autoDetect bool, autoConfigURL string) (*url.URL, bool) {
 	var opts winhttpAutoProxyOptions
 	var acPtr *uint16
 	if autoDetect {
@@ -210,7 +298,6 @@ func resolveWindowsPAC(target *url.URL, autoDetect bool, autoConfigURL string) (
 			opts.AutoConfigURL = acPtr
 		}
 	}
-	// Never automatically send Windows logon credentials to untrusted WPAD/PAC servers.
 	opts.AutoLogonIfChallenged = 0
 
 	u16, err := windows.UTF16PtrFromString(pacInput)
@@ -231,7 +318,6 @@ func resolveWindowsPAC(target *url.URL, autoDetect bool, autoConfigURL string) (
 		}
 		return nil, false
 	}
-
 	var resolved *url.URL
 	decided := false
 	switch info.AccessType {
@@ -240,36 +326,13 @@ func resolveWindowsPAC(target *url.URL, autoDetect bool, autoConfigURL string) (
 	case winhttpAccessTypeNamedProxy:
 		if info.Proxy != nil {
 			rawList := windows.UTF16PtrToString(info.Proxy)
-			resolved, decided = parseWinHTTPProxyList(rawList, target.Scheme)
+			resolved, decided = parseWinHTTPProxyList(rawList, targetScheme)
 		}
 	}
 	if info.Proxy != nil {
 		globalFree(info.Proxy)
 	}
-	if !decided {
-		return nil, false
-	}
-
-	winProxyCache.mu.Lock()
-	if len(winProxyCache.pac) >= maxPACCacheEntries {
-		var oldestKey string
-		var oldestAt time.Time
-		for k, v := range winProxyCache.pac {
-			if oldestKey == "" || v.at.Before(oldestAt) {
-				oldestKey, oldestAt = k, v.at
-			}
-		}
-		if oldestKey != "" {
-			delete(winProxyCache.pac, oldestKey)
-		}
-	}
-	winProxyCache.pac[key] = pacEntry{at: time.Now(), url: resolved}
-	winProxyCache.mu.Unlock()
-	if resolved == nil {
-		return nil, true
-	}
-	cp := *resolved
-	return &cp, true
+	return resolved, decided
 }
 
 func parseWinHTTPProxyList(list, scheme string) (*url.URL, bool) {
@@ -384,9 +447,14 @@ func windowsBypassed(target *url.URL, bypass string) bool {
 			pat = pat[idx+3:]
 		}
 		candidate := host
-		if strings.Contains(pat, ":") && !strings.HasPrefix(pat, "[") {
-			candidate = hostPort
-		} else if strings.HasPrefix(pat, "[") && strings.Contains(pat, "]:") {
+		if strings.HasPrefix(pat, "[") {
+			if strings.Contains(pat, "]:") {
+				candidate = hostPort
+			} else if strings.HasSuffix(pat, "]") {
+				// Strip brackets on host-only IPv6 patterns so they match target.Hostname().
+				pat = pat[1 : len(pat)-1]
+			}
+		} else if strings.Contains(pat, ":") {
 			candidate = hostPort
 		}
 		if wildcardMatch(pat, candidate) {

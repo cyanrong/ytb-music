@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 )
@@ -38,46 +39,79 @@ var httpClient = &http.Client{Timeout: 20 * time.Second, Transport: proxyTranspo
 // when it gets old or YouTube starts refusing it. Network fetches run
 // outside mu and check gen so resetVisitorData never blocks on slow I/O or
 // accepts tokens from an obsolete route.
+type visitorFetch struct {
+	done chan struct{}
+	data string
+	gen  uint64
+}
+
 var visitor struct {
 	mu         sync.Mutex
 	data       string
 	at         time.Time
 	refreshing bool
+	inflight   *visitorFetch
 	gen        uint64
 }
 
 var visitorRe = regexp.MustCompile(`"(Cg[A-Za-z0-9_%-]{10,})"`)
 
 func visitorData() string {
-	visitor.mu.Lock()
-	if visitor.data != "" {
-		// Old, it serves on while another is fetched: no request waits
-		// for one but the first.
-		if time.Since(visitor.at) >= 6*time.Hour && !visitor.refreshing {
-			visitor.refreshing = true
-			gen := visitor.gen
-			go refreshVisitorData(gen)
+	for range 2 {
+		visitor.mu.Lock()
+		if visitor.data != "" {
+			// Old, it serves on while another is fetched: no request waits
+			// for one but the first.
+			if time.Since(visitor.at) >= 6*time.Hour && !visitor.refreshing {
+				visitor.refreshing = true
+				gen := visitor.gen
+				go refreshVisitorData(gen)
+			}
+			d := visitor.data
+			visitor.mu.Unlock()
+			return d
 		}
-		d := visitor.data
+		f := visitor.inflight
+		leader := false
+		if f == nil || f.gen != visitor.gen {
+			f = &visitorFetch{done: make(chan struct{}), gen: visitor.gen}
+			visitor.inflight = f
+			leader = true
+		}
 		visitor.mu.Unlock()
-		return d
-	}
-	gen := visitor.gen
-	visitor.mu.Unlock()
 
-	d, err := fetchVisitorData()
-	if err != nil || d == "" {
-		return ""
+		if leader {
+			d, err := fetchVisitorData()
+			visitor.mu.Lock()
+			if visitor.gen == f.gen {
+				if err == nil && d != "" {
+					f.data = d
+					if visitor.data == "" {
+						visitor.data, visitor.at = d, time.Now()
+					}
+				}
+				if visitor.inflight == f {
+					visitor.inflight = nil
+				}
+			}
+			visitor.mu.Unlock()
+			close(f.done)
+		} else {
+			<-f.done
+		}
+
+		visitor.mu.Lock()
+		sameGen := visitor.gen == f.gen
+		cur := visitor.data
+		visitor.mu.Unlock()
+		if sameGen {
+			if cur != "" {
+				return cur
+			}
+			return f.data
+		}
 	}
-	visitor.mu.Lock()
-	if visitor.gen == gen && visitor.data == "" {
-		visitor.data, visitor.at = d, time.Now()
-	}
-	if visitor.data != "" {
-		d = visitor.data
-	}
-	visitor.mu.Unlock()
-	return d
+	return ""
 }
 
 func refreshVisitorData(gen uint64) {
@@ -121,6 +155,7 @@ func dropVisitorData(data string) {
 	visitor.mu.Lock()
 	if visitor.data == data {
 		visitor.data = ""
+		visitor.inflight = nil
 		visitor.gen++
 		visitor.refreshing = false
 	}
@@ -131,6 +166,7 @@ func dropVisitorData(data string) {
 func resetVisitorData() {
 	visitor.mu.Lock()
 	visitor.data = ""
+	visitor.inflight = nil
 	visitor.gen++
 	visitor.refreshing = false
 	visitor.mu.Unlock()
@@ -374,6 +410,17 @@ func (c *ttlCache[V]) evict() {
 func (c *ttlCache[V]) clear() {
 	c.mu.Lock()
 	c.entries = map[string]*cacheEntry[V]{}
+	c.mu.Unlock()
+}
+
+// deleteSuffix drops cached entries whose key ends with suffix.
+func (c *ttlCache[V]) deleteSuffix(suffix string) {
+	c.mu.Lock()
+	for k := range c.entries {
+		if strings.HasSuffix(k, suffix) {
+			delete(c.entries, k)
+		}
+	}
 	c.mu.Unlock()
 }
 

@@ -7,7 +7,8 @@ import (
 	"testing"
 )
 
-// Windows proxy server lists honour protocol boundaries and wildcard bypasses.
+// Windows proxy server lists honour protocol boundaries and wildcard bypasses,
+// including bracketed IPv6 host entries.
 func TestWindowsProxyParsingAndBypass(t *testing.T) {
 	if got := pickWindowsProxy("http=127.0.0.1:8080", "https"); got != "" {
 		t.Fatalf("HTTPS borrowed HTTP-only entry: %q", got)
@@ -26,7 +27,7 @@ func TestWindowsProxyParsingAndBypass(t *testing.T) {
 		}
 		return u
 	}
-	bypass := "192.168.*;*youtube.com;<local>;http://onlyhttp.example"
+	bypass := "192.168.*;*youtube.com;<local>;[2001:db8::1];http://onlyhttp.example"
 	if !windowsBypassed(mustURL("https://192.168.1.50/"), bypass) {
 		t.Error("192.168.* did not match")
 	}
@@ -35,6 +36,9 @@ func TestWindowsProxyParsingAndBypass(t *testing.T) {
 	}
 	if !windowsBypassed(mustURL("http://intranet/"), bypass) {
 		t.Error("<local> did not match plain hostname")
+	}
+	if !windowsBypassed(mustURL("https://[2001:db8::1]/"), bypass) {
+		t.Error("[2001:db8::1] did not match bracketed IPv6 host")
 	}
 	if windowsBypassed(mustURL("https://onlyhttp.example/"), bypass) {
 		t.Error("http:// bypass matched https:// target")

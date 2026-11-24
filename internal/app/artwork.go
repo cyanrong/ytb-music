@@ -74,6 +74,11 @@ func (c *artCache) clearFailed() {
 			delete(c.art, key)
 		}
 	}
+	for key, p := range c.gone {
+		if a := p.Value(); a == nil || a.failed {
+			delete(c.gone, key)
+		}
+	}
 }
 
 // add keeps a cover, and drops those asked for least recently once the
@@ -102,7 +107,9 @@ func (c *artCache) add(key string, a *artwork) {
 		a := c.art[key]
 		delete(c.art, key)
 		c.size -= a.size
-		c.gone[key] = weak.Make(a)
+		if !a.failed {
+			c.gone[key] = weak.Make(a)
+		}
 	}
 }
 

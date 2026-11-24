@@ -2,8 +2,11 @@
 
 package ytm
 
-import "net/url"
+import (
+	"context"
+	"net/url"
+)
 
-func systemProxy(*url.URL) (*url.URL, ProxySource, error) {
+func systemProxy(context.Context, *url.URL) (*url.URL, ProxySource, error) {
 	return nil, ProxySourceNone, nil
 }

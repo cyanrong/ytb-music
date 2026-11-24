@@ -85,7 +85,7 @@ func (c *Cache) download(id string, st *ytm.Stream) *download {
 	if id != "" && st != nil && st.Size > 0 {
 		wantLevel, wantSize := st.Level, st.Size
 		refresh = func() (string, error) {
-			ytm.InvalidateRouteCaches()
+			ytm.InvalidateTrackStream(id)
 			fresh, err := songURL(id, wantLevel)
 			if err != nil || fresh == nil || fresh.Level != wantLevel || fresh.Size != wantSize {
 				return "", err

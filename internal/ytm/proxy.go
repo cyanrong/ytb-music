@@ -1,6 +1,7 @@
 package ytm
 
 import (
+	"context"
 	"errors"
 	"net"
 	"net/http"
@@ -10,7 +11,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"time"
 
 	"golang.org/x/net/http/httpproxy"
 )
@@ -29,13 +29,8 @@ const (
 
 var (
 	proxyMu     sync.RWMutex
-	customProxy string // "", "direct", or a validated proxy URL
+	customProxy string // "", "direct", or a normalized proxy URL
 	parsedProxy *url.URL
-
-	// nativeTransport preserves Go's initial transport before http.DefaultTransport
-	// is replaced, so native media lookups on macOS (AVPlayer) share the OS route.
-	nativeTransport = cloneDefaultTransport()
-	nativeClient    = &http.Client{Timeout: 20 * time.Second, Transport: nativeTransport}
 
 	proxyTransport = newProxyTransport()
 
@@ -47,17 +42,13 @@ var (
 	systemProxyFn = systemProxy
 )
 
-func cloneDefaultTransport() *http.Transport {
-	if base, ok := http.DefaultTransport.(*http.Transport); ok {
-		return base.Clone()
-	}
-	return &http.Transport{Proxy: http.ProxyFromEnvironment}
-}
-
 func newProxyTransport() *http.Transport {
-	t := nativeTransport.Clone()
-	t.Proxy = proxyForRequest
-	return t
+	if base, ok := http.DefaultTransport.(*http.Transport); ok {
+		t := base.Clone()
+		t.Proxy = proxyForRequest
+		return t
+	}
+	return &http.Transport{Proxy: proxyForRequest}
 }
 
 // Transport returns the shared HTTP transport that honours SetProxy,
@@ -96,6 +87,7 @@ func ParseProxy(raw string) (*url.URL, error) {
 		return nil, err
 	}
 	u.Scheme = strings.ToLower(u.Scheme)
+	u.Host = strings.ToLower(u.Host)
 	u.Path, u.RawPath = "", ""
 	return u, nil
 }
@@ -128,6 +120,23 @@ func validateHostPort(hostport string) error {
 	return nil
 }
 
+// NormalizeProxy returns the canonical stored representation of raw ("",
+// "direct", or a normalized proxy URL).
+func NormalizeProxy(raw string) (string, error) {
+	s := strings.TrimSpace(raw)
+	if s == "" {
+		return "", nil
+	}
+	if strings.EqualFold(s, "direct") || strings.EqualFold(s, "none") {
+		return "direct", nil
+	}
+	u, err := ParseProxy(s)
+	if err != nil {
+		return "", err
+	}
+	return u.String(), nil
+}
+
 // RedactedProxy formats raw with any embedded password masked for display.
 func RedactedProxy(raw string) string {
 	u, err := ParseProxy(raw)
@@ -139,21 +148,20 @@ func RedactedProxy(raw string) string {
 
 // SetProxy sets the proxy override: "" uses environment and OS system proxy,
 // "direct" forces direct connections, and any valid HTTP/SOCKS5 address
-// routes YouTube requests through that proxy. When the route changes, signed
-// stream caches and idle sockets are invalidated so new requests bind to the
-// new egress IP.
+// routes YouTube requests through that proxy. When the normalized route
+// changes, signed stream caches and idle sockets are invalidated.
 func SetProxy(raw string) error {
-	s := strings.TrimSpace(raw)
-	if strings.EqualFold(s, "none") {
-		s = "direct"
-	}
-	u, err := ParseProxy(s)
+	norm, err := NormalizeProxy(raw)
 	if err != nil {
 		return err
 	}
+	var u *url.URL
+	if norm != "" && norm != "direct" {
+		u, _ = ParseProxy(norm)
+	}
 	proxyMu.Lock()
-	changed := customProxy != s
-	customProxy = s
+	changed := customProxy != norm
+	customProxy = norm
 	parsedProxy = u
 	proxyMu.Unlock()
 
@@ -195,13 +203,34 @@ func InvalidateRouteCaches() {
 	resetVisitorData()
 }
 
+// InvalidateTrackStream drops cached stream URLs for video id alone without
+// disturbing other tracks' caches or pooled connections.
+func InvalidateTrackStream(id string) {
+	if id == "" {
+		return
+	}
+	suffix := "/" + id
+	playerCache.deleteSuffix(suffix)
+	premiumCache.deleteSuffix(suffix)
+}
+
 var musicOriginURL = &url.URL{Scheme: "https", Host: "music.youtube.com", Path: "/"}
 
-// routeCacheKey identifies the current route for YouTube requests so cached
-// signed stream URLs are never reused across a proxy or exit-IP switch, even
-// when OS proxy settings change externally in Follow System mode.
-func routeCacheKey() string {
-	u, src, err := resolveProxy(musicOriginURL)
+// RouteSignature identifies the current route for YouTube media requests so
+// active range downloads can tell whether the route changed mid-song.
+func RouteSignature() string {
+	return routeCacheKeyFor(playerAPI)
+}
+
+// routeCacheKeyFor identifies the active route for rawURL so cached signed
+// stream URLs are never reused across a proxy or exit-IP switch, even when
+// host-specific bypasses or OS proxy settings change externally.
+func routeCacheKeyFor(rawURL string) string {
+	target, err := url.Parse(rawURL)
+	if err != nil || target == nil {
+		target = musicOriginURL
+	}
+	u, src, err := resolveProxy(context.Background(), target)
 	if err != nil || u == nil {
 		return string(src) + ":direct"
 	}
@@ -213,7 +242,7 @@ func routeCacheKey() string {
 // threads should invoke this from a background goroutine because PAC resolution
 // may perform WinHTTP lookups.
 func EffectiveProxy() (string, ProxySource) {
-	u, src, err := resolveProxy(musicOriginURL)
+	u, src, err := resolveProxy(context.Background(), musicOriginURL)
 	if err != nil || u == nil {
 		return "", src
 	}
@@ -230,11 +259,11 @@ func proxyForRequest(req *http.Request) (*url.URL, error) {
 	if req == nil || req.URL == nil {
 		return nil, nil
 	}
-	u, _, err := resolveProxy(req.URL)
+	u, _, err := resolveProxy(req.Context(), req.URL)
 	return u, err
 }
 
-func resolveProxy(target *url.URL) (*url.URL, ProxySource, error) {
+func resolveProxy(ctx context.Context, target *url.URL) (*url.URL, ProxySource, error) {
 	if target == nil || isLoopbackHost(target.Hostname()) {
 		return nil, ProxySourceNone, nil
 	}
@@ -261,7 +290,7 @@ func resolveProxy(target *url.URL) (*url.URL, ProxySource, error) {
 	if u != nil {
 		return u, ProxySourceEnv, nil
 	}
-	return systemProxyFn(target)
+	return systemProxyFn(ctx, target)
 }
 
 func envProxy(target *url.URL) (proxy *url.URL, excluded bool, err error) {

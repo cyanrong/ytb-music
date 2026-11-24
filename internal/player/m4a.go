@@ -151,10 +151,31 @@ const (
 // ranged reports whether url is YouTube's, which serves ranges.
 func ranged(url string) bool { return strings.Contains(url, ".googlevideo.com/") }
 
+type httpStatusError struct {
+	code   int
+	status string
+}
+
+func (e httpStatusError) Error() string { return e.status }
+
+func needsStreamRefresh(err error, routeSig *string) bool {
+	var se httpStatusError
+	if errors.As(err, &se) && (se.code == http.StatusForbidden || se.code == http.StatusUnauthorized) {
+		*routeSig = ytm.RouteSignature()
+		return true
+	}
+	if cur := ytm.RouteSignature(); cur != *routeSig {
+		*routeSig = cur
+		return true
+	}
+	return false
+}
+
 // fetchRanges fetches the whole song, of d.size bytes, a range at a time,
 // trying a range again where it broke off, twice, and refreshing the signed
-// stream URL if a proxy or exit-IP change invalidates the current one.
+// stream URL only when an authorization error or route change invalidates it.
 func (d *download) fetchRanges(ctx context.Context, url string) error {
+	routeSig := ytm.RouteSignature()
 	for off := int64(0); off < d.size; {
 		size := int64(rangeSize)
 		if off == 0 {
@@ -163,18 +184,18 @@ func (d *download) fetchRanges(ctx context.Context, url string) error {
 		end := min(off+size, d.size) - 1
 		var err error
 		refreshed := false
-		for attempt := range 3 {
-			if attempt > 0 && !refreshed && d.refresh != nil && ctx.Err() == nil {
-				refreshed = true
-				if fresh, rerr := d.refresh(); rerr == nil && fresh != "" {
-					url = fresh
-				}
-			}
+		for range 3 {
 			var got int64
 			got, err = d.fetchRange(ctx, url, off, end)
 			off += got
 			if err == nil || ctx.Err() != nil {
 				break
+			}
+			if !refreshed && d.refresh != nil && needsStreamRefresh(err, &routeSig) {
+				refreshed = true
+				if fresh, rerr := d.refresh(); rerr == nil && fresh != "" {
+					url = fresh
+				}
 			}
 		}
 		if err != nil {
@@ -199,7 +220,7 @@ func (d *download) fetchRange(ctx context.Context, url string, from, to int64) (
 	}
 	defer res.Body.Close()
 	if res.StatusCode != http.StatusOK && res.StatusCode != http.StatusPartialContent {
-		return 0, errors.New(res.Status)
+		return 0, httpStatusError{code: res.StatusCode, status: res.Status}
 	}
 	var got int64
 	want := to - from + 1
