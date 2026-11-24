@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"net/url"
 	"runtime"
 	"strings"
@@ -12,11 +13,72 @@ import (
 	"ytb-music/internal/ytm"
 )
 
-// setProxy applies the proxy route; tests wrap or inspect it.
-var setProxy = ytm.SetProxy
+// setProxy and reloadHome apply proxy routes and retry the home page; tests
+// swap them out.
+var (
+	setProxy   = ytm.SetProxy
+	reloadHome = func(a *app) { a.loadHome() }
+)
+
+func defaultAutoProxyDesc() string {
+	if runtime.GOOS == "windows" {
+		return "自动跟随环境变量或 Windows 系统代理"
+	}
+	return "自动跟随 HTTP_PROXY / HTTPS_PROXY 环境变量"
+}
+
+func formatAutoProxyDesc(activeURL string, src ytm.ProxySource) string {
+	switch {
+	case activeURL != "" && src == ytm.ProxySourceEnv:
+		return "当前使用环境变量代理：" + activeURL
+	case activeURL != "" && src == ytm.ProxySourcePAC:
+		return "当前使用系统自动代理脚本：" + activeURL
+	case activeURL != "":
+		return "当前使用系统代理：" + activeURL
+	case runtime.GOOS == "windows":
+		return "自动跟随环境变量或 Windows 系统代理（当前直连）"
+	default:
+		return "自动跟随 HTTP_PROXY / HTTPS_PROXY 环境变量（当前直连）"
+	}
+}
+
+// refreshAutoProxyDesc resolves the active automatic route off the UI thread
+// so WinHTTP / PAC lookups never block rendering.
+func (a *app) refreshAutoProxyDesc() {
+	if a.autoProxyDesc == "" {
+		a.autoProxyDesc = defaultAutoProxyDesc()
+	}
+	win := a.settingsWin
+	if win == nil {
+		win = a.win
+	}
+	if win == nil {
+		return
+	}
+	a.autoProxyGen++
+	gen := a.autoProxyGen
+	go func() {
+		activeURL, src := ytm.EffectiveProxy()
+		desc := formatAutoProxyDesc(activeURL, src)
+		win.Update(func() {
+			if gen != a.autoProxyGen {
+				return
+			}
+			if a.autoProxyDesc != desc {
+				a.autoProxyDesc = desc
+				if a.settingsWin != nil {
+					a.settingsWin.Invalidate()
+				}
+			}
+		})
+	}()
+}
 
 func (a *app) syncProxyState() {
 	a.proxyErr = ""
+	if a.autoProxyDesc == "" {
+		a.autoProxyDesc = defaultAutoProxyDesc()
+	}
 	switch strings.ToLower(strings.TrimSpace(a.settings.Proxy)) {
 	case "":
 		a.proxyMode = 0
@@ -24,26 +86,34 @@ func (a *app) syncProxyState() {
 		a.proxyMode = 2
 	default:
 		a.proxyMode = 1
+		a.lastCustomProxy = a.settings.Proxy
 		a.proxyInput = ytm.RedactedProxy(a.settings.Proxy)
 	}
 }
 
-// restoreRedactedPassword preserves the stored proxy password when the editor
-// submits the masked "xxxxx" placeholder unchanged for the same user.
-func restoreRedactedPassword(input, saved string) string {
-	inU, err1 := ytm.ParseProxy(input)
-	svU, err2 := ytm.ParseProxy(saved)
-	if err1 != nil || err2 != nil || inU == nil || svU == nil || inU.User == nil || svU.User == nil {
-		return input
+// restoreRedactedPassword preserves the stored proxy password only when the
+// masked "xxxxx" placeholder is submitted with the exact same scheme, host,
+// port, and username; any endpoint change requires re-entering the password.
+func restoreRedactedPassword(input, saved string) (string, error) {
+	inU, err := ytm.ParseProxy(input)
+	if err != nil || inU == nil || inU.User == nil {
+		return input, nil
 	}
 	inPass, inHas := inU.User.Password()
-	svPass, svHas := svU.User.Password()
-	if inHas && svHas && inPass == "xxxxx" && svPass != "xxxxx" && inU.User.Username() == svU.User.Username() {
-		cp := *inU
-		cp.User = url.UserPassword(svU.User.Username(), svPass)
-		return cp.String()
+	if !inHas || inPass != "xxxxx" {
+		return input, nil
 	}
-	return input
+	svU, err2 := ytm.ParseProxy(saved)
+	if err2 != nil || svU == nil || svU.User == nil {
+		return "", errors.New("masked password has no saved source")
+	}
+	svPass, svHas := svU.User.Password()
+	if !svHas || inU.Scheme != svU.Scheme || !strings.EqualFold(inU.Host, svU.Host) || inU.User.Username() != svU.User.Username() {
+		return "", errors.New("proxy endpoint changed while password remained masked")
+	}
+	cp := *inU
+	cp.User = url.UserPassword(svU.User.Username(), svPass)
+	return cp.String(), nil
 }
 
 func (a *app) onProxyRouteChanged() {
@@ -52,7 +122,7 @@ func (a *app) onProxyRouteChanged() {
 		a.art.clearFailed()
 	}
 	if a.homeErr != "" {
-		a.loadHome()
+		reloadHome(a)
 	}
 }
 
@@ -62,7 +132,12 @@ func (a *app) applyCustomProxy() {
 		a.proxyErr = "请输入有效的代理地址，例如 127.0.0.1:7890 或 socks5://127.0.0.1:1080"
 		return
 	}
-	raw = restoreRedactedPassword(raw, a.settings.Proxy)
+	restored, maskErr := restoreRedactedPassword(raw, a.lastCustomProxy)
+	if maskErr != nil {
+		a.proxyErr = "已更改代理服务器或账号，请重新输入完整的代理密码"
+		return
+	}
+	raw = restored
 	prev := a.settings.Proxy
 	if err := setProxy(raw); err != nil {
 		a.proxyErr = "代理地址格式不正确，请填写有效的 http:// 或 socks5:// 主机与端口"
@@ -70,12 +145,13 @@ func (a *app) applyCustomProxy() {
 	}
 	a.proxyErr = ""
 	a.settings.Proxy = raw
+	a.lastCustomProxy = raw
 	a.proxyInput = ytm.RedactedProxy(raw)
 	a.changed()
 	if prev != raw {
 		a.onProxyRouteChanged()
 	} else if a.homeErr != "" {
-		a.loadHome()
+		reloadHome(a)
 	}
 }
 
@@ -85,6 +161,7 @@ func (a *app) openSettings() {
 		a.settingsWin.Show()
 		a.settingsWin.Focus()
 		a.measureCache()
+		a.refreshAutoProxyDesc()
 		return
 	}
 	a.syncProxyState()
@@ -108,6 +185,7 @@ func (a *app) openSettings() {
 		a.settingsWin = nil
 		a.syncDock()
 	})
+	a.refreshAutoProxyDesc()
 	a.syncDock()
 }
 
@@ -247,24 +325,16 @@ func (a *app) settingsView(c *ui.Context) {
 		})
 
 		group("网络", func() {
-			desc := "作用于目录、音频流、封面与歌词请求；独立登录窗口默认使用系统网络设置"
+			desc := "作用于目录、音频流、封面与歌词请求（Google 登录窗口需重启应用生效，且不支持带密码代理）"
 			switch a.proxyMode {
 			case 0:
-				activeURL, src := ytm.EffectiveProxy()
-				switch {
-				case activeURL != "" && src == ytm.ProxySourceEnv:
-					desc = "当前使用环境变量代理：" + activeURL
-				case activeURL != "" && src == ytm.ProxySourcePAC:
-					desc = "当前使用系统自动代理脚本：" + activeURL
-				case activeURL != "":
-					desc = "当前使用系统代理：" + activeURL
-				case runtime.GOOS == "windows":
-					desc = "自动跟随环境变量或 Windows 系统代理（当前直连）"
-				default:
-					desc = "自动跟随 HTTP_PROXY / HTTPS_PROXY 环境变量（当前直连）"
+				if a.autoProxyDesc != "" {
+					desc = a.autoProxyDesc
+				} else {
+					desc = defaultAutoProxyDesc()
 				}
 			case 2:
-				desc = "目录、音频流、封面与歌词请求直接连接（独立登录窗口与系统视频组件使用系统网络设置）"
+				desc = "目录、音频流、封面与歌词直接连接（Google 登录窗口需重启应用生效；macOS 视频走系统网络）"
 			}
 			row("网络代理", desc, func() {
 				mode := a.proxyMode
@@ -277,14 +347,15 @@ func (a *app) settingsView(c *ui.Context) {
 						s.Proxy = ""
 						_ = setProxy("")
 						a.changed()
+						a.refreshAutoProxyDesc()
 						if prev != "" {
 							a.onProxyRouteChanged()
 						} else if a.homeErr != "" {
-							a.loadHome()
+							reloadHome(a)
 						}
 					case 1:
-						if a.proxyInput == "" && s.Proxy != "" && s.Proxy != "direct" {
-							a.proxyInput = ytm.RedactedProxy(s.Proxy)
+						if a.proxyInput == "" && a.lastCustomProxy != "" {
+							a.proxyInput = ytm.RedactedProxy(a.lastCustomProxy)
 						}
 					case 2:
 						s.Proxy = "direct"
@@ -293,7 +364,7 @@ func (a *app) settingsView(c *ui.Context) {
 						if prev != "direct" {
 							a.onProxyRouteChanged()
 						} else if a.homeErr != "" {
-							a.loadHome()
+							reloadHome(a)
 						}
 					}
 				}

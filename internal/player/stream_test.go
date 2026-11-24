@@ -1,6 +1,8 @@
 package player
 
 import (
+	"bytes"
+	"fmt"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -343,5 +345,54 @@ func TestThroughput(t *testing.T) {
 	noteSpeed(3<<20, time.Second)
 	if got, want := Throughput(), float64(2<<20)*8; got != want {
 		t.Fatalf("%v b/s, want %v", got, want)
+	}
+}
+
+// A ranged download whose signed URL returns 403 mid-song after an exit-IP
+// switch refreshes the stream URL and resumes from the current byte offset.
+func TestRangeDownloadRefreshesURLAfterRouteChange(t *testing.T) {
+	total := int64(firstRange + 64<<10)
+	payload := make([]byte, total)
+	for i := range payload {
+		payload[i] = byte(i % 251)
+	}
+
+	serveRange := func(w http.ResponseWriter, r *http.Request) {
+		rng := r.URL.Query().Get("range")
+		var from, to int64
+		if _, err := fmt.Sscanf(rng, "%d-%d", &from, &to); err != nil || from < 0 || to >= total {
+			http.Error(w, "bad range", http.StatusBadRequest)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(payload[from : to+1])
+	}
+
+	oldSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Query().Get("range") != fmt.Sprintf("0-%d", firstRange-1) {
+			http.Error(w, "ip mismatch", http.StatusForbidden)
+			return
+		}
+		serveRange(w, r)
+	}))
+	defer oldSrv.Close()
+
+	newSrv := httptest.NewServer(http.HandlerFunc(serveRange))
+	defer newSrv.Close()
+
+	refreshes := 0
+	dl := startDownloadWithRefresh(oldSrv.URL+"/.googlevideo.com/videoplayback?id=1", total, nil, nil, func() (string, error) {
+		refreshes++
+		return newSrv.URL + "/.googlevideo.com/videoplayback?id=1", nil
+	})
+	defer dl.Close()
+
+	got := dl.waitFor(total)
+	dl.mu.Lock()
+	err := dl.err
+	data := append([]byte(nil), dl.data...)
+	dl.mu.Unlock()
+	if err != nil || got != total || refreshes != 1 || !bytes.Equal(data, payload) {
+		t.Fatalf("got=%d/%d err=%v refreshes=%d equal=%v", got, total, err, refreshes, bytes.Equal(data, payload))
 	}
 }

@@ -13,12 +13,14 @@ import (
 	"ytb-music/internal/ytm"
 )
 
-// Choosing a proxy mode in Settings validates addresses, redacts credentials,
-// applies the active transport route, clears failed covers, and retries an
-// errored home page across modes.
+// Choosing a proxy mode in Settings validates addresses, binds masked
+// credentials to their original endpoint, applies the active transport route,
+// clears failed covers, and retries an errored home page without hitting the
+// network in offline tests.
 func TestSettingsProxy(t *testing.T) {
 	var applied []string
-	realSet := setProxy
+	homeRetries := 0
+	realSet, realReload := setProxy, reloadHome
 	setProxy = func(raw string) error {
 		if err := realSet(raw); err != nil {
 			return err
@@ -26,8 +28,13 @@ func TestSettingsProxy(t *testing.T) {
 		applied = append(applied, raw)
 		return nil
 	}
+	reloadHome = func(a *app) {
+		homeRetries++
+		a.homeLoading, a.homeErr = true, ""
+	}
 	defer func() {
 		setProxy = realSet
+		reloadHome = realReload
 		_ = ytm.SetProxy("")
 	}()
 
@@ -56,20 +63,20 @@ func TestSettingsProxy(t *testing.T) {
 	// and credentials are redacted in the UI state.
 	a.art.art["https://img/fail"] = &artwork{failed: true}
 	a.video.urls = map[string]videoURL{"v1": {url: "https://signed", at: time.Now()}}
-	a.proxyInput = "http://alice:s3cr3tPass@127.0.0.1:1080"
+	a.proxyInput = "https://alice:s3cr3tPass@127.0.0.1:1080"
 	tt.Frame()
 	if err := tt.Click("应用"); err != nil {
 		t.Fatal(err)
 	}
 	tt.Frame()
-	if a.proxyErr != "" || a.settings.Proxy != "http://alice:s3cr3tPass@127.0.0.1:1080" {
+	if a.proxyErr != "" || a.settings.Proxy != "https://alice:s3cr3tPass@127.0.0.1:1080" {
 		t.Fatalf("valid proxy not saved: err=%q proxy=%q", a.proxyErr, a.settings.Proxy)
 	}
 	if strings.Contains(a.proxyInput, "s3cr3tPass") || tt.HasText("s3cr3tPass") {
 		t.Fatalf("plaintext password remained visible: input=%q", a.proxyInput)
 	}
 	activeURL, activeSrc := ytm.EffectiveProxy()
-	if activeSrc != ytm.ProxySourceCustom || activeURL != "http://alice:xxxxx@127.0.0.1:1080" {
+	if activeSrc != ytm.ProxySourceCustom || activeURL != "https://alice:xxxxx@127.0.0.1:1080" {
 		t.Fatalf("effective route mismatch: %q (%s)", activeURL, activeSrc)
 	}
 	if _, stillFailed := a.art.art["https://img/fail"]; stillFailed {
@@ -77,6 +84,18 @@ func TestSettingsProxy(t *testing.T) {
 	}
 	if len(a.video.urls) != 0 {
 		t.Error("cached video URLs were not cleared after route change")
+	}
+
+	// Editing the endpoint or downgrading the scheme while keeping the masked
+	// password must NOT forward the saved password to the new endpoint.
+	a.proxyInput = "http://alice:xxxxx@127.0.0.1:1080"
+	tt.Frame()
+	if err := tt.Click("应用"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if a.proxyErr == "" || a.settings.Proxy != "https://alice:s3cr3tPass@127.0.0.1:1080" {
+		t.Fatalf("masked password leaked to downgraded endpoint: err=%q proxy=%q", a.proxyErr, a.settings.Proxy)
 	}
 
 	// Switching to Direct updates the active transport and retries an errored home page.
@@ -89,8 +108,23 @@ func TestSettingsProxy(t *testing.T) {
 	if a.settings.Proxy != "direct" || activeSrc != ytm.ProxySourceDirect {
 		t.Fatalf("direct mode not active: proxy=%q src=%s", a.settings.Proxy, activeSrc)
 	}
-	if !a.homeLoading {
-		t.Error("switching to Direct did not retry an errored home load")
+	if homeRetries != 1 {
+		t.Fatalf("switching to Direct retried home %d times, want 1", homeRetries)
+	}
+
+	// Switching back to Custom preserves the original password for the same endpoint.
+	if err := tt.Click("自定义"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	a.proxyInput = "https://alice:xxxxx@127.0.0.1:1080"
+	tt.Frame()
+	if err := tt.Click("应用"); err != nil {
+		t.Fatal(err)
+	}
+	tt.Frame()
+	if a.proxyErr != "" || a.settings.Proxy != "https://alice:s3cr3tPass@127.0.0.1:1080" {
+		t.Fatalf("round-trip back to Custom lost password: err=%q proxy=%q", a.proxyErr, a.settings.Proxy)
 	}
 }
 
@@ -115,6 +149,7 @@ func TestSettingsProxyFrames(t *testing.T) {
 	a.settings = defaultSettings()
 	a.settings.Quality = "exhigh"
 	a.syncProxyState()
+	a.autoProxyDesc = formatAutoProxyDesc(ytm.EffectiveProxy())
 	tt := ui.NewTester(a.settingsView, 560, 760)
 	tt.SetDark(true)
 	tt.Frame()

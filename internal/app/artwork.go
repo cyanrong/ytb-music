@@ -44,6 +44,7 @@ type artCache struct {
 	now   func() time.Time
 	size  int // the bytes the covers in art keep
 	limit int
+	gen   int // incremented on route change so in-flight failures do not stick
 }
 
 // artLimit is how many bytes of covers the cache keeps. A cover keeps its
@@ -67,6 +68,7 @@ func (c *artCache) clearFailed() {
 	if c == nil {
 		return
 	}
+	c.gen++
 	for key, a := range c.art {
 		if a != nil && a.failed {
 			delete(c.art, key)
@@ -128,6 +130,7 @@ func (c *artCache) get(url string, backdrop bool) *artwork {
 		return nil
 	}
 	c.busy[key] = true
+	gen := c.gen
 	go func() {
 		c.sem <- struct{}{}
 		bmp, img, size, err := loadArt(url)
@@ -143,7 +146,9 @@ func (c *artCache) get(url string, backdrop bool) *artwork {
 		c.post(func() {
 			delete(c.busy, key)
 			if err != nil {
-				c.add(key, &artwork{failed: true, used: c.now()})
+				if gen == c.gen {
+					c.add(key, &artwork{failed: true, used: c.now()})
+				}
 				return
 			}
 			a := &artwork{bmp: bmp, tint: tint, used: c.now(), size: size}

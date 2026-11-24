@@ -3,7 +3,9 @@ package ytm
 import (
 	"errors"
 	"fmt"
+	"net/http"
 	"net/url"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
@@ -23,11 +25,15 @@ type player struct {
 var playerCache = newCache[*player](30*time.Minute, 64)
 
 func playerOf(id string) (*player, error) {
+	return playerOfClient(httpClient, routeCacheKey(), id)
+}
+
+func playerOfClient(hc *http.Client, routeKey, id string) (*player, error) {
 	if id == "" {
 		return nil, ErrUnavailable
 	}
-	return playerCache.get(Language+"/"+Region+"/"+id, func() (*player, error) {
-		resp, err := callPlayer(id)
+	return playerCache.get(routeKey+"|"+Language+"/"+Region+"/"+id, func() (*player, error) {
+		resp, err := callPlayerOn(hc, id)
 		if err != nil {
 			return nil, err
 		}
@@ -164,7 +170,7 @@ var premiumCache = newCache[*Stream](30*time.Minute, 64)
 // premiumStream returns a track's AAC at 256 kbps, which YouTube Music's
 // web client gives an account with Premium, unscrambled.
 func premiumStream(id string) (*Stream, error) {
-	return premiumCache.get(Language+"/"+Region+"/"+id, func() (*Stream, error) {
+	return premiumCache.get(routeCacheKey()+"|"+Language+"/"+Region+"/"+id, func() (*Stream, error) {
 		sv, err := currentSolver()
 		if err != nil {
 			return nil, err
@@ -196,10 +202,21 @@ func premiumStream(id string) (*Stream, error) {
 	})
 }
 
+// videoHTTPClient returns the HTTP client whose egress matches the native
+// video player: on macOS, AVPlayer uses the system network stack rather than
+// custom Go proxy overrides.
+func videoHTTPClient() (*http.Client, string) {
+	if runtime.GOOS == "darwin" {
+		return nativeClient, "native"
+	}
+	return httpClient, routeCacheKey()
+}
+
 // VideoURL returns the HLS manifest of a video, which the system's player
 // plays adaptively.
 func VideoURL(id string) (string, error) {
-	p, err := playerOf(id)
+	hc, rkey := videoHTTPClient()
+	p, err := playerOfClient(hc, rkey, id)
 	if err != nil {
 		return "", err
 	}
@@ -223,7 +240,8 @@ func VideoStream(id string, height, bps int) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	body, _, err := get(master, UserAgent)
+	hc, _ := videoHTTPClient()
+	body, _, err := getOn(hc, master, UserAgent)
 	if err != nil {
 		return master, nil
 	}

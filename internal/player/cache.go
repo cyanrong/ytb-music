@@ -81,13 +81,25 @@ func (c *Cache) lookup(id string, level string) (*download, *ytm.Stream, bool) {
 // download fetches the song of the stream st into a file, to keep once it
 // has all come in; or into memory, if the cache would not keep it.
 func (c *Cache) download(id string, st *ytm.Stream) *download {
+	var refresh func() (string, error)
+	if id != "" && st != nil && st.Size > 0 {
+		wantLevel, wantSize := st.Level, st.Size
+		refresh = func() (string, error) {
+			ytm.InvalidateRouteCaches()
+			fresh, err := songURL(id, wantLevel)
+			if err != nil || fresh == nil || fresh.Level != wantLevel || fresh.Size != wantSize {
+				return "", err
+			}
+			return fresh.URL, nil
+		}
+	}
 	part := c.part(st)
 	if part == nil {
-		return startDownload(st.URL, st.Size, nil, nil)
+		return startDownloadWithRefresh(st.URL, st.Size, nil, nil, refresh)
 	}
-	return startDownload(st.URL, st.Size, part, func(path string, n int64) (string, bool) {
+	return startDownloadWithRefresh(st.URL, st.Size, part, func(path string, n int64) (string, bool) {
 		return c.keep(id, st, path, n)
-	})
+	}, refresh)
 }
 
 // part makes a file for a song of the stream st to come into, or returns

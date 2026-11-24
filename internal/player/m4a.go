@@ -152,7 +152,8 @@ const (
 func ranged(url string) bool { return strings.Contains(url, ".googlevideo.com/") }
 
 // fetchRanges fetches the whole song, of d.size bytes, a range at a time,
-// trying a range again where it broke off, twice.
+// trying a range again where it broke off, twice, and refreshing the signed
+// stream URL if a proxy or exit-IP change invalidates the current one.
 func (d *download) fetchRanges(ctx context.Context, url string) error {
 	for off := int64(0); off < d.size; {
 		size := int64(rangeSize)
@@ -161,7 +162,14 @@ func (d *download) fetchRanges(ctx context.Context, url string) error {
 		}
 		end := min(off+size, d.size) - 1
 		var err error
-		for range 3 {
+		refreshed := false
+		for attempt := range 3 {
+			if attempt > 0 && !refreshed && d.refresh != nil && ctx.Err() == nil {
+				refreshed = true
+				if fresh, rerr := d.refresh(); rerr == nil && fresh != "" {
+					url = fresh
+				}
+			}
 			var got int64
 			got, err = d.fetchRange(ctx, url, off, end)
 			off += got

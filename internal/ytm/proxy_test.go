@@ -2,19 +2,28 @@ package ytm
 
 import (
 	"net/http"
-	"runtime"
+	"net/url"
+	"os"
 	"testing"
 )
 
-// Proxy validation rejects malformed endpoints, honours NO_PROXY before OS
-// fallbacks, and clears IP-bound stream caches when routes change.
+// Proxy validation rejects malformed endpoints, accepts IPv6 literals with or
+// without explicit ports, honours NO_PROXY ahead of OS fallbacks, and keys
+// stream caches by the effective route.
 func TestProxyForRequest(t *testing.T) {
-	defer func() { _ = SetProxy("") }()
+	realSystem := systemProxyFn
+	defer func() {
+		systemProxyFn = realSystem
+		_ = SetProxy("")
+		_ = os.Unsetenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
+	}()
 
 	for _, bad := range []string{
 		"ftp://127.0.0.1:21",
 		"http://:7890",
 		":7890",
+		"http://[::1",
+		"http://[::1]:0",
 		"http://127.0.0.1:0",
 		"http://127.0.0.1:70000",
 		"http://127.0.0.1:abc",
@@ -26,10 +35,17 @@ func TestProxyForRequest(t *testing.T) {
 		}
 	}
 
-	u, err := ParseProxy("127.0.0.1:7890")
-	if err != nil || u == nil || u.String() != "http://127.0.0.1:7890" {
-		t.Fatalf("ParseProxy bare host: %v, %v", u, err)
+	for _, good := range [][2]string{
+		{"127.0.0.1:7890", "http://127.0.0.1:7890"},
+		{"http://[::1]", "http://[::1]"},
+		{"socks5h://[2001:db8::1]:1080", "socks5h://[2001:db8::1]:1080"},
+	} {
+		u, err := ParseProxy(good[0])
+		if err != nil || u == nil || u.String() != good[1] {
+			t.Fatalf("ParseProxy(%q) = %v, %v; want %q", good[0], u, err, good[1])
+		}
 	}
+
 	if got := RedactedProxy("http://user:secret123@127.0.0.1:7890"); got != "http://user:xxxxx@127.0.0.1:7890" {
 		t.Fatalf("RedactedProxy leaked secret: %q", got)
 	}
@@ -66,20 +82,33 @@ func TestProxyForRequest(t *testing.T) {
 		t.Fatalf("direct mode used proxy: %v, %v", got, err)
 	}
 
-	// In automatic mode, NO_PROXY must prevent falling back to the OS proxy.
+	// Deterministic OS fallback: without NO_PROXY it routes through the OS
+	// proxy; with NO_PROXY=music.youtube.com it connects directly; and when the
+	// OS proxy changes externally, routeCacheKey changes automatically.
+	osProxyURL, _ := url.Parse("http://10.0.0.2:8888")
+	systemProxyFn = func(*url.URL) (*url.URL, ProxySource, error) {
+		cp := *osProxyURL
+		return &cp, ProxySourceSystem, nil
+	}
 	if err := SetProxy(""); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("HTTP_PROXY", "")
 	t.Setenv("HTTPS_PROXY", "")
+	t.Setenv("NO_PROXY", "")
+	if got, err := proxyForRequest(extReq); err != nil || got == nil || got.String() != "http://10.0.0.2:8888" {
+		t.Fatalf("expected OS fallback proxy, got %v (%v)", got, err)
+	}
+	keyBefore := routeCacheKey()
+
 	t.Setenv("NO_PROXY", "music.youtube.com")
 	if got, err := proxyForRequest(extReq); err != nil || got != nil {
-		t.Fatalf("NO_PROXY bypassed to %v (%v)", got, err)
+		t.Fatalf("NO_PROXY fell through to OS proxy: %v (%v)", got, err)
 	}
 
 	t.Setenv("NO_PROXY", "")
-	if runtime.GOOS == "windows" {
-		active, src := EffectiveProxy()
-		t.Logf("detected Windows effective proxy: %q (source=%s)", active, src)
+	osProxyURL, _ = url.Parse("http://10.0.0.3:9999")
+	if keyAfter := routeCacheKey(); keyAfter == keyBefore {
+		t.Fatalf("routeCacheKey did not change after external OS proxy switch: %q", keyAfter)
 	}
 }

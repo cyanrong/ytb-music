@@ -33,8 +33,9 @@ type download struct {
 	cancel context.CancelFunc
 	// part is the file's path until the cache keeps it, which keep does
 	// once the song has all come in: the path it is at then.
-	part string
-	keep func(part string, n int64) (string, bool)
+	part    string
+	keep    func(part string, n int64) (string, bool)
+	refresh func() (string, error) // reacquires a fresh signed URL after a route change
 	// users counts what reads or writes the song: the stream decoding it,
 	// until it closes, and the goroutine fetching it. The last to go
 	// closes the file, and removes it unless the cache kept it.
@@ -45,8 +46,12 @@ type download struct {
 // startDownload fetches url, of size bytes if known, into part, a file
 // that keep keeps once it has all come in: or into memory, without one.
 func startDownload(url string, size int64, part *os.File, keep func(string, int64) (string, bool)) *download {
+	return startDownloadWithRefresh(url, size, part, keep, nil)
+}
+
+func startDownloadWithRefresh(url string, size int64, part *os.File, keep func(string, int64) (string, bool), refresh func() (string, error)) *download {
 	ctx, cancel := context.WithCancel(context.Background())
-	d := &download{size: size, cancel: cancel, users: 2}
+	d := &download{size: size, cancel: cancel, refresh: refresh, users: 2}
 	d.cond.L = &d.mu
 	switch {
 	case part != nil:

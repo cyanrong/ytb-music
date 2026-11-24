@@ -2,10 +2,11 @@ package jsc
 
 import (
 	"os"
-	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+
+	"github.com/dop251/goja"
 )
 
 // A script's value comes back as a string, and what it throws as an
@@ -22,7 +23,7 @@ func TestEval(t *testing.T) {
 
 // Hostile values whose string conversion throws or cannot coerce return
 // errors instead of panicking, and sourceMappingURL comments do not read
-// files on disk.
+// files on disk when formatting stack traces.
 func TestEvalHostileValuesAndSourceMaps(t *testing.T) {
 	if _, err := Eval(`throw { toString() { throw new Error("nested"); } }`); err == nil {
 		t.Fatal("expected error when thrown object's toString throws")
@@ -36,12 +37,26 @@ func TestEvalHostileValuesAndSourceMaps(t *testing.T) {
 	_, _ = Eval(`Symbol("x")`)
 
 	dir := t.TempDir()
-	mapPath := filepath.Join(dir, "secret.map")
-	os.WriteFile(mapPath, []byte(`{"version":3,"sources":["secret.js"],"names":[],"mappings":"AAAA"}`), 0o600)
-	script := "function f() { throw new Error('boom'); }\nf();\n//# sourceMappingURL=" + filepath.ToSlash(mapPath)
-	_, err := Eval(script)
-	if err == nil || strings.Contains(err.Error(), "secret.js") {
-		t.Fatalf("source map should be ignored in compute-only context, got: %v", err)
+	t.Chdir(dir)
+	os.WriteFile("secret.map", []byte(`{"version":3,"file":"<eval>","sources":["mapped-secret.js"],"names":[],"mappings":"AAAA,IAAIA,KAAK"}`), 0o600)
+	script := "var x = new Error('boom').stack; x\n//# sourceMappingURL=secret.map"
+
+	// Positive control on non-darwin: default goja reads the local source map
+	// when formatting Error.stack, rewriting frames to mapped-secret.js.
+	if runtime.GOOS != "darwin" {
+		rawVM := goja.New()
+		val, err := rawVM.RunString(script)
+		if err != nil || !strings.Contains(val.String(), "mapped-secret.js") {
+			t.Fatalf("positive control did not observe source map in stack: %v, %v", val, err)
+		}
+	}
+
+	stack, err := Eval(script)
+	if err != nil {
+		t.Fatalf("Eval stack script: %v", err)
+	}
+	if strings.Contains(stack, "mapped-secret.js") {
+		t.Fatalf("jsc read local source map from disk: %s", stack)
 	}
 }
 

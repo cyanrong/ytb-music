@@ -159,12 +159,15 @@ type app struct {
 	sig                   playerSig
 	quitting              bool
 
-	settings    settings
-	settingsWin *mygo.Window
-	proxyMode   int    // 0: system, 1: custom, 2: direct
-	proxyInput  string // custom proxy address edited in settings
-	proxyErr    string
-	cacheUsed   int64 // the bytes the song cache takes, -1 until measured
+	settings        settings
+	settingsWin     *mygo.Window
+	proxyMode       int    // 0: system, 1: custom, 2: direct
+	proxyInput      string // custom proxy address edited in settings
+	lastCustomProxy string // last saved custom proxy URL, kept across mode switches
+	proxyErr        string
+	autoProxyDesc   string // resolved off the UI thread for Follow System mode
+	autoProxyGen    int
+	cacheUsed       int64 // the bytes the song cache takes, -1 until measured
 	updates     bool  // the update plugin is used (useUpdater)
 
 	restored     bool   // playback picked up where it was left
@@ -233,6 +236,7 @@ func Run() error {
 	mygo.App.WhenReady(func() {
 		a.settings = loadSettings()
 		_ = ytm.SetProxy(a.settings.Proxy)
+		ytm.InitWebViewProxy(a.settings.Proxy)
 		http.DefaultTransport = ytm.Transport()
 		a.syncProxyState()
 		a.settings.applyAppearance()

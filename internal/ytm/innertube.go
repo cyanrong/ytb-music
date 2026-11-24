@@ -35,12 +35,15 @@ var httpClient = &http.Client{Timeout: 20 * time.Second, Transport: proxyTranspo
 
 // visitor is the visitorData that anonymous requests carry, as a browser
 // that has been to YouTube before: fetched once, shared, and fetched again
-// when it gets old or YouTube starts refusing it.
+// when it gets old or YouTube starts refusing it. Network fetches run
+// outside mu and check gen so resetVisitorData never blocks on slow I/O or
+// accepts tokens from an obsolete route.
 var visitor struct {
 	mu         sync.Mutex
 	data       string
 	at         time.Time
 	refreshing bool
+	gen        uint64
 }
 
 var visitorRe = regexp.MustCompile(`"(Cg[A-Za-z0-9_%-]{10,})"`)
@@ -52,26 +55,40 @@ func visitorData() string {
 		// for one but the first.
 		if time.Since(visitor.at) >= 6*time.Hour && !visitor.refreshing {
 			visitor.refreshing = true
-			go refreshVisitorData()
+			gen := visitor.gen
+			go refreshVisitorData(gen)
 		}
 		d := visitor.data
 		visitor.mu.Unlock()
 		return d
 	}
-	defer visitor.mu.Unlock()
-	if d, err := fetchVisitorData(); err == nil {
+	gen := visitor.gen
+	visitor.mu.Unlock()
+
+	d, err := fetchVisitorData()
+	if err != nil || d == "" {
+		return ""
+	}
+	visitor.mu.Lock()
+	if visitor.gen == gen && visitor.data == "" {
 		visitor.data, visitor.at = d, time.Now()
 	}
-	return visitor.data
+	if visitor.data != "" {
+		d = visitor.data
+	}
+	visitor.mu.Unlock()
+	return d
 }
 
-func refreshVisitorData() {
+func refreshVisitorData(gen uint64) {
 	d, err := fetchVisitorData()
 	visitor.mu.Lock()
-	if err == nil {
-		visitor.data, visitor.at = d, time.Now()
+	if visitor.gen == gen {
+		if err == nil && d != "" {
+			visitor.data, visitor.at = d, time.Now()
+		}
+		visitor.refreshing = false
 	}
-	visitor.refreshing = false
 	visitor.mu.Unlock()
 }
 
@@ -104,6 +121,8 @@ func dropVisitorData(data string) {
 	visitor.mu.Lock()
 	if visitor.data == data {
 		visitor.data = ""
+		visitor.gen++
+		visitor.refreshing = false
 	}
 	visitor.mu.Unlock()
 }
@@ -112,6 +131,8 @@ func dropVisitorData(data string) {
 func resetVisitorData() {
 	visitor.mu.Lock()
 	visitor.data = ""
+	visitor.gen++
+	visitor.refreshing = false
 	visitor.mu.Unlock()
 }
 
@@ -161,8 +182,12 @@ func call(endpoint string, body map[string]any) (any, error) {
 // callPlayer asks the visionOS client for a video's streams: its formats
 // come as plain URLs that serve whole.
 func callPlayer(id string) (any, error) {
+	return callPlayerOn(httpClient, id)
+}
+
+func callPlayerOn(hc *http.Client, id string) (any, error) {
 	body := map[string]any{"videoId": id, "contentCheckOk": true, "racyCheckOk": true}
-	return post(playerAPI, body, func(vd string) (map[string]any, http.Header) {
+	return postOn(hc, playerAPI, body, func(vd string) (map[string]any, http.Header) {
 		client := map[string]any{
 			"clientName": visionName, "clientVersion": visionVer, "hl": Language, "gl": Region,
 			"deviceMake": "Apple", "deviceModel": "RealityDevice14,1",
@@ -181,6 +206,10 @@ func callPlayer(id string) (any, error) {
 // post sends body with the context client makes, and tries once more with
 // fresh visitorData if YouTube refuses the one it had.
 func post(url string, body map[string]any, client func(vd string) (map[string]any, http.Header)) (any, error) {
+	return postOn(httpClient, url, body, client)
+}
+
+func postOn(hc *http.Client, url string, body map[string]any, client func(vd string) (map[string]any, http.Header)) (any, error) {
 	var err error
 	for try := 0; try < 2; try++ {
 		vd := visitorData()
@@ -192,7 +221,7 @@ func post(url string, body map[string]any, client func(vd string) (map[string]an
 		payload["context"] = map[string]any{"client": c}
 		var v any
 		var status int
-		v, status, err = postJSON(url, payload, h, vd)
+		v, status, err = postJSONOn(hc, url, payload, h, vd)
 		if err == nil {
 			return v, nil
 		}
@@ -204,7 +233,7 @@ func post(url string, body map[string]any, client func(vd string) (map[string]an
 	return nil, err
 }
 
-func postJSON(url string, payload any, h http.Header, vd string) (any, int, error) {
+func postJSONOn(hc *http.Client, url string, payload any, h http.Header, vd string) (any, int, error) {
 	b, err := json.Marshal(payload)
 	if err != nil {
 		return nil, 0, err
@@ -221,7 +250,7 @@ func postJSON(url string, payload any, h http.Header, vd string) (any, int, erro
 	if vd != "" {
 		req.Header.Set("X-Goog-Visitor-Id", vd)
 	}
-	resp, err := httpClient.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}
@@ -247,12 +276,16 @@ func postJSON(url string, payload any, h http.Header, vd string) (any, int, erro
 // get fetches url with the app's User-Agent and returns its body, which
 // must come with status 200.
 func get(url string, ua string) ([]byte, int, error) {
+	return getOn(httpClient, url, ua)
+}
+
+func getOn(hc *http.Client, url string, ua string) ([]byte, int, error) {
 	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
 		return nil, 0, err
 	}
 	req.Header.Set("User-Agent", ua)
-	resp, err := httpClient.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, 0, err
 	}

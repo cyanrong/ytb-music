@@ -10,6 +10,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"golang.org/x/net/http/httpproxy"
 )
@@ -27,26 +28,36 @@ const (
 )
 
 var (
-	proxyMu          sync.RWMutex
-	customProxy      string // "", "direct", or a validated proxy URL
-	parsedProxy      *url.URL
-	webviewEnvOwned  bool // true when SetProxy manages WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS
-	webviewEnvChecked bool
+	proxyMu     sync.RWMutex
+	customProxy string // "", "direct", or a validated proxy URL
+	parsedProxy *url.URL
+
+	// nativeTransport preserves Go's initial transport before http.DefaultTransport
+	// is replaced, so native media lookups on macOS (AVPlayer) share the OS route.
+	nativeTransport = cloneDefaultTransport()
+	nativeClient    = &http.Client{Timeout: 20 * time.Second, Transport: nativeTransport}
 
 	proxyTransport = newProxyTransport()
 
 	// StreamClient fetches media streams without a fixed whole-body timeout,
 	// using the same proxy settings as API requests.
 	StreamClient = &http.Client{Transport: proxyTransport}
+
+	// systemProxyFn resolves the OS system proxy; tests replace it.
+	systemProxyFn = systemProxy
 )
 
-func newProxyTransport() *http.Transport {
+func cloneDefaultTransport() *http.Transport {
 	if base, ok := http.DefaultTransport.(*http.Transport); ok {
-		t := base.Clone()
-		t.Proxy = proxyForRequest
-		return t
+		return base.Clone()
 	}
-	return &http.Transport{Proxy: proxyForRequest}
+	return &http.Transport{Proxy: http.ProxyFromEnvironment}
+}
+
+func newProxyTransport() *http.Transport {
+	t := nativeTransport.Clone()
+	t.Proxy = proxyForRequest
+	return t
 }
 
 // Transport returns the shared HTTP transport that honours SetProxy,
@@ -55,7 +66,7 @@ func Transport() http.RoundTripper {
 	return proxyTransport
 }
 
-// ParseProxy validates raw ("", "direct", "127.0.0.1:7890",
+// ParseProxy validates raw ("", "direct", "127.0.0.1:7890", "[::1]",
 // "http://...", "socks5://...") and returns the normalized URL, or nil
 // for automatic / direct modes.
 func ParseProxy(raw string) (*url.URL, error) {
@@ -81,20 +92,40 @@ func ParseProxy(raw string) (*url.URL, error) {
 	if (u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" {
 		return nil, errors.New("ytm: proxy URL must not contain path, query, or fragment")
 	}
-	// Reject malformed host:port syntax such as trailing colons or out-of-range ports.
-	if strings.Contains(u.Host, ":") {
-		host, portStr, splitErr := net.SplitHostPort(u.Host)
-		if splitErr != nil || host == "" || portStr == "" {
-			return nil, errors.New("ytm: invalid proxy host or port")
-		}
-		port, convErr := strconv.Atoi(portStr)
-		if convErr != nil || port < 1 || port > 65535 {
-			return nil, errors.New("ytm: proxy port out of range")
-		}
+	if err := validateHostPort(u.Host); err != nil {
+		return nil, err
 	}
 	u.Scheme = strings.ToLower(u.Scheme)
 	u.Path, u.RawPath = "", ""
 	return u, nil
+}
+
+func validateHostPort(hostport string) error {
+	if hostport == "" {
+		return errors.New("ytm: empty proxy host")
+	}
+	rest := hostport
+	if strings.HasPrefix(hostport, "[") {
+		closeIdx := strings.IndexByte(hostport, ']')
+		if closeIdx <= 1 {
+			return errors.New("ytm: invalid IPv6 proxy host")
+		}
+		rest = hostport[closeIdx+1:]
+		if rest == "" {
+			return nil // bracketed IPv6 literal without explicit port
+		}
+	} else if !strings.Contains(hostport, ":") {
+		return nil // hostname or IPv4 without explicit port
+	}
+	host, portStr, err := net.SplitHostPort(hostport)
+	if err != nil || host == "" || portStr == "" {
+		return errors.New("ytm: invalid proxy host or port")
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return errors.New("ytm: proxy port out of range")
+	}
+	return nil
 }
 
 // RedactedProxy formats raw with any embedded password masked for display.
@@ -121,23 +152,38 @@ func SetProxy(raw string) error {
 		return err
 	}
 	proxyMu.Lock()
-	if !webviewEnvChecked {
-		webviewEnvChecked = true
-		webviewEnvOwned = os.Getenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") == ""
-	}
 	changed := customProxy != s
 	customProxy = s
 	parsedProxy = u
-	ownWebViewEnv := webviewEnvOwned
 	proxyMu.Unlock()
 
-	if ownWebViewEnv && runtime.GOOS == "windows" {
-		syncWebView2ProxyEnv(s, u)
-	}
 	if changed {
 		InvalidateRouteCaches()
 	}
 	return nil
+}
+
+// InitWebViewProxy configures WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS once at
+// startup on Windows before any WebView2 environment is created, unless the
+// caller already set custom browser arguments.
+func InitWebViewProxy(raw string) {
+	if runtime.GOOS != "windows" || os.Getenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS") != "" {
+		return
+	}
+	s := strings.TrimSpace(raw)
+	if strings.EqualFold(s, "direct") || strings.EqualFold(s, "none") {
+		_ = os.Setenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--no-proxy-server")
+		return
+	}
+	u, err := ParseProxy(s)
+	if err != nil || u == nil || u.User != nil {
+		return
+	}
+	wv := *u
+	if wv.Scheme == "socks5h" {
+		wv.Scheme = "socks5"
+	}
+	_ = os.Setenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--proxy-server="+wv.String())
 }
 
 // InvalidateRouteCaches drops pooled connections, visitor tokens, and cached
@@ -149,24 +195,25 @@ func InvalidateRouteCaches() {
 	resetVisitorData()
 }
 
-// syncWebView2ProxyEnv propagates unauthenticated custom/direct proxy settings
-// to WebView2 before its environment is created on Windows.
-func syncWebView2ProxyEnv(mode string, u *url.URL) {
-	switch {
-	case strings.EqualFold(mode, "direct"):
-		_ = os.Setenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--no-proxy-server")
-	case u != nil && u.User == nil:
-		_ = os.Setenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--proxy-server="+u.String())
-	default:
-		_ = os.Unsetenv("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS")
+var musicOriginURL = &url.URL{Scheme: "https", Host: "music.youtube.com", Path: "/"}
+
+// routeCacheKey identifies the current route for YouTube requests so cached
+// signed stream URLs are never reused across a proxy or exit-IP switch, even
+// when OS proxy settings change externally in Follow System mode.
+func routeCacheKey() string {
+	u, src, err := resolveProxy(musicOriginURL)
+	if err != nil || u == nil {
+		return string(src) + ":direct"
 	}
+	return string(src) + ":" + u.String()
 }
 
 // EffectiveProxy resolves the active proxy route for YouTube Music using the
-// exact request pipeline and returns its redacted URL and source.
+// exact request pipeline and returns its redacted URL and source. Callers on UI
+// threads should invoke this from a background goroutine because PAC resolution
+// may perform WinHTTP lookups.
 func EffectiveProxy() (string, ProxySource) {
-	target := &url.URL{Scheme: "https", Host: "music.youtube.com"}
-	u, src, err := resolveProxy(target)
+	u, src, err := resolveProxy(musicOriginURL)
 	if err != nil || u == nil {
 		return "", src
 	}
@@ -214,7 +261,7 @@ func resolveProxy(target *url.URL) (*url.URL, ProxySource, error) {
 	if u != nil {
 		return u, ProxySourceEnv, nil
 	}
-	return systemProxy(target)
+	return systemProxyFn(target)
 }
 
 func envProxy(target *url.URL) (proxy *url.URL, excluded bool, err error) {
