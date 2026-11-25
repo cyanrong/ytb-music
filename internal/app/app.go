@@ -42,6 +42,19 @@ type route struct {
 	kind  ytm.SearchType
 }
 
+type navSnapshot struct {
+	pageScroll  ui.ScrollState
+	trackList   ui.ListState
+	artistTab   int
+	localTab    int
+	localAlbums ui.ListState
+	localArtist ui.ListState
+	localGenres ui.ListState
+	localTracks ui.ListState
+	localScroll ui.ScrollState
+	localFolder string
+}
+
 // app is the state both windows show. Everything in it is read and changed
 // on the main thread: by the views, and by goroutines through post.
 type app struct {
@@ -52,9 +65,10 @@ type app struct {
 	pl    *player.Player
 	pal   palette
 
-	route   route
-	history []route
-	forward []route // the pages gone back from, the last first to go to
+	route    route
+	history  []route
+	forward  []route // the pages gone back from, the last first to go to
+	navSaved map[route]navSnapshot
 
 	profile      *ytm.Profile
 	mine, saved  []ytm.Playlist  // the listener's playlists: made, and saved

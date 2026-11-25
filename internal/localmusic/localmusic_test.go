@@ -2651,3 +2651,49 @@ func buildSyntheticXingMP3(totalFrames uint32, title, artist string) []byte {
 	out.Write(frame2)
 	return out.Bytes()
 }
+
+// Rescanning an unchanged music folder neither increments Revision nor rewrites local_library.json on disk.
+func TestScanNoOpSkipsRevisionBumpAndIndexRewrite(t *testing.T) {
+	root := t.TempDir()
+	musicDir := filepath.Join(root, "music")
+	if err := os.MkdirAll(musicDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(musicDir, "01 - Track.mp3"), buildSyntheticXingMP3(200, "Quiet Check", "Artist"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	idxPath := filepath.Join(root, "local_library.json")
+	lib := NewLibrary(idxPath, filepath.Join(root, "covers"))
+	lib.AddFolder(musicDir)
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("initial Scan: %v", err)
+	}
+	rev1 := lib.Revision()
+	st1, err := os.Stat(idxPath)
+	if err != nil {
+		t.Fatalf("stat index after initial Scan: %v", err)
+	}
+	past := time.Now().Add(-10 * time.Second)
+	if err := os.Chtimes(idxPath, past, past); err != nil {
+		t.Fatal(err)
+	}
+	stBackdated, err := os.Stat(idxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := lib.Scan(context.Background(), nil); err != nil {
+		t.Fatalf("second Scan: %v", err)
+	}
+	if got := lib.Revision(); got != rev1 {
+		t.Fatalf("unchanged Scan incremented Revision from %d to %d", rev1, got)
+	}
+	st2, err := os.Stat(idxPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st2.ModTime().Equal(stBackdated.ModTime()) || st2.Size() != st1.Size() {
+		t.Fatalf("unchanged Scan rewrote index file: modTime %v -> %v", stBackdated.ModTime(), st2.ModTime())
+	}
+}

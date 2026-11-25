@@ -89,8 +89,9 @@ func (a *app) toggleLike(tr *ytm.Track) {
 	}
 	id, like := tr.ID, !a.liked[tr.ID]
 	a.setLiked(id, like)
+	fn := likeSong
 	go func() {
-		err := likeSong(id, like)
+		err := fn(id, like)
 		a.post(func() {
 			if err != nil {
 				a.setLiked(id, !like)
@@ -113,8 +114,9 @@ func (a *app) toggleLike(tr *ytm.Track) {
 func (a *app) toggleProgramLike(id string) {
 	like := !a.likedPrograms[id]
 	a.setProgramLiked(id, like)
+	fn := likeProgram
 	go func() {
-		err := likeProgram(id, like)
+		err := fn(id, like)
 		a.post(func() {
 			if err != nil {
 				a.setProgramLiked(id, !like)

@@ -115,6 +115,49 @@ func (a *app) shortcuts(c *ui.Context) {
 	}
 }
 
+func (a *app) saveNavState(r route) {
+	if a.navSaved == nil {
+		a.navSaved = map[route]navSnapshot{}
+	}
+	a.navSaved[r] = navSnapshot{
+		pageScroll:  a.pageScroll,
+		trackList:   a.trackList,
+		artistTab:   a.artistTab,
+		localTab:    a.local.tab,
+		localAlbums: a.local.albumsList,
+		localArtist: a.local.artistsList,
+		localGenres: a.local.genresList,
+		localTracks: a.local.tracksList,
+		localScroll: a.local.folderScroll,
+		localFolder: a.local.folderPath,
+	}
+}
+
+func (a *app) restoreNavState(r route) {
+	if a.navSaved == nil {
+		return
+	}
+	snap, ok := a.navSaved[r]
+	if !ok {
+		return
+	}
+	a.pageScroll = snap.pageScroll
+	a.trackList = snap.trackList
+	if r.page == pageArtist {
+		a.artistTab = snap.artistTab
+	}
+	if r.page == pageLocal {
+		a.local.tab = snap.localTab
+		a.local.albumsList = snap.localAlbums
+		a.local.artistsList = snap.localArtist
+		a.local.genresList = snap.localGenres
+		a.local.tracksList = snap.localTracks
+		a.local.folderScroll = snap.localScroll
+		a.local.folderPath = snap.localFolder
+	}
+	a.scrolled = r
+}
+
 // go opens a page, remembering the one before for the back button, and
 // closes Now Playing over it, though it is the page open.
 func (a *app) open(r route) {
@@ -122,6 +165,7 @@ func (a *app) open(r route) {
 	if r == a.route {
 		return
 	}
+	a.saveNavState(a.route)
 	a.history, a.forward = append(a.history, a.route), nil
 	a.show(r)
 }
@@ -167,9 +211,11 @@ func (a *app) back() {
 	if len(a.history) == 0 {
 		return
 	}
+	a.saveNavState(a.route)
 	a.forward = append(a.forward, a.route)
 	r := a.history[len(a.history)-1]
 	a.history = a.history[:len(a.history)-1]
+	a.restoreNavState(r)
 	a.show(r)
 }
 
@@ -179,10 +225,12 @@ func (a *app) goForward() {
 	if len(a.forward) == 0 {
 		return
 	}
+	a.saveNavState(a.route)
 	a.history = append(a.history, a.route)
 	r := a.forward[len(a.forward)-1]
 	a.forward = a.forward[:len(a.forward)-1]
 	a.nowPlaying = false
+	a.restoreNavState(r)
 	a.show(r)
 }
 

@@ -83,6 +83,27 @@ type localUIState struct {
 	picking      bool
 	syncingRoon  bool
 
+	albumsList       ui.ListState
+	albumsSig        string
+	albumsCacheSig   string
+	albumsCacheRev   uint64
+	albumsCacheReady bool
+	cachedAlbums     []localmusic.LocalAlbum
+
+	artistsList       ui.ListState
+	artistsSig        string
+	artistsCacheSig   string
+	artistsCacheRev   uint64
+	artistsCacheReady bool
+	cachedArtists     []localmusic.LocalArtist
+
+	genresList       ui.ListState
+	genresSig        string
+	genresCacheSig   string
+	genresCacheRev   uint64
+	genresCacheReady bool
+	cachedGenres     []localmusic.GenreSummary
+
 	tracksList        ui.ListState
 	tracksSig         string
 	tracksCacheSig    string
@@ -90,6 +111,8 @@ type localUIState struct {
 	tracksCacheReady  bool
 	cachedLocalTracks []localmusic.LocalTrack
 	cachedYTMTracks   []ytm.Track
+
+	folderScroll ui.ScrollState
 
 	newPl localPlaylistPrompt
 }
@@ -181,17 +204,24 @@ func (a *app) initLocalLibrary() {
 	a.setLocalLibrary(lib)
 }
 
-// startInitialLocalScan begins the incremental background folder check once the
-// main window exists and can deliver completion posts to the UI thread.
+// startInitialLocalScan runs a quiet incremental folder check once the main
+// window exists, only surfacing UI scan progress if new or modified audio files
+// actually need parsing.
 func (a *app) startInitialLocalScan() {
 	if a.local.lib != nil && len(a.local.lib.Folders()) > 0 {
-		a.rescanLocalLibrary()
+		a.scanLocalLibrary(true)
 	}
 }
 
 // setLocalLibrary attaches lib to the app, cover cache, and player.
 func (a *app) setLocalLibrary(lib *localmusic.Library) {
 	a.local.lib = lib
+	a.local.albumsCacheReady = false
+	a.local.cachedAlbums = nil
+	a.local.artistsCacheReady = false
+	a.local.cachedArtists = nil
+	a.local.genresCacheReady = false
+	a.local.cachedGenres = nil
 	a.local.tracksCacheReady = false
 	a.local.cachedLocalTracks = nil
 	a.local.cachedYTMTracks = nil
@@ -243,14 +273,20 @@ func (a *app) invalidateLocalPages() {
 	}
 }
 
-// rescanLocalLibrary triggers an incremental background folder scan.
+// rescanLocalLibrary triggers an explicit incremental background folder scan.
 func (a *app) rescanLocalLibrary() {
+	a.scanLocalLibrary(false)
+}
+
+func (a *app) scanLocalLibrary(silent bool) {
 	lib := a.local.lib
 	if lib == nil {
 		return
 	}
 	if len(lib.Folders()) == 0 {
-		a.toast = "请先添加本地音乐文件夹"
+		if !silent {
+			a.toast = "请先添加本地音乐文件夹"
+		}
 		return
 	}
 	if a.local.scanCancel != nil {
@@ -260,16 +296,22 @@ func (a *app) rescanLocalLibrary() {
 	gen := a.local.scanGen
 	ctx, cancel := context.WithCancel(context.Background())
 	a.local.scanCancel = cancel
-	a.local.scanning = true
-	a.local.scanProgress = localmusic.ScanProgress{Scanning: true}
+	if !silent {
+		a.local.scanning = true
+		a.local.scanProgress = localmusic.ScanProgress{Scanning: true}
+	}
 
 	beforeRev := lib.Revision()
 	go func() {
 		err := lib.Scan(ctx, func(sp localmusic.ScanProgress) {
+			if silent && (!sp.Scanning || sp.Total == 0 || sp.Scanned >= sp.Total) {
+				return
+			}
 			a.post(func() {
-				if a.local.scanGen != gen || !a.local.scanning {
+				if a.local.scanGen != gen {
 					return
 				}
+				a.local.scanning = sp.Scanning
 				a.local.scanProgress = sp
 			})
 		})
@@ -280,7 +322,7 @@ func (a *app) rescanLocalLibrary() {
 			a.local.scanning = false
 			a.local.scanProgress.Scanning = false
 			a.local.scanCancel = nil
-			if err == nil || lib.Revision() != beforeRev {
+			if lib.Revision() != beforeRev {
 				a.invalidateLocalPages()
 			}
 			if err != nil && !errors.Is(err, context.Canceled) {
@@ -573,7 +615,7 @@ func (a *app) localPage(c *ui.Context) {
 	// Empty onboarding state when no tracks are indexed and not actively scanning.
 	if stats.Tracks == 0 && !a.local.scanning {
 		top, bottom := a.insets(c)
-		ui.Scroll(c.Key("local-empty")).TrackScroll(&a.pageScroll).Grow(1).
+		ui.Scroll(c.Key("local-empty")).TrackScroll(&a.local.folderScroll).Grow(1).
 			Padding(top+pageGap, pagePad, bottom+32, pagePad).ScrollbarInsets(top, 0, bottom, 0).Children(func() {
 			a.startMark(c)
 			defer a.endMark(c)
@@ -586,29 +628,31 @@ func (a *app) localPage(c *ui.Context) {
 		return
 	}
 
-	// Virtualized ui.List when on the Tracks lens.
-	if a.local.tab == localTabTracks {
+	// Row-virtualized ui.List lenses keep frame build O(visible rows) and avoid
+	// off-screen cover cache thrashing across multi-thousand-album libraries.
+	switch a.local.tab {
+	case localTabAlbums:
+		a.localAlbumsLens(c, stats, folders)
+		return
+	case localTabArtists:
+		a.localArtistsLens(c, stats, folders)
+		return
+	case localTabGenres:
+		a.localGenresLens(c, stats, folders)
+		return
+	case localTabTracks:
 		a.localTracksLens(c, stats, folders)
 		return
 	}
 
 	top, bottom := a.insets(c)
-	ui.Scroll(c.Key("local-scroll")).TrackScroll(&a.pageScroll).Grow(1).
+	ui.Scroll(c.Key("local-scroll")).TrackScroll(&a.local.folderScroll).Grow(1).
 		Padding(top+pageGap, pagePad-12, bottom+40, pagePad-12).ScrollbarInsets(top, 0, bottom, 0).Children(func() {
 		a.startMark(c)
 		defer a.endMark(c)
 		ui.Column(c).PaddingX(12).Children(func() {
 			a.localTopControls(c, stats, folders)
-			switch a.local.tab {
-			case localTabAlbums:
-				a.localAlbumsLens(c)
-			case localTabArtists:
-				a.localArtistsLens(c)
-			case localTabGenres:
-				a.localGenresLens(c)
-			case localTabFolders:
-				a.localFoldersLens(c)
-			}
+			a.localFoldersLens(c)
 		})
 	})
 }
@@ -756,10 +800,7 @@ func (a *app) localTopControls(c *ui.Context, stats localmusic.Stats, folders []
 
 	// Five Roon Lenses + Instant Filter input.
 	ui.Row(c).Gap(12).AlignItems(ui.Center).Margin(0, 0, 14, 0).Wrap().Children(func() {
-		if segmented(c.Key("local-lenses"), &a.local.tab, "专辑", "艺人", "流派", "曲目", "文件夹") {
-			a.pageScroll = ui.ScrollState{}
-			a.local.tracksList = ui.ListState{}
-		}
+		segmented(c.Key("local-lenses"), &a.local.tab, "专辑", "艺人", "流派", "曲目", "文件夹")
 		ui.Spacer(c)
 		filterBox := ui.Row(c).Width(248).Height(30).PaddingX(10).Gap(6).Radius(8).AlignItems(ui.Center)
 		if c.Focused(a.local.filterBox) {
@@ -810,8 +851,6 @@ func (a *app) localTopControls(c *ui.Context, stats localmusic.Stats, folders []
 					})
 					if chip.Clicked() {
 						a.local.focus = o.key
-						a.pageScroll = ui.ScrollState{}
-						a.local.tracksList = ui.ListState{}
 					}
 				}
 			}
@@ -852,7 +891,6 @@ func (a *app) localTopControls(c *ui.Context, stats localmusic.Stats, folders []
 						}
 						if m.Item(label).Chosen() {
 							a.local.sort = o.key
-							a.pageScroll = ui.ScrollState{}
 						}
 					}
 				})
@@ -861,26 +899,69 @@ func (a *app) localTopControls(c *ui.Context, stats localmusic.Stats, folders []
 	}
 }
 
-// 1. 专辑墙 (Albums Lens)
-func (a *app) localAlbumsLens(c *ui.Context) {
-	if a.local.lib == nil {
-		return
+// 1. 专辑墙 (Row-Virtualized Albums Lens)
+func (a *app) localAlbumsLens(c *ui.Context, stats localmusic.Stats, folders []string) {
+	sig := a.local.filter + "\x00" + a.local.genre + "\x00" + a.local.focus + "\x00" + a.local.sort
+	if a.local.albumsSig != sig {
+		a.local.albumsSig = sig
+		a.local.albumsList = ui.ListState{}
 	}
-	albums := a.local.lib.Albums(localmusic.AlbumFilter{
-		Query: a.local.filter,
-		Genre: a.local.genre,
-		Focus: a.local.focus,
-		Sort:  a.local.sort,
-	})
-	if len(albums) == 0 {
-		a.empty(c, "没有符合当前筛选条件的本地专辑")
-		return
+	var rev uint64
+	if a.local.lib != nil {
+		rev = a.local.lib.Revision()
 	}
-	ui.Grid(c).Columns(a.columns(c, 162)).GapX(20).GapY(28).Children(func() {
-		for i := range albums {
-			a.localAlbumCard(c.Key(albums[i].ID), &albums[i])
+	if !a.local.albumsCacheReady || a.local.albumsCacheSig != sig || a.local.albumsCacheRev != rev {
+		var fresh []localmusic.LocalAlbum
+		if a.local.lib != nil {
+			fresh = a.local.lib.Albums(localmusic.AlbumFilter{
+				Query: a.local.filter,
+				Genre: a.local.genre,
+				Focus: a.local.focus,
+				Sort:  a.local.sort,
+			})
 		}
-	})
+		a.local.cachedAlbums = fresh
+		a.local.albumsCacheSig = sig
+		a.local.albumsCacheRev = rev
+		a.local.albumsCacheReady = true
+	}
+	albums := a.local.cachedAlbums
+
+	cols := a.columns(c, 162)
+	top, bottom := a.insets(c)
+	a.underTop, a.underBottom = true, true
+
+	gridRows := (len(albums) + cols - 1) / cols
+	rows := 1 + gridRows
+	if len(albums) == 0 {
+		rows = 2
+	}
+	ui.List(c.Key("local-albums-list"), &a.local.albumsList, rows, func(rowIdx int) {
+		if rowIdx == 0 {
+			ui.Column(c).PaddingX(12).Children(func() {
+				a.startMark(c)
+				a.localTopControls(c, stats, folders)
+			})
+			return
+		}
+		if rowIdx == rows-1 {
+			defer a.endMark(c)
+		}
+		if len(albums) == 0 {
+			ui.Column(c).PaddingX(12).Children(func() {
+				a.empty(c, "没有符合当前筛选条件的本地专辑")
+			})
+			return
+		}
+		r := rowIdx - 1
+		start := r * cols
+		end := min(len(albums), start+cols)
+		ui.Grid(c.Key(fmt.Sprintf("alb-row-%d-%d", cols, r))).Columns(cols).GapX(20).Margin(0, 12, 28, 12).Children(func() {
+			for i := start; i < end; i++ {
+				a.localAlbumCard(c.Key(albums[i].ID), &albums[i])
+			}
+		})
+	}).Grow(1).Padding(top+pageGap, pagePad-12, bottom+32, pagePad-12).ScrollbarInsets(top, 0, bottom, 0)
 }
 
 func (a *app) localAlbumCard(c *ui.Context, al *localmusic.LocalAlbum) {
@@ -949,111 +1030,193 @@ func (a *app) localDiscPlaceholder(c *ui.Context, radius float32) {
 	})
 }
 
-// 2. 艺人 (Artists Lens)
-func (a *app) localArtistsLens(c *ui.Context) {
-	if a.local.lib == nil {
-		return
+// 2. 艺人 (Row-Virtualized Artists Lens)
+func (a *app) localArtistsLens(c *ui.Context, stats localmusic.Stats, folders []string) {
+	sig := a.local.filter
+	if a.local.artistsSig != sig {
+		a.local.artistsSig = sig
+		a.local.artistsList = ui.ListState{}
 	}
-	artists := a.local.lib.Artists(a.local.filter)
-	if len(artists) == 0 {
-		a.empty(c, "没有匹配的本地艺人")
-		return
+	var rev uint64
+	if a.local.lib != nil {
+		rev = a.local.lib.Revision()
 	}
-	p := a.pal
-	ui.Grid(c).Columns(a.columns(c, 148)).GapX(20).GapY(28).Children(func() {
-		for i := range artists {
-			ar := &artists[i]
-			card := ui.ButtonBase(c.Key(ar.ID)).Column().Gap(9).AlignItems(ui.Stretch).Justify(ui.Start).FocusRing(false).Label(ar.Name)
-			hovered := card.Hovered()
-			card.Children(func() {
-				art := ui.Box(c).AspectRatio(1).Radius(999)
-				lift := ui.Pose{}
-				if hovered {
-					lift = ui.Pose{Y: -3}
-					art.Shadow(0, 12, 28, -6, p.cardShade)
-				} else {
-					art.Shadow(0, 2, 8, -2, p.cardShade)
-				}
-				art.AnimatePose(lift, ui.Snappy)
-				art.Children(func() {
-					if ar.CoverID == "" {
-						a.localDiscPlaceholder(c, 999)
-					} else {
-						a.coverFill(c, localmusic.CoverURL(ar.CoverID), 400, 999)
-					}
-				})
-				ui.Text(c, ar.Name).FontSize(13.5).FontWeight(600).SingleLine().AlignSelf(ui.Center)
-				ui.Textf(c, "%d 张专辑 · %d 首", ar.AlbumCount, ar.TrackCount).
-					FontSize(12).TextColor(p.muted).SingleLine().AlignSelf(ui.Center).Margin(-5, 0, 0, 0)
-			})
-			if card.Clicked() {
-				a.open(route{page: pageArtist, id: ar.ID})
-			}
+	if !a.local.artistsCacheReady || a.local.artistsCacheSig != sig || a.local.artistsCacheRev != rev {
+		var fresh []localmusic.LocalArtist
+		if a.local.lib != nil {
+			fresh = a.local.lib.Artists(a.local.filter)
 		}
-	})
-}
+		a.local.cachedArtists = fresh
+		a.local.artistsCacheSig = sig
+		a.local.artistsCacheRev = rev
+		a.local.artistsCacheReady = true
+	}
+	artists := a.local.cachedArtists
 
-// 3. 流派 (Genres Lens)
-func (a *app) localGenresLens(c *ui.Context) {
-	if a.local.lib == nil {
-		return
-	}
-	allGenres := a.local.lib.Genres()
-	q := strings.ToLower(strings.TrimSpace(a.local.filter))
-	var genres []localmusic.GenreSummary
-	for _, g := range allGenres {
-		if q == "" || strings.Contains(strings.ToLower(g.Name), q) {
-			genres = append(genres, g)
-		}
-	}
-	if len(genres) == 0 {
-		msg := "暂无流派信息（可点击右上角“从 Roon 同步流派”自动补全）"
-		if q != "" {
-			msg = "没有匹配的流派"
-		}
-		a.empty(c, msg)
-		return
-	}
+	cols := a.columns(c, 148)
 	p := a.pal
-	goldFg, goldBg, goldBorder := audiophileGold(p.dark)
-	ui.Grid(c).Columns(a.columns(c, 224)).Gap(16).Children(func() {
-		for i := range genres {
-			g := genres[i]
-			card := ui.ButtonBase(c.Key("genre:" + g.Name)).Padding(12).Radius(14).Gap(14).
-				AlignItems(ui.Center).Justify(ui.Start).FocusRing(false).Label(g.Name)
-			bg := p.hover
-			if card.Hovered() {
-				bg = p.press
-			}
-			card.Background(card.AnimateColor("bg", bg, ui.Animation{Duration: 120 * time.Millisecond})).Border(1, p.hairline)
-			card.Children(func() {
-				// 2x2 mini mosaic when >= 4 covers, primary cover when 1..3, or disc tile.
-				switch {
-				case len(g.Covers) >= 4:
-					ui.Grid(c).Columns(2).Gap(2).Size(76, 76).Shrink(0).Children(func() {
-						for k := range 4 {
-							a.cover(c.Key(k), g.Covers[k], 160, 37, 5)
+	top, bottom := a.insets(c)
+	a.underTop, a.underBottom = true, true
+
+	gridRows := (len(artists) + cols - 1) / cols
+	rows := 1 + gridRows
+	if len(artists) == 0 {
+		rows = 2
+	}
+	ui.List(c.Key("local-artists-list"), &a.local.artistsList, rows, func(rowIdx int) {
+		if rowIdx == 0 {
+			ui.Column(c).PaddingX(12).Children(func() {
+				a.startMark(c)
+				a.localTopControls(c, stats, folders)
+			})
+			return
+		}
+		if rowIdx == rows-1 {
+			defer a.endMark(c)
+		}
+		if len(artists) == 0 {
+			ui.Column(c).PaddingX(12).Children(func() {
+				a.empty(c, "没有匹配的本地艺人")
+			})
+			return
+		}
+		r := rowIdx - 1
+		start := r * cols
+		end := min(len(artists), start+cols)
+		ui.Grid(c.Key(fmt.Sprintf("art-row-%d-%d", cols, r))).Columns(cols).GapX(20).Margin(0, 12, 28, 12).Children(func() {
+			for i := start; i < end; i++ {
+				ar := &artists[i]
+				card := ui.ButtonBase(c.Key(ar.ID)).Column().Gap(9).AlignItems(ui.Stretch).Justify(ui.Start).FocusRing(false).Label(ar.Name)
+				hovered := card.Hovered()
+				card.Children(func() {
+					art := ui.Box(c).AspectRatio(1).Radius(999)
+					lift := ui.Pose{}
+					if hovered {
+						lift = ui.Pose{Y: -3}
+						art.Shadow(0, 12, 28, -6, p.cardShade)
+					} else {
+						art.Shadow(0, 2, 8, -2, p.cardShade)
+					}
+					art.AnimatePose(lift, ui.Snappy)
+					art.Children(func() {
+						if ar.CoverID == "" {
+							a.localDiscPlaceholder(c, 999)
+						} else {
+							a.coverFill(c, localmusic.CoverURL(ar.CoverID), 400, 999)
 						}
 					})
-				case len(g.Covers) > 0:
-					a.cover(c, g.Covers[0], 200, 76, 10).Shrink(0)
-				default:
-					ui.Box(c).Size(76, 76).Radius(10).Shrink(0).Center().Background(goldBg).Border(1, goldBorder).Children(func() {
-						ui.Icon(c, iconTag).Size(26, 26).TextColor(goldFg)
-					})
-				}
-				ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Gap(5).Children(func() {
-					ui.Text(c, g.Name).FontSize(15.5).FontWeight(700).SingleLine()
-					ui.Textf(c, "%d 张专辑 · %d 首曲目", g.AlbumCount, g.TrackCount).FontSize(12).TextColor(p.muted).SingleLine()
+					ui.Text(c, ar.Name).FontSize(13.5).FontWeight(600).SingleLine().AlignSelf(ui.Center)
+					ui.Textf(c, "%d 张专辑 · %d 首", ar.AlbumCount, ar.TrackCount).
+						FontSize(12).TextColor(p.muted).SingleLine().AlignSelf(ui.Center).Margin(-5, 0, 0, 0)
 				})
-			})
-			if card.Clicked() {
-				a.local.genre = g.Name
-				a.local.tab = localTabAlbums
-				a.pageScroll = ui.ScrollState{}
+				if card.Clicked() {
+					a.open(route{page: pageArtist, id: ar.ID})
+				}
+			}
+		})
+	}).Grow(1).Padding(top+pageGap, pagePad-12, bottom+32, pagePad-12).ScrollbarInsets(top, 0, bottom, 0)
+}
+
+// 3. 流派 (Row-Virtualized Genres Lens)
+func (a *app) localGenresLens(c *ui.Context, stats localmusic.Stats, folders []string) {
+	sig := a.local.filter
+	if a.local.genresSig != sig {
+		a.local.genresSig = sig
+		a.local.genresList = ui.ListState{}
+	}
+	var rev uint64
+	if a.local.lib != nil {
+		rev = a.local.lib.Revision()
+	}
+	q := strings.ToLower(strings.TrimSpace(a.local.filter))
+	if !a.local.genresCacheReady || a.local.genresCacheSig != sig || a.local.genresCacheRev != rev {
+		var filtered []localmusic.GenreSummary
+		if a.local.lib != nil {
+			for _, g := range a.local.lib.Genres() {
+				if q == "" || strings.Contains(strings.ToLower(g.Name), q) {
+					filtered = append(filtered, g)
+				}
 			}
 		}
-	})
+		a.local.cachedGenres = filtered
+		a.local.genresCacheSig = sig
+		a.local.genresCacheRev = rev
+		a.local.genresCacheReady = true
+	}
+	genres := a.local.cachedGenres
+
+	cols := a.columns(c, 224)
+	p := a.pal
+	goldFg, goldBg, goldBorder := audiophileGold(p.dark)
+	top, bottom := a.insets(c)
+	a.underTop, a.underBottom = true, true
+
+	gridRows := (len(genres) + cols - 1) / cols
+	rows := 1 + gridRows
+	if len(genres) == 0 {
+		rows = 2
+	}
+	ui.List(c.Key("local-genres-list"), &a.local.genresList, rows, func(rowIdx int) {
+		if rowIdx == 0 {
+			ui.Column(c).PaddingX(12).Children(func() {
+				a.startMark(c)
+				a.localTopControls(c, stats, folders)
+			})
+			return
+		}
+		if rowIdx == rows-1 {
+			defer a.endMark(c)
+		}
+		if len(genres) == 0 {
+			msg := "暂无流派信息（可点击右上角“从 Roon 同步流派”自动补全）"
+			if q != "" {
+				msg = "没有匹配的流派"
+			}
+			ui.Column(c).PaddingX(12).Children(func() {
+				a.empty(c, msg)
+			})
+			return
+		}
+		r := rowIdx - 1
+		start := r * cols
+		end := min(len(genres), start+cols)
+		ui.Grid(c.Key(fmt.Sprintf("gen-row-%d-%d", cols, r))).Columns(cols).GapX(16).Margin(0, 12, 16, 12).Children(func() {
+			for i := start; i < end; i++ {
+				g := genres[i]
+				card := ui.ButtonBase(c.Key("genre:" + g.Name)).Padding(12).Radius(14).Gap(14).
+					AlignItems(ui.Center).Justify(ui.Start).FocusRing(false).Label(g.Name)
+				bg := p.hover
+				if card.Hovered() {
+					bg = p.press
+				}
+				card.Background(card.AnimateColor("bg", bg, ui.Animation{Duration: 120 * time.Millisecond})).Border(1, p.hairline)
+				card.Children(func() {
+					switch {
+					case len(g.Covers) >= 4:
+						ui.Grid(c).Columns(2).Gap(2).Size(76, 76).Shrink(0).Children(func() {
+							for k := range 4 {
+								a.cover(c.Key(k), g.Covers[k], 160, 37, 5)
+							}
+						})
+					case len(g.Covers) > 0:
+						a.cover(c, g.Covers[0], 200, 76, 10).Shrink(0)
+					default:
+						ui.Box(c).Size(76, 76).Radius(10).Shrink(0).Center().Background(goldBg).Border(1, goldBorder).Children(func() {
+							ui.Icon(c, iconTag).Size(26, 26).TextColor(goldFg)
+						})
+					}
+					ui.Column(c).Grow(1).Shrink(1).MinWidth(0).Gap(5).Children(func() {
+						ui.Text(c, g.Name).FontSize(15.5).FontWeight(700).SingleLine()
+						ui.Textf(c, "%d 张专辑 · %d 首曲目", g.AlbumCount, g.TrackCount).FontSize(12).TextColor(p.muted).SingleLine()
+					})
+				})
+				if card.Clicked() {
+					a.local.genre = g.Name
+					a.local.tab = localTabAlbums
+				}
+			}
+		})
+	}).Grow(1).Padding(top+pageGap, pagePad-12, bottom+32, pagePad-12).ScrollbarInsets(top, 0, bottom, 0)
 }
 
 // 4. 曲目 (Virtualized Tracks Lens)
@@ -1249,7 +1412,7 @@ func (a *app) localFoldersLens(c *ui.Context) {
 				})
 				if b.Clicked() && !isLast {
 					a.local.folderPath = crumb.path
-					a.pageScroll = ui.ScrollState{}
+					a.local.folderScroll = ui.ScrollState{}
 				}
 			}
 		})
@@ -1307,7 +1470,7 @@ func (a *app) localFoldersLens(c *ui.Context) {
 				})
 				if row.Clicked() {
 					a.local.folderPath = sub.Path
-					a.pageScroll = ui.ScrollState{}
+					a.local.folderScroll = ui.ScrollState{}
 				}
 			}
 		})

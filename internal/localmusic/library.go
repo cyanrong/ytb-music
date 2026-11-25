@@ -564,6 +564,7 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 	nowMs := time.Now().UnixMilli()
 	nextCues := make(map[string]cachedCue, len(cueDisk))
 	consumedByCue := map[string]bool{}
+	scanMutated := false
 
 	for _, cw := range cueDisk {
 		if ctx.Err() != nil {
@@ -631,6 +632,7 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 					if same {
 						continue
 					}
+					scanMutated = true
 					updatedCue.Tracks[i].CoverID = covID
 					updatedCue.TrackCovers[i] = cachedCueTrackCover{
 						EmbeddedCover: false,
@@ -649,6 +651,7 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 			}
 		}
 
+		scanMutated = true
 		addedAt := cw.modTimeNs / 1e6
 		if prev, ok := prevCues[cw.key]; ok && prev.AddedAt > 0 {
 			addedAt = prev.AddedAt
@@ -724,6 +727,7 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 					nextFiles[aw.key] = prev
 					continue
 				}
+				scanMutated = true
 				updated := prev
 				updated.Track.CoverID = covID
 				updated.SidecarCover = cand.path
@@ -733,6 +737,7 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 				continue
 			}
 		}
+		scanMutated = true
 		toParse = append(toParse, aw)
 	}
 
@@ -858,6 +863,36 @@ func (l *Library) Scan(ctx context.Context, onProgress func(ScanProgress)) error
 			delete(nextCues, k)
 		}
 	}
+	changed := scanMutated || len(nextFiles) != len(l.files) || len(nextCues) != len(l.cues)
+	if !changed {
+		for k := range nextFiles {
+			if _, ok := l.files[k]; !ok {
+				changed = true
+				break
+			}
+		}
+	}
+	if !changed {
+		for k := range nextCues {
+			if _, ok := l.cues[k]; !ok {
+				changed = true
+				break
+			}
+		}
+	}
+	if !changed {
+		l.progress = ScanProgress{
+			Scanning: false,
+			Scanned:  totalItems,
+			Total:    totalItems,
+		}
+		l.mu.Unlock()
+		if len(activeRootErrs) > 0 {
+			return errors.Join(activeRootErrs...)
+		}
+		return nil
+	}
+
 	l.files = nextFiles
 	l.cues = nextCues
 	l.applyPersistedRoonGenresLocked()

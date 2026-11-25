@@ -51,7 +51,7 @@ type artCache struct {
 // data, some 50–100 KB for Now Playing's and a few for a row's, so this
 // is thousands: going back to a page shows its covers as they were,
 // however long ago it showed them, rather than loading them again.
-const artLimit = 64 << 20
+const artLimit = 128 << 20
 
 // artAtOnce is how many covers load at once: a page's covers wait on the
 // network, not on its speed, so a screenful at once comes in about the
@@ -174,7 +174,7 @@ func (c *artCache) get(url string, backdrop bool) *artwork {
 
 // artRelease is how long a cover keeps its pixels once loaded: past the
 // frame that first shows it, and the smaller copies it shows from there.
-const artRelease = 2 * time.Second
+const artRelease = 15 * time.Second
 
 // loadArt fetches the cover at url, as a bitmap to draw and an image to
 // measure, with the bytes of its data.

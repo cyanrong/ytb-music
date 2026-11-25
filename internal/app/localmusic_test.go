@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"image"
 	"image/color"
 	"image/png"
@@ -1052,5 +1053,150 @@ func TestRenderLocalLibraryScreenshots(t *testing.T) {
 	if len(dsdAlbums) > 0 {
 		a.open(route{page: pageAlbum, id: dsdAlbums[0].ID})
 		saveShot("local-album-detail-dark.png")
+	}
+}
+
+// Navigating from a scrolled Local Music Album Wall or Local Playlist into an album detail page and clicking 返回 restores the exact scroll position instead of jumping back to the top.
+func TestLocalScrollRestoredAfterAlbumNavigation(t *testing.T) {
+	musicRoot := filepath.Join(t.TempDir(), "ManyAlbums")
+	var plTracks []ytm.Track
+	for i := 1; i <= 55; i++ {
+		title := fmt.Sprintf("Record %02d", i)
+		dir := filepath.Join(musicRoot, title)
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		id3 := makeID3v23(fmt.Sprintf("Movement %02d", i), "Ensemble", title, "2022", "Classical")
+		if err := os.WriteFile(filepath.Join(dir, "01 - Track.wav"), makeWAV16(44100, 4410, id3), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	a, _, _ := newLocalTestApp(t)
+	a.local.lib.AddFolders(musicRoot)
+	if err := a.local.lib.Scan(context.Background(), nil); err != nil {
+		t.Fatal(err)
+	}
+	a.local.sort = "title"
+
+	// 1) Local Music Album Wall: scroll down, open a deep album, click 返回, verify scroll restored.
+	a.open(route{page: pageLocal})
+	tt := ui.NewTester(a.view, 1180, 780)
+	tt.SetDark(true)
+	tt.Frame()
+
+	if !tt.HasText("Record 01") {
+		t.Fatalf("expected Record 01 at top of Album Wall: %v", tt.Texts())
+	}
+	// Virtualized wall should NOT build all 55 albums at once while at top.
+	if tt.HasText("Record 50") {
+		t.Fatal("expected Record 50 off-screen before scrolling")
+	}
+
+	tt.Scroll(700, 450, 0, 2200)
+	tt.Frame()
+	if tt.HasText("Record 01") || !tt.HasText("Record 40") {
+		t.Fatalf("expected Album Wall scrolled down to Record 40, texts=%v", tt.Texts())
+	}
+	if err := tt.Click("Record 40"); err != nil {
+		t.Fatalf("click Record 40 card: %v", err)
+	}
+	tt.Frame()
+	if a.route.page != pageAlbum {
+		t.Fatalf("expected pageAlbum, got %+v", a.route)
+	}
+
+	if err := tt.Click("返回"); err != nil {
+		t.Fatalf("click 返回 from album detail: %v", err)
+	}
+	tt.Frame()
+	if a.route.page != pageLocal {
+		t.Fatalf("expected return to pageLocal, got %+v", a.route)
+	}
+	if tt.HasText("Record 01") || !tt.HasText("Record 40") {
+		t.Fatalf("expected Album Wall scroll restored to Record 40 after 返回, got texts=%v", tt.Texts())
+	}
+
+	// 2) Local Playlist (本地歌单): scroll down, click a track's album link, click 返回, verify trackList scroll restored.
+	for _, lt := range a.local.lib.Tracks("", "", "") {
+		plTracks = append(plTracks, lt.ToYTMTrack())
+	}
+	slices.SortFunc(plTracks, func(x, y ytm.Track) int { return strings.Compare(x.Name, y.Name) })
+	pl, err := a.createLocalPlaylist("大编制歌单", "", "", plTracks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	a.open(route{page: pagePlaylist, id: pl.ID})
+	tt.Frame()
+	if !tt.HasText("Movement 01") {
+		t.Fatalf("expected Movement 01 at top of playlist: %v", tt.Texts())
+	}
+	tt.Scroll(700, 450, 0, 2200)
+	tt.Frame()
+	if tt.HasText("Movement 01") || !tt.HasText("Record 38") {
+		t.Fatalf("expected playlist scrolled down to Record 38, texts=%v", tt.Texts())
+	}
+	albRect, ok := tt.Find("Record 38")
+	if !ok {
+		t.Fatalf("could not find Record 38 album link: %v", tt.Texts())
+	}
+	tt.Press(albRect.X+8, albRect.Y+albRect.H/2)
+	tt.Release(albRect.X+8, albRect.Y+albRect.H/2)
+	tt.Frame()
+	if a.route.page != pageAlbum {
+		t.Fatalf("expected pageAlbum from playlist album link, got %+v", a.route)
+	}
+	if err := tt.Click("返回"); err != nil {
+		t.Fatalf("click 返回 to playlist: %v", err)
+	}
+	tt.Frame()
+	if a.route.page != pagePlaylist || tt.HasText("Movement 01") || !tt.HasText("Record 38") {
+		t.Fatalf("expected playlist scroll restored to Record 38 after 返回, route=%+v texts=%v", a.route, tt.Texts())
+	}
+}
+
+// High-resolution local covers are downscaled to compact thumbnails for grid cards so large libraries do not evict and reload covers while scrolling.
+func TestLocalLargeCoverThumbnailsAndNoEvictionReload(t *testing.T) {
+	// Generate a 1600x1600 cover that previously stayed unresized in artCache.
+	const bigDim = 1600
+	bigImg := image.NewRGBA(image.Rect(0, 0, bigDim, bigDim))
+	for y := range bigDim {
+		for x := range bigDim {
+			bigImg.SetRGBA(x, y, color.RGBA{
+				R: uint8((x*37 + y*13) & 0xFF),
+				G: uint8((x*17 ^ y*29) & 0xFF),
+				B: uint8((x*7 + y*53) & 0xFF),
+				A: 255,
+			})
+		}
+	}
+	var rawPNG bytes.Buffer
+	if err := png.Encode(&rawPNG, bigImg); err != nil {
+		t.Fatal(err)
+	}
+	rawBytes := rawPNG.Bytes()
+
+	var loaderReads atomic.Int32
+	origCover := func(u string) ([]byte, error) {
+		loaderReads.Add(1)
+		return rawBytes, nil
+	}
+	setLocalCoverLoader(origCover)
+	defer setLocalCoverLoader(nil)
+
+	sizedURL := ytm.Sized(localmusic.CoverURL("testbigcover"), 400)
+	thumbBytes, err := fetchCover(sizedURL)
+	if err != nil {
+		t.Fatalf("fetchCover(%q): %v", sizedURL, err)
+	}
+	cfg, _, err := image.DecodeConfig(bytes.NewReader(thumbBytes))
+	if err != nil {
+		t.Fatalf("decode thumbnail config: %v", err)
+	}
+	if cfg.Width != 400 || cfg.Height != 400 {
+		t.Fatalf("thumbnail dimensions = %dx%d, want 400x400", cfg.Width, cfg.Height)
+	}
+	if len(thumbBytes) >= len(rawBytes)/3 {
+		t.Fatalf("thumbnail size %d bytes was not substantially smaller than raw %d bytes", len(thumbBytes), len(rawBytes))
 	}
 }

@@ -649,6 +649,13 @@ func Sized(pic string, n int) string {
 	if pic == "" || n <= 0 {
 		return pic
 	}
+	if strings.HasPrefix(pic, "localcover://") {
+		base := pic
+		if i := strings.IndexByte(base, '?'); i >= 0 {
+			base = base[:i]
+		}
+		return base + "?w=" + strconv.Itoa(n)
+	}
 	u, err := url.Parse(pic)
 	if err != nil {
 		return pic
