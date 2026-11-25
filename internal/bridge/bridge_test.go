@@ -12,7 +12,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
@@ -193,13 +192,10 @@ func TestHQPlayerBackendLocalFileAndRangeWAV(t *testing.T) {
 	if !strings.HasPrefix(gotURI, "file:///") {
 		t.Fatalf("PlaylistAdd URI = %q, want local file:/// URI", gotURI)
 	}
-	unescapedURIPath, uerr := url.PathUnescape(strings.TrimPrefix(gotURI, "file:///"))
-	if uerr != nil {
-		t.Fatalf("PathUnescape(%q): %v", gotURI, uerr)
-	}
-	localPath := filepath.FromSlash(unescapedURIPath)
+	rawURIPath := strings.TrimPrefix(gotURI, "file:///")
+	localPath := filepath.FromSlash(rawURIPath)
 	if filepath.Separator == '/' {
-		localPath = "/" + unescapedURIPath
+		localPath = "/" + rawURIPath
 	}
 	wavBytes, err := os.ReadFile(localPath)
 	if err != nil {
@@ -1012,41 +1008,43 @@ func TestRoonFetchLibraryGenresMultiSession(t *testing.T) {
 	}
 }
 
-// LocalFileURI percent-encodes reserved URI characters across Windows drive paths, POSIX root paths, and UNC network shares per RFC 8089.
-func TestLocalFileURIRFC8089Encoding(t *testing.T) {
+// LocalFileURI preserves raw UTF-8 characters, spaces, and punctuation (without percent-encoding) as required by HQPlayer 5's native file:/// loader across Windows drive paths, POSIX roots, and UNC shares.
+func TestLocalFileURIHQPlayerRawUTF8(t *testing.T) {
 	cases := []struct {
 		in   string
 		want string
 	}{
 		{
-			in:   `D:\Music\Take #2.flac`,
-			want: "file:///D:/Music/Take%20%232.flac",
+			in:   `I:\TF\V家\02. シャルル.flac`,
+			want: "file:///I:/TF/V家/02. シャルル.flac",
 		},
 		{
-			in:   `C:\Lossless\100% Pure [DSD]\What? #1.dsf`,
-			want: "file:///C:/Lossless/100%25%20Pure%20%5BDSD%5D/What%3F%20%231.dsf",
-		},
-		{
-			in:   `/music/Take #2.flac`,
-			want: "file:///music/Take%20%232.flac",
+			in:   `C:\Lossless\100% Pure & [DSD]\Take #2.dsf`,
+			want: "file:///C:/Lossless/100% Pure & [DSD]/Take #2.dsf",
 		},
 		{
 			in:   `/music/100% [Live]/グッドバイ #1.wav`,
-			want: "file:///music/100%25%20%5BLive%5D/%E3%82%B0%E3%83%83%E3%83%89%E3%83%90%E3%82%A4%20%231.wav",
+			want: "file:///music/100% [Live]/グッドバイ #1.wav",
 		},
 		{
-			in:   `\\server\share\dir\Take #2.flac`,
-			want: "file://server/share/dir/Take%20%232.flac",
-		},
-		{
-			in:   `\\192.168.1.20\Music Share\100% [Hi-Res]\Song?.flac`,
-			want: "file://192.168.1.20/Music%20Share/100%25%20%5BHi-Res%5D/Song%3F.flac",
+			in:   `\\192.168.1.20\Music Share\V家\02. シャルル.flac`,
+			want: "file://192.168.1.20/Music Share/V家/02. シャルル.flac",
 		},
 	}
 	for _, tc := range cases {
 		if got := LocalFileURI(tc.in); got != tc.want {
 			t.Errorf("LocalFileURI(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+
+	// Verify XML round-trip of "&" and CJK/Japanese in <PlaylistAdd uri="..."/>.
+	addXML := buildHQPPlaylistAdd(LocalFileURI(`C:\Music\R&B\02. シャルル.flac`), player.TrackSource{
+		Track:    ytm.Track{Name: "シャルル"},
+		Duration: 227 * time.Second,
+	}, "", 227*time.Second)
+	tag, attrs, err := parseXMLAttrs([]byte(xmlDecl + addXML))
+	if err != nil || tag != "PlaylistAdd" || attrs["uri"] != "file:///C:/Music/R&B/02. シャルル.flac" || attrs["clear"] != "1" {
+		t.Fatalf("parsed PlaylistAdd = (%q, uri=%q, clear=%q, err=%v)", tag, attrs["uri"], attrs["clear"], err)
 	}
 }
 

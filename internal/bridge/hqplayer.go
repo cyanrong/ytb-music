@@ -665,7 +665,7 @@ func buildHQPPlaylistAdd(uri string, src player.TrackSource, coverURL string, du
 	meta.WriteString(`/>`)
 
 	return fmt.Sprintf(
-		`<PlaylistAdd uri="%s" queued="0" clear="0" start="0" freewheel="0">%s</PlaylistAdd>`,
+		`<PlaylistAdd uri="%s" queued="0" clear="1" start="0" freewheel="0">%s</PlaylistAdd>`,
 		xmlEscapeAttr(uri),
 		meta.String(),
 	)

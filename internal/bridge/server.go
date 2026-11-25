@@ -13,7 +13,6 @@ import (
 	"math"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -498,17 +497,13 @@ func isASCIIAlpha(b byte) bool {
 	return (b >= 'a' && b <= 'z') || (b >= 'A' && b <= 'Z')
 }
 
-func escapeFileSegments(slashPath string) string {
-	if slashPath == "" {
-		return ""
-	}
-	parts := strings.Split(slashPath, "/")
-	for i, seg := range parts {
-		parts[i] = url.PathEscape(seg)
-	}
-	return strings.Join(parts, "/")
-}
-
+// localFileURI formats a local or UNC filesystem path for Signalyst HQPlayer's
+// <PlaylistAdd uri="..."/> attribute. Hardware verification against HQPlayer 5
+// Desktop confirms its C++ file:// handler strips the "file:///" (or UNC
+// "file://") prefix and opens the raw UTF-8 path directly WITHOUT URI percent-
+// decoding (%20, %23, %25, or percent-encoded CJK/Japanese bytes cause File Not
+// Found and "clHQPlayerEngine::Play(): Empty transport"). XML attribute
+// escaping (&amp;, &quot;, etc.) is handled separately by xmlEscapeAttr.
 func localFileURI(rawPath string) string {
 	if rawPath == "" {
 		return "file:///"
@@ -531,7 +526,7 @@ func localFileURI(rawPath string) string {
 		if !ok || rem == "" {
 			return "file://" + host + "/"
 		}
-		return "file://" + host + "/" + escapeFileSegments(rem)
+		return "file://" + host + "/" + rem
 	}
 
 	s := strings.ReplaceAll(p, `\`, `/`)
@@ -543,7 +538,6 @@ func localFileURI(rawPath string) string {
 			p = abs
 			s = strings.ReplaceAll(p, `\`, `/`)
 			hasDrive = len(s) >= 2 && isASCIIAlpha(s[0]) && s[1] == ':'
-			isPOSIXAbs = strings.HasPrefix(p, "/")
 		}
 	}
 
@@ -553,17 +547,17 @@ func localFileURI(rawPath string) string {
 		if rem == "" {
 			return "file:///" + drive + "/"
 		}
-		return "file:///" + drive + "/" + escapeFileSegments(rem)
+		return "file:///" + drive + "/" + rem
 	}
 
-	rem := strings.TrimPrefix(p, "/")
+	rem := strings.TrimPrefix(s, "/")
 	if rem == "" {
 		return "file:///"
 	}
-	return "file:///" + escapeFileSegments(rem)
+	return "file:///" + rem
 }
 
-// LocalFileURI formats an absolute local filesystem path as an RFC 8089 file URI for HQPlayer.
+// LocalFileURI formats an absolute local filesystem path as a raw UTF-8 file:/// URI for HQPlayer.
 func LocalFileURI(absPath string) string {
 	return localFileURI(absPath)
 }
